@@ -76,11 +76,6 @@ def test_v37_keeps_v36_transaction_recipe_and_repairs_liveness_plane() -> None:
     assert REVIVAL_EFFICIENCY_REWARD_SPEC.version == "sts2-run-survival-efficiency-v7"
     assert REVIVAL_EFFICIENCY_REWARD_SPEC.revival_reference_budget == 64
     assert REVIVAL_EFFICIENCY_REWARD_SPEC.revival_cost_cap == pytest.approx(0.40)
-    assert config.failure_credit.liveness_risk_actor_min_selected_probability == pytest.approx(0.01)
-    assert config.episodic_learning.success_imitation_exempt_surfaces == (
-        "rest_site",
-        "shop",
-    )
     assert config.curriculum.revival_budget == 16
     assert config.runtime.model_initialization_schedule_mode == "inherit"
     assert config.runtime.model_initialization_liveness_schedule_mode == "inherit"

@@ -13,7 +13,6 @@ from sts2_rl.training.collector import EpisodeMetrics, _is_forge_selection_surfa
 from sts2_rl.training.config import FailureCreditConfig, TransactionLearningConfig
 from sts2_rl.training.episode_replay import EpisodeDecisionStep
 from sts2_rl.training.failure_credit import (
-    DirectPolicyTarget,
     EvidenceStratum,
     FailureOutcome,
 )
@@ -444,7 +443,7 @@ def test_forge_surface_and_evaluation_metric_are_exact() -> None:
     assert summary["forge_transaction_completion_rate"] == pytest.approx(0.5)
 
 
-def test_forge_selection_clean_exit_counts_and_retains_positive_credit() -> None:
+def test_forge_selection_clean_exit_counts_and_stores_completion_control() -> None:
     base = _recovery_config(max_steps=8, repeat_threshold=8)
     config = replace(
         base,
@@ -484,7 +483,6 @@ def test_forge_selection_clean_exit_counts_and_retains_positive_credit() -> None
     funnel = episode.failure_credit_shadow_metrics
     assert funnel is not None
     assert funnel.completion_controls >= 1
-    assert funnel.actor_actionable_records >= 1
     completions = tuple(
         record
         for record in episode.failure_credit_records
@@ -495,13 +493,9 @@ def test_forge_selection_clean_exit_counts_and_retains_positive_credit() -> None
         EvidenceStratum.COMPLETION_CONTROL in record.plan.strata
         for record in completions
     )
-    preferred = tuple(
-        target
-        for record in completions
-        for target in record.plan.direct_policy_targets
-        if target.target is DirectPolicyTarget.PREFER
-    )
-    assert preferred
+    # Completion controls are pure value/critic evidence: they carry no
+    # policy witness and no policy-credit targets.
+    assert all(record.incident.witnesses == () for record in completions)
 
 
 def test_cancelled_forge_is_neutral_and_only_verified_upgrade_commits() -> None:
@@ -551,23 +545,9 @@ def test_cancelled_forge_is_neutral_and_only_verified_upgrade_commits() -> None:
     assert completed is not None
     policy_eligibility = tuple(step.decision.policy_decision for step in completed.steps)
     # Attempt one (Smith, Select, Cancel) is retained for value/Q learning but
-    # removed from the successful episode's actor imitation path.  Attempt two
+    # removed from the successful episode's policy-gradient path.  Attempt two
     # remains eligible through the verified deck-upgrade commit.
     assert policy_eligibility == (False, False, False, True, True, True)
-
-    preferred_operations: list[str] = []
-    for record in episode.failure_credit_records:
-        for target in record.plan.direct_policy_targets:
-            if target.target is not DirectPolicyTarget.PREFER:
-                continue
-            payload = record.plan.context.steps[
-                target.step_index
-            ].selected_action.loop.payload
-            assert isinstance(payload, dict)
-            action = payload.get("action")
-            assert isinstance(action, dict)
-            preferred_operations.append(str(action.get("operation") or ""))
-    assert preferred_operations == ["confirm"]
 
     summary = summarize_evaluation([episode.metrics], objective="run")
     assert summary["forge_transactions_closed"] == 2

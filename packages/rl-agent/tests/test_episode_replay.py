@@ -13,7 +13,6 @@ import sts2_rl.training.episode_replay as episode_replay_module
 from sts2_rl.encoding import EncodedDecisionSnapshot, GroundedEncodingConfig
 from sts2_rl.encoding.snapshot import sparse_token_table
 from sts2_rl.training.episode_replay import (
-    ActSegmentHealth,
     BoundaryOutcome,
     BoundedEpisodicReplay,
     CompletedEpisode,
@@ -585,9 +584,14 @@ def test_decision_surfaces_fail_closed_and_combat_is_canonical() -> None:
 
 @pytest.mark.parametrize(
     "prior_version",
-    ("sts2-episodic-replay-v1", "sts2-episodic-replay-v2"),
+    (
+        "sts2-episodic-replay-v1",
+        "sts2-episodic-replay-v2",
+        "sts2-episodic-replay-v3",
+        "sts2-episodic-replay-v4",
+    ),
 )
-def test_v3_replay_rejects_prior_exact_resume_sidecars(
+def test_v5_replay_rejects_prior_exact_resume_sidecars(
     prior_version: str,
 ) -> None:
     replay = BoundedEpisodicReplay(
@@ -636,463 +640,6 @@ def test_sampling_round_robins_win_failure_and_censored_strata() -> None:
     }
     assert strata == {"win", "failure", "censored"}
     assert len({sequence.episode_id for sequence in first_round}) == 3
-
-
-def test_fresh_policy_reservation_keeps_one_global_value_slot() -> None:
-    snapshot = _snapshot()
-    fresh = _with_policy_versions(
-        _linear_episode(snapshot, episode_id="fresh-win", length=2, won=True),
-        (0, 100),
-    )
-    stale_failure = _with_policy_versions(
-        _linear_episode(snapshot, episode_id="stale-failure", length=2, won=False),
-        (0, 0),
-    )
-    episodes = (fresh, stale_failure)
-    replay = BoundedEpisodicReplay(
-        capacity=2,
-        byte_capacity=sum(episode.storage_nbytes() for episode in episodes),
-        episode_byte_capacity=max(episode.storage_nbytes() for episode in episodes),
-        max_segments_per_episode=1,
-        seed=11,
-    )
-    assert all(replay.put(episode) for episode in episodes)
-
-    sample = replay.sample_for_learning(
-        2,
-        learn_steps=1,
-        burn_in_steps=0,
-        macro_sample_fraction=0.0,
-        current_policy_version=100,
-        policy_gradient_max_lag=5,
-        fresh_policy_sequences=1,
-    )
-
-    assert len(sample.sequences) == 2
-    assert sample.sequences[0].episode_id == "fresh-win"
-    assert sample.sequences[0].learn_start_step == 1
-    assert sample.sequences[1].episode_id == "stale-failure"
-    assert sample.diagnostics.to_mapping() == {
-        "fresh_policy_quota_requested": 1,
-        "fresh_policy_quota_filled": 1,
-        "fresh_policy_quota_missed": 0,
-        "fresh_policy_candidate_episodes": 1,
-        "fresh_policy_candidate_decisions": 1,
-        "fresh_policy_surface_exempted_decisions": 0,
-        "sampled_fresh_policy_lag_min": 0,
-        "sampled_fresh_policy_lag_mean": 0.0,
-        "sampled_fresh_policy_lag_max": 0,
-    }
-
-
-def test_fresh_policy_reservation_excludes_success_imitation_surfaces() -> None:
-    episode = _surface_episode(
-        episode_id="surface-exemption",
-        surfaces=("rest_site", "shop", "map"),
-        won=True,
-    )
-    replay = BoundedEpisodicReplay(
-        capacity=1,
-        byte_capacity=episode.storage_nbytes(),
-        episode_byte_capacity=episode.storage_nbytes(),
-        max_segments_per_episode=3,
-        seed=43,
-    )
-    assert replay.put(episode)
-
-    sample = replay.sample_for_learning(
-        1,
-        learn_steps=1,
-        burn_in_steps=0,
-        macro_sample_fraction=1.0,
-        current_policy_version=7,
-        policy_gradient_max_lag=128,
-        fresh_policy_sequences=1,
-        success_imitation_exempt_surfaces=("rest_site", "shop"),
-    )
-
-    assert len(sample.sequences) == 1
-    assert sample.sequences[0].learn_start_step == 2
-    assert sample.sequences[0].learn_steps[0].decision.decision_surface == "map"
-    assert sample.diagnostics.fresh_policy_candidate_episodes == 1
-    assert sample.diagnostics.fresh_policy_candidate_decisions == 1
-    assert sample.diagnostics.fresh_policy_surface_exempted_decisions == 2
-    assert sample.diagnostics.fresh_policy_quota_filled == 1
-
-
-@pytest.mark.parametrize(
-    ("behavior_version", "filled"),
-    ((72, 1), (71, 0)),
-)
-def test_fresh_policy_lag_boundary_is_closed(
-    behavior_version: int,
-    filled: int,
-) -> None:
-    snapshot = _snapshot()
-    episode = _with_policy_versions(
-        _linear_episode(snapshot, episode_id="lag-boundary", length=2, won=True),
-        (0, behavior_version),
-        policy_decisions=(False, True),
-    )
-    replay = BoundedEpisodicReplay(
-        capacity=1,
-        byte_capacity=episode.storage_nbytes(),
-        episode_byte_capacity=episode.storage_nbytes(),
-        max_segments_per_episode=1,
-        seed=13,
-    )
-    assert replay.put(episode)
-
-    sample = replay.sample_for_learning(
-        1,
-        learn_steps=1,
-        burn_in_steps=0,
-        macro_sample_fraction=0.0,
-        current_policy_version=200,
-        policy_gradient_max_lag=128,
-        fresh_policy_sequences=1,
-    )
-
-    assert len(sample.sequences) == 1
-    assert sample.diagnostics.fresh_policy_quota_filled == filled
-    if filled:
-        assert sample.sequences[0].learn_start_step == 1
-        assert sample.diagnostics.sampled_fresh_policy_lag_max == 128
-
-
-def test_fresh_policy_reservation_requires_an_actual_learner_label() -> None:
-    snapshot = _snapshot()
-    forced_win = _with_policy_versions(
-        _linear_episode(snapshot, episode_id="forced-win", length=2, won=True),
-        (100, 100),
-        policy_decisions=(False, False),
-    )
-    failed = _with_policy_versions(
-        _linear_episode(snapshot, episode_id="fresh-failure", length=2, won=False),
-        (100, 100),
-    )
-    stale_win = _with_policy_versions(
-        _linear_episode(snapshot, episode_id="stale-win", length=2, won=True),
-        (0, 0),
-    )
-    episodes = (forced_win, failed, stale_win)
-    replay = BoundedEpisodicReplay(
-        capacity=3,
-        byte_capacity=sum(episode.storage_nbytes() for episode in episodes),
-        episode_byte_capacity=max(episode.storage_nbytes() for episode in episodes),
-        max_segments_per_episode=1,
-        seed=17,
-    )
-    assert all(replay.put(episode) for episode in episodes)
-
-    sample = replay.sample_for_learning(
-        2,
-        learn_steps=1,
-        burn_in_steps=0,
-        macro_sample_fraction=0.0,
-        current_policy_version=100,
-        policy_gradient_max_lag=5,
-        fresh_policy_sequences=1,
-    )
-
-    assert len(sample.sequences) == 2
-    assert sample.diagnostics.fresh_policy_candidate_episodes == 0
-    assert sample.diagnostics.fresh_policy_candidate_decisions == 0
-    assert sample.diagnostics.fresh_policy_quota_filled == 0
-    assert sample.diagnostics.fresh_policy_quota_missed == 1
-
-
-def test_fresh_policy_reservation_indexes_only_healthy_failed_act_prefixes() -> None:
-    snapshot = _snapshot()
-
-    def failed_after_act(*, hp_ratio: float, episode_id: str) -> CompletedEpisode:
-        steps = (
-            _step(
-                snapshot,
-                0,
-                act=1,
-                combat_id=None,
-                reward=0.0,
-                before_revivals=0,
-                after_revivals=4,
-                before_hp=0.0,
-                after_hp=10.0,
-                act_boundary=BoundaryOutcome.SUCCEEDED,
-                decision_surface="map",
-            ),
-            _step(
-                snapshot,
-                1,
-                act=2,
-                combat_id=None,
-                reward=-1.0,
-                before_revivals=4,
-                after_revivals=4,
-                before_hp=10.0,
-                after_hp=10.0,
-                act_boundary=BoundaryOutcome.FAILED,
-                decision_surface="map",
-            ),
-        )
-        return backfill_completed_episode(
-            episode_id=episode_id,
-            steps=steps,
-            completion=EpisodeCompletion(
-                authoritative=True,
-                won=False,
-                final_revivals=4,
-                final_hp_loss=10.0,
-                terminal_reason="run_defeat",
-            ),
-            act_segment_health=(
-                ActSegmentHealth(
-                    act=1,
-                    boundary_step_index=0,
-                    exit_hp_ratio=hp_ratio,
-                    cumulative_revivals=4,
-                    revival_budget=64,
-                ),
-            ),
-        )
-
-    healthy = failed_after_act(hp_ratio=0.60, episode_id="healthy-act-prefix")
-    unhealthy = failed_after_act(hp_ratio=0.20, episode_id="unhealthy-act-prefix")
-    episodes = (healthy, unhealthy)
-    replay = BoundedEpisodicReplay(
-        capacity=2,
-        byte_capacity=sum(episode.storage_nbytes() for episode in episodes),
-        episode_byte_capacity=max(episode.storage_nbytes() for episode in episodes),
-        max_segments_per_episode=1,
-        seed=79,
-    )
-    assert all(replay.put(episode) for episode in episodes)
-
-    sample = replay.sample_for_learning(
-        1,
-        learn_steps=1,
-        burn_in_steps=0,
-        macro_sample_fraction=0.0,
-        current_policy_version=7,
-        policy_gradient_max_lag=0,
-        fresh_policy_sequences=1,
-        act_segment_imitation_enabled=True,
-        act_segment_min_exit_hp_ratio=0.35,
-        act_segment_max_revival_fraction=0.34,
-    )
-
-    assert sample.diagnostics.fresh_policy_candidate_episodes == 1
-    assert sample.diagnostics.fresh_policy_candidate_decisions == 1
-    assert sample.diagnostics.fresh_policy_quota_filled == 1
-    assert sample.sequences[0].episode_id == "healthy-act-prefix"
-    assert sample.sequences[0].learn_start_step == 0
-    assert sample.sequences[0].act_segment_health == healthy.act_segment_health
-
-
-def test_act_health_revival_fraction_is_strictly_budget_bounded() -> None:
-    allowed = ActSegmentHealth(
-        act=1,
-        boundary_step_index=0,
-        exit_hp_ratio=0.60,
-        cumulative_revivals=21,
-        revival_budget=64,
-    )
-    rejected = replace(allowed, cumulative_revivals=22)
-
-    assert allowed.healthy(
-        minimum_exit_hp_ratio=0.35,
-        maximum_revival_fraction=0.34,
-    )
-    assert not rejected.healthy(
-        minimum_exit_hp_ratio=0.35,
-        maximum_revival_fraction=0.34,
-    )
-
-
-def test_censored_run_with_successful_act_is_fresh_policy_eligible() -> None:
-    snapshot = _snapshot()
-    decisions = (
-        _step(
-            snapshot,
-            0,
-            act=1,
-            combat_id=None,
-            reward=0.0,
-            before_revivals=0,
-            after_revivals=0,
-            before_hp=0.0,
-            after_hp=0.0,
-            act_boundary=BoundaryOutcome.SUCCEEDED,
-        ),
-    )
-    episode = backfill_completed_episode(
-        episode_id="censored-after-act-success",
-        steps=decisions,
-        completion=EpisodeCompletion(
-            authoritative=False,
-            won=None,
-            final_revivals=0,
-            final_hp_loss=0.0,
-            terminal_reason="transport_abort",
-        ),
-    )
-    replay = BoundedEpisodicReplay(
-        capacity=1,
-        byte_capacity=episode.storage_nbytes(),
-        episode_byte_capacity=episode.storage_nbytes(),
-        max_segments_per_episode=1,
-        seed=19,
-    )
-    assert replay.put(episode)
-
-    sample = replay.sample_for_learning(
-        1,
-        learn_steps=1,
-        burn_in_steps=0,
-        macro_sample_fraction=0.0,
-        current_policy_version=7,
-        policy_gradient_max_lag=0,
-        fresh_policy_sequences=1,
-    )
-
-    assert sample.diagnostics.fresh_policy_quota_filled == 1
-    assert sample.sequences[0].learn_start_step == 0
-
-
-def test_fresh_macro_sequence_satisfies_macro_reservation() -> None:
-    fresh_map = _with_policy_versions(
-        _surface_episode(
-            episode_id="fresh-map",
-            surfaces=("forced", "map"),
-            policy_decisions=(False, True),
-            won=True,
-        ),
-        (0, 100),
-    )
-    stale_failure = _with_policy_versions(
-        _surface_episode(
-            episode_id="stale-event",
-            surfaces=("event",),
-            won=False,
-        ),
-        (0,),
-    )
-    episodes = (fresh_map, stale_failure)
-    replay = BoundedEpisodicReplay(
-        capacity=2,
-        byte_capacity=sum(episode.storage_nbytes() for episode in episodes),
-        episode_byte_capacity=max(episode.storage_nbytes() for episode in episodes),
-        max_segments_per_episode=1,
-        seed=23,
-    )
-    assert all(replay.put(episode) for episode in episodes)
-
-    sample = replay.sample_for_learning(
-        2,
-        learn_steps=1,
-        burn_in_steps=0,
-        macro_sample_fraction=0.5,
-        current_policy_version=100,
-        policy_gradient_max_lag=5,
-        fresh_policy_sequences=1,
-    )
-
-    assert len(sample.sequences) == 2
-    assert sample.sequences[0].episode_id == "fresh-map"
-    assert sample.sequences[0].learn_start_step == 1
-    assert replay.metrics()["macro_sample_count"] == 1
-
-
-def test_fresh_reservation_prefers_macro_when_combat_is_also_eligible() -> None:
-    base_episode = backfill_completed_episode(
-        episode_id="fresh-mixed",
-        steps=(
-            _step(
-                _snapshot(domain_id=1),
-                0,
-                act=1,
-                combat_id="combat-1",
-                reward=0.0,
-                before_revivals=0,
-                after_revivals=0,
-                before_hp=0.0,
-                after_hp=0.0,
-                combat_boundary=BoundaryOutcome.SUCCEEDED,
-            ),
-            _step(
-                _snapshot(domain_id=0),
-                1,
-                act=1,
-                combat_id=None,
-                reward=0.0,
-                before_revivals=0,
-                after_revivals=0,
-                before_hp=0.0,
-                after_hp=0.0,
-                act_boundary=BoundaryOutcome.SUCCEEDED,
-                decision_surface="map",
-            ),
-        ),
-        completion=EpisodeCompletion(
-            authoritative=True,
-            won=True,
-            final_revivals=0,
-            final_hp_loss=0.0,
-            terminal_reason="run_victory",
-        ),
-    )
-    mixed_success = _with_policy_versions(
-        base_episode,
-        (100, 100),
-    )
-    replay = BoundedEpisodicReplay(
-        capacity=1,
-        byte_capacity=mixed_success.storage_nbytes(),
-        episode_byte_capacity=mixed_success.storage_nbytes(),
-        max_segments_per_episode=1,
-        seed=25,
-    )
-    assert replay.put(mixed_success)
-
-    sample = replay.sample_for_learning(
-        1,
-        learn_steps=1,
-        burn_in_steps=0,
-        macro_sample_fraction=1.0,
-        current_policy_version=100,
-        policy_gradient_max_lag=5,
-        fresh_policy_sequences=1,
-    )
-
-    assert sample.diagnostics.fresh_policy_quota_filled == 1
-    assert sample.sequences[0].learn_start_step == 1
-    assert replay.metrics()["macro_sample_count"] == 1
-
-
-def test_future_behavior_policy_in_fresh_view_fails_closed() -> None:
-    snapshot = _snapshot()
-    episode = _with_policy_versions(
-        _linear_episode(snapshot, episode_id="future", length=1, won=True),
-        (101,),
-    )
-    replay = BoundedEpisodicReplay(
-        capacity=1,
-        byte_capacity=episode.storage_nbytes(),
-        episode_byte_capacity=episode.storage_nbytes(),
-        max_segments_per_episode=1,
-        seed=29,
-    )
-    assert replay.put(episode)
-
-    with pytest.raises(ValueError, match="newer than the learner"):
-        replay.sample_for_learning(
-            1,
-            learn_steps=1,
-            burn_in_steps=0,
-            macro_sample_fraction=0.0,
-            current_policy_version=100,
-            policy_gradient_max_lag=5,
-            fresh_policy_sequences=1,
-        )
 
 
 def test_macro_fraction_reserves_exact_noncombat_policy_decisions_by_surface() -> None:
@@ -1541,7 +1088,7 @@ def test_replay_state_dict_round_trips_rng_items_counters_and_rejects_atomically
         macro_sample_fraction=0.5,
     )
     payload = original.state_dict()
-    assert payload["version"] == "sts2-episodic-replay-v4"
+    assert payload["version"] == "sts2-episodic-replay-v5"
     assert payload["sample_count"] == 2
     assert payload["macro_sample_count"] == 1
     assert set(payload) == {
@@ -1580,29 +1127,6 @@ def test_replay_state_dict_round_trips_rng_items_counters_and_rejects_atomically
         )
     assert [projection(sequence) for sequence in actual] == [
         projection(sequence) for sequence in expected
-    ]
-
-    expected_fresh = original.sample_for_learning(
-        2,
-        learn_steps=2,
-        burn_in_steps=1,
-        macro_sample_fraction=0.5,
-        current_policy_version=7,
-        policy_gradient_max_lag=128,
-        fresh_policy_sequences=1,
-    )
-    actual_fresh = restored.sample_for_learning(
-        2,
-        learn_steps=2,
-        burn_in_steps=1,
-        macro_sample_fraction=0.5,
-        current_policy_version=7,
-        policy_gradient_max_lag=128,
-        fresh_policy_sequences=1,
-    )
-    assert actual_fresh.diagnostics == expected_fresh.diagnostics
-    assert [projection(sequence) for sequence in actual_fresh.sequences] == [
-        projection(sequence) for sequence in expected_fresh.sequences
     ]
     assert restored.state_dict()["rng_state"] == original.state_dict()["rng_state"]
 
@@ -1694,88 +1218,6 @@ def test_replay_rejects_hash_consistent_accounting_edits_atomically() -> None:
     assert replay.state_dict() == before
 
 
-def test_fresh_sampling_reuses_put_time_index_without_reclassifying_steps(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A learner update must not scan every stored step for fresh candidates."""
-
-    episode = _surface_episode(
-        episode_id="indexed-fresh",
-        surfaces=("event", "card_reward", "map"),
-        won=True,
-    )
-    size = episode.storage_nbytes()
-    replay = BoundedEpisodicReplay(
-        capacity=1,
-        byte_capacity=size,
-        episode_byte_capacity=size,
-        max_segments_per_episode=3,
-        seed=29,
-    )
-    assert replay.put(episode)
-
-    def unexpected_reclassification(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("fresh sampling rescanned an indexed episode")
-
-    monkeypatch.setattr(
-        episode_replay_module,
-        "_primary_policy_target",
-        unexpected_reclassification,
-    )
-    sample = replay.sample_for_learning(
-        1,
-        learn_steps=1,
-        burn_in_steps=0,
-        macro_sample_fraction=0.0,
-        current_policy_version=7,
-        policy_gradient_max_lag=0,
-        fresh_policy_sequences=1,
-    )
-
-    assert len(sample.sequences) == 1
-    assert sample.sequences[0].episode_id == episode.episode_id
-    assert sample.diagnostics.fresh_policy_candidate_decisions == 3
-    assert sample.diagnostics.fresh_policy_quota_filled == 1
-
-
-def test_indexed_fresh_sampling_preserves_legacy_step_order_for_version_runs() -> None:
-    episode = _with_policy_versions(
-        _surface_episode(
-            episode_id="indexed-version-runs",
-            surfaces=("event", "event", "event"),
-            won=True,
-        ),
-        (7, 6, 7),
-    )
-    sampling_index = episode_replay_module._build_episode_sampling_index(
-        episode,
-        storage_nbytes=episode.storage_nbytes(),
-    )
-
-    for seed in range(16):
-        expected_rng = np.random.default_rng(seed)
-        # The legacy implementation consumed one draw to resolve the sole
-        # surface tie, then indexed the eligible decisions in episode order.
-        expected_rng.integers(0, 1)
-        expected_step = int(expected_rng.integers(0, 3))
-        actual, candidate_episodes, candidate_decisions, exempted_decisions = (
-            episode_replay_module._fresh_policy_candidates(
-                (episode,),
-                (sampling_index,),
-                episode_order=(0,),
-                current_policy_version=7,
-                maximum_policy_lag=1,
-                exempt_surfaces=frozenset(),
-                rng=np.random.default_rng(seed),
-            )
-        )
-
-        assert actual == ((0, expected_step, 7 - (7, 6, 7)[expected_step]),)
-        assert candidate_episodes == 1
-        assert candidate_decisions == 3
-        assert exempted_decisions == 0
-
-
 def test_concurrent_put_completes_while_sampling_materializes_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1811,9 +1253,9 @@ def test_concurrent_put_completes_while_sampling_materializes_snapshot(
     release_sampling = threading.Event()
     put_finished = threading.Event()
     errors: list[BaseException] = []
-    original = episode_replay_module._fresh_policy_candidates
+    original = episode_replay_module._stratified_episode_order
 
-    def paused_fresh_candidates(*args: object, **kwargs: object) -> object:
+    def paused_episode_order(*args: object, **kwargs: object) -> object:
         sampling_started.set()
         if not release_sampling.wait(timeout=5.0):
             raise TimeoutError("test did not release paused sampling")
@@ -1821,20 +1263,17 @@ def test_concurrent_put_completes_while_sampling_materializes_snapshot(
 
     monkeypatch.setattr(
         episode_replay_module,
-        "_fresh_policy_candidates",
-        paused_fresh_candidates,
+        "_stratified_episode_order",
+        paused_episode_order,
     )
 
     def sample_worker() -> None:
         try:
-            replay.sample_for_learning(
+            replay.sample(
                 1,
                 learn_steps=1,
                 burn_in_steps=0,
                 macro_sample_fraction=0.0,
-                current_policy_version=7,
-                policy_gradient_max_lag=0,
-                fresh_policy_sequences=1,
             )
         except BaseException as exc:  # pragma: no cover - surfaced below
             errors.append(exc)
@@ -1869,7 +1308,7 @@ def test_concurrent_put_completes_while_sampling_materializes_snapshot(
     ]
 
 
-def test_sampling_index_tracks_eviction_duplicate_bytes_and_future_failure() -> None:
+def test_sampling_index_tracks_eviction_duplicate_and_bytes() -> None:
     snapshot = _snapshot()
     first = _linear_episode(
         snapshot,
@@ -1895,48 +1334,16 @@ def test_sampling_index_tracks_eviction_duplicate_bytes_and_future_failure() -> 
     assert replay.put(second)
     assert not replay.put(second)
 
-    sample = replay.sample_for_learning(
+    sample = replay.sample(
         1,
         learn_steps=1,
         burn_in_steps=0,
         macro_sample_fraction=0.0,
-        current_policy_version=7,
-        policy_gradient_max_lag=0,
-        fresh_policy_sequences=1,
     )
-    assert [sequence.episode_id for sequence in sample.sequences] == [second.episode_id]
+    assert [sequence.episode_id for sequence in sample] == [second.episode_id]
     metrics = replay.metrics()
     assert metrics["size"] == 1
     assert metrics["storage_nbytes"] == second.storage_nbytes()
     assert metrics["put_count"] == 2
     assert metrics["eviction_count"] == 1
     assert metrics["duplicate_count"] == 1
-
-    failed_future = _with_policy_versions(
-        _linear_episode(
-            snapshot,
-            episode_id="indexed-failed-future",
-            length=1,
-            won=False,
-        ),
-        (8,),
-    )
-    failed_size = failed_future.storage_nbytes()
-    future_replay = BoundedEpisodicReplay(
-        capacity=1,
-        byte_capacity=failed_size,
-        episode_byte_capacity=failed_size,
-        max_segments_per_episode=1,
-        seed=41,
-    )
-    assert future_replay.put(failed_future)
-    with pytest.raises(ValueError, match="newer than the learner"):
-        future_replay.sample_for_learning(
-            1,
-            learn_steps=1,
-            burn_in_steps=0,
-            macro_sample_fraction=0.0,
-            current_policy_version=7,
-            policy_gradient_max_lag=128,
-            fresh_policy_sequences=1,
-        )

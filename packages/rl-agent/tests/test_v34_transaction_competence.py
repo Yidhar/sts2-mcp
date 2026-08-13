@@ -15,10 +15,6 @@ from sts2_rl.training import (
     summarize_evaluation,
 )
 from sts2_rl.training.collector import _deck_card_removal_committed
-from sts2_rl.training.failure_credit import (
-    DirectPolicyTarget,
-    FailureOutcome,
-)
 from tests.test_v2_training_pipeline import TerminalWithoutObservationFlagsBackend
 from tests.test_v33_recovery_semantics import (
     _recovery_config,
@@ -393,36 +389,6 @@ def test_successful_rest_emits_symmetric_factual_lifecycle_and_q_label() -> None
         assert metrics["committed_rest_lifecycle_size"] == 1
     finally:
         resources.close()
-
-
-def test_forge_completes_and_keeps_verified_positive_credit() -> None:
-    config = _shadow_credit_config(max_steps=8)
-    resources = build_training_resources(
-        config,
-        backend=_RestForgeSelectionSuccessBackend(),
-    )
-    try:
-        resources.collector.bind_failure_credit_run_id("v34-forge")
-        resources.collector._rng = _ScriptedChoiceRng((0, 0, 1))  # type: ignore[assignment]
-        with torch.no_grad():
-            for parameter in resources.model.parameters():
-                parameter.zero_()
-        episode = resources.collector.collect_episode(
-            epsilon=0.05,
-            deterministic=False,
-            record=True,
-        )
-    finally:
-        resources.close()
-
-    assert episode.metrics.run_won
-    assert episode.metrics.forge_selection_transactions_completed == 1
-    assert any(
-        target.target is DirectPolicyTarget.PREFER
-        for record in episode.failure_credit_records
-        if record.incident.outcome is FailureOutcome.COMPLETED
-        for target in record.plan.direct_policy_targets
-    )
 
 
 def test_shop_removal_requires_real_deck_mutation_and_reports_it() -> None:

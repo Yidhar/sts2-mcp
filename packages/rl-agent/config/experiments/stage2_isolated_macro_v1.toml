@@ -52,11 +52,8 @@ macro_option_max_log_probability_shift = 2.0
 mode = "disabled"
 
 [episodic_learning]
-fresh_policy_sequences = 1
-act_segment_imitation_enabled = false
 combat_hp_loss_value_weight = 0.05
 combat_hp_loss_reference = 80.0
-success_policy_trust_region_epsilon = 0.20
 
 [curriculum]
 revival_budget = 40

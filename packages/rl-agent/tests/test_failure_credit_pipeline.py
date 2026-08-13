@@ -11,11 +11,11 @@ from sts2_rl.semantics import (
     ProgressKind,
 )
 from sts2_rl.training.failure_credit import (
-    DirectPolicyTarget,
     EvidenceStratum,
     FailureCreditEpisodePipeline,
     FailureCreditPipelineConfig,
     FailureOutcome,
+    WitnessKind,
 )
 
 
@@ -233,16 +233,17 @@ def test_event_two_state_loop_captures_detector_time_direct_witness_and_forced_s
     assert failure.incident.outcome is FailureOutcome.DEADLOCK_CYCLE
     assert EvidenceStratum.DIRECT_WITNESS in failure.plan.strata
     assert EvidenceStratum.RISK_SEQUENCE in failure.plan.strata
-    assert len(failure.plan.direct_policy_targets) == 1
-    direct = failure.plan.direct_policy_targets[0]
-    assert direct.target is DirectPolicyTarget.AVOID
-    # The second LOOP policy choice owns actor credit.  Its forced PROCEED
-    # suffix remains value/Q context but is never blamed directly.
-    assert failure.plan.context.steps[direct.step_index].episode_step == 2
+    witness = failure.incident.witnesses[0]
+    assert witness.kind is WitnessKind.DIRECT_WITNESS
+    # The second LOOP policy choice owns the detector attribution.  Its forced
+    # PROCEED suffix remains value/Q context but is never attributed directly.
+    attributed_episode_steps = tuple(
+        failure.plan.context.steps[index].episode_step for index in witness.attributed_step_indices
+    )
+    assert attributed_episode_steps == (2,)
     forced_step = next(index for index, step in enumerate(failure.plan.context.steps) if step.episode_step == 3)
     assert failure.plan.context.steps[forced_step].forced
-    assert forced_step not in {target.step_index for target in failure.plan.direct_policy_targets}
-    witness = failure.incident.witnesses[0]
+    assert forced_step not in witness.attributed_step_indices
     assert witness.supporting_episode_steps == (0, 1, 2, 3)
     assert witness.loop_edges[0].supporting_episode_steps == (0, 2)
     assert result.metrics.detected_direct_cycles == 1
@@ -288,7 +289,6 @@ def test_detector_confirmed_cycle_is_drainable_before_episode_boundary_once() ->
     )
     assert not any(record.incident.outcome is FailureOutcome.DEADLOCK_CYCLE for record in result.records)
     assert result.metrics.streamed_records == 1
-    assert result.metrics.streamed_actor_actionable_records == 1
     assert result.metrics.detected_direct_cycles == 1
     assert result.metrics.detected_multi_edge_cycles == 0
 
@@ -346,18 +346,19 @@ def test_multiselect_select_deselect_cycle_is_multi_edge_not_last_action_blame()
 
     assert failure.incident.outcome is FailureOutcome.DEADLOCK_CYCLE
     assert EvidenceStratum.MULTI_EDGE_CYCLE in failure.plan.strata
-    assert not failure.plan.direct_policy_targets
-    assert len(failure.plan.cycle_policy_targets) == 1
+    assert EvidenceStratum.DIRECT_WITNESS not in failure.plan.strata
+    witness = failure.incident.witnesses[0]
+    assert witness.kind is WitnessKind.MULTI_EDGE_CYCLE
     attributed = tuple(
-        failure.plan.context.steps[index].episode_step for index in failure.plan.cycle_policy_targets[0].step_indices
+        failure.plan.context.steps[index].episode_step for index in witness.attributed_step_indices
     )
     assert attributed == (2, 3)
-    assert len(failure.incident.witnesses[0].loop_edges) == 2
+    assert len(witness.loop_edges) == 2
     assert result.metrics.detected_direct_cycles == 0
     assert result.metrics.detected_multi_edge_cycles == 1
 
 
-def test_unique_unresolved_stall_has_risk_value_credit_but_no_avoid_target() -> None:
+def test_unique_unresolved_stall_has_risk_value_credit_without_step_blame() -> None:
     pipeline, encoder = _pipeline()
     actions = _event_actions()
     for step in range(4):
@@ -384,16 +385,17 @@ def test_unique_unresolved_stall_has_risk_value_credit_but_no_avoid_target() -> 
     assert failure.incident.outcome is FailureOutcome.DEADLOCK_STALL
     assert EvidenceStratum.RISK_SEQUENCE in failure.plan.strata
     assert EvidenceStratum.UNRESOLVED_STALL in failure.plan.strata
+    assert EvidenceStratum.DIRECT_WITNESS not in failure.plan.strata
+    assert EvidenceStratum.MULTI_EDGE_CYCLE not in failure.plan.strata
     assert failure.plan.liveness_value_targets
     assert failure.plan.liveness_q_targets
-    assert not failure.plan.direct_policy_targets
-    assert not failure.plan.cycle_policy_targets
-    assert failure.plan.direct_actor_label_count == 0
-    assert failure.plan.risk_actor_candidate_count == 4
-    assert failure.plan.actor_label_count == 4
+    witness = failure.incident.witnesses[0]
+    assert witness.kind is WitnessKind.RISK_SEQUENCE
+    assert len(witness.attributed_step_indices) == 4
+    assert witness.loop_edges == ()
 
 
-def test_flow_completion_is_zero_liveness_control_without_generic_prefer() -> None:
+def test_flow_completion_is_zero_liveness_control_without_witnesses() -> None:
     pipeline, encoder = _pipeline()
     event = _event("CHOICE")
     map_observation = {
@@ -434,81 +436,10 @@ def test_flow_completion_is_zero_liveness_control_without_generic_prefer() -> No
     assert completion.plan.strata == (EvidenceStratum.COMPLETION_CONTROL,)
     assert completion.plan.liveness_value_targets
     assert all(target.target == 0.0 for target in completion.plan.liveness_value_targets)
-    assert not completion.plan.direct_policy_targets
-    assert completion.plan.actor_label_count == 0
+    assert completion.incident.witnesses == ()
 
 
-def test_selection_clean_exit_keeps_completion_prefer_credit() -> None:
-    pipeline, encoder = _pipeline()
-    selection = _event("SELECT", selected_count=1)
-    selection_actions = (
-        {
-            "action_handle": "confirm-selection",
-            "model_action_kind": "card_selection",
-            "model_action_variant": "confirm",
-            "selection_operation": "confirm",
-            "kind": "confirm_selection",
-        },
-        {
-            "action_handle": "deselect-strike",
-            "model_action_kind": "card_selection",
-            "model_action_variant": "deselect",
-            "selection_operation": "deselect",
-            "kind": "deselect_card",
-            "card": {
-                "card_id": "CARD.STRIKE",
-                "card_instance_id": "strike-instance",
-                "upgrade_level": 0,
-            },
-        },
-    )
-    map_observation = {
-        "phase": "map",
-        "decision_domain": "map",
-        "run": {"act": 1, "floor": 9},
-        "map": {"current_coordinate": {"x": 1, "y": 9}},
-        "player": {"hp": 60, "max_hp": 80},
-    }
-    map_actions = (
-        {
-            "action_handle": "map-next",
-            "model_action_kind": "map_node",
-            "kind": "map_node",
-            "coordinate": {"x": 2, "y": 10},
-        },
-    )
-
-    kind = _observe(
-        pipeline,
-        encoder,
-        step=0,
-        before=selection,
-        actions=selection_actions,
-        selected=0,
-        after=map_observation,
-        after_actions=map_actions,
-    )
-    result = pipeline.finalize(
-        failure_kind=None,
-        local_failure=False,
-        terminal_succeeded=True,
-    )
-    completion = result.records[0]
-
-    assert kind is ProgressKind.FLOW_ADVANCE
-    assert completion.incident.outcome is FailureOutcome.COMPLETED
-    assert completion.plan.strata == (EvidenceStratum.COMPLETION_CONTROL,)
-    assert completion.plan.liveness_q_targets
-    assert len(completion.plan.direct_policy_targets) == 1
-    preferred = completion.plan.direct_policy_targets[0]
-    assert preferred.target is DirectPolicyTarget.PREFER
-    assert completion.plan.context.steps[preferred.step_index].selected_action == (
-        completion.plan.context.steps[preferred.step_index].candidate_actions[0]
-    )
-    assert completion.plan.actor_label_count == 1
-
-
-def test_combat_net_damage_resets_stall_epoch_without_completion_or_prefer() -> None:
+def test_combat_net_damage_resets_stall_epoch_without_completion() -> None:
     pipeline, encoder = _pipeline()
     before = {
         "phase": "combat",
@@ -565,7 +496,7 @@ def test_combat_net_damage_resets_stall_epoch_without_completion_or_prefer() -> 
     assert result.metrics.completion_controls == 0
 
 
-def test_shop_durable_commit_has_zero_liveness_control_but_no_prefer() -> None:
+def test_shop_durable_commit_has_zero_liveness_control_without_witnesses() -> None:
     pipeline, encoder = _pipeline()
     actions = (
         {
@@ -624,8 +555,8 @@ def test_shop_durable_commit_has_zero_liveness_control_but_no_prefer() -> None:
     assert kind is ProgressKind.DURABLE_COMMIT
     assert completion.incident.failure_kind == "verified_durable_commit"
     assert completion.plan.liveness_q_targets
-    assert not completion.plan.direct_policy_targets
-    assert completion.plan.actor_label_count == 0
+    assert all(target.target == 0.0 for target in completion.plan.liveness_q_targets)
+    assert completion.incident.witnesses == ()
 
 
 def test_completion_staging_is_count_bounded_and_context_is_critic_minimal() -> None:
@@ -687,7 +618,7 @@ def test_completion_staging_is_count_bounded_and_context_is_critic_minimal() -> 
     for completion in completions:
         assert len(completion.plan.context.learn_step_indices) == 1
         assert len(completion.plan.context.steps) <= 3
-        assert completion.plan.actor_label_count == 0
+        assert completion.incident.witnesses == ()
 
 
 def test_hp_death_and_revival_are_cost_only_and_do_not_reset_loop_epoch() -> None:
@@ -726,7 +657,7 @@ def test_hp_death_and_revival_are_cost_only_and_do_not_reset_loop_epoch() -> Non
     assert result.metrics.progress_receipts == ((ProgressKind.COST_ONLY, 2),)
 
 
-def test_cycle_followed_by_a_long_unique_tail_loses_direct_actor_blame() -> None:
+def test_cycle_followed_by_a_long_unique_tail_loses_direct_witness_blame() -> None:
     pipeline, encoder = _pipeline(
         detector_window_steps=32,
         context_burn_in_steps=1,
@@ -774,9 +705,9 @@ def test_cycle_followed_by_a_long_unique_tail_loses_direct_actor_blame() -> None
 
     assert failure.incident.outcome is FailureOutcome.DEADLOCK_STALL
     assert EvidenceStratum.UNRESOLVED_STALL in failure.plan.strata
+    assert EvidenceStratum.DIRECT_WITNESS not in failure.plan.strata
     assert EvidenceStratum.MULTI_EDGE_CYCLE not in failure.plan.strata
-    assert not failure.plan.direct_policy_targets
-    assert not failure.plan.cycle_policy_targets
+    assert {witness.kind for witness in failure.incident.witnesses} == {WitnessKind.RISK_SEQUENCE}
     assert len(failure.plan.context.steps) == 9
     assert failure.plan.context.burn_in_steps == 1
 
@@ -831,10 +762,8 @@ def test_abandoned_cycle_inside_learning_tail_cannot_blame_later_stall() -> None
     assert EvidenceStratum.UNRESOLVED_STALL in failure.plan.strata
     assert EvidenceStratum.DIRECT_WITNESS not in failure.plan.strata
     assert EvidenceStratum.MULTI_EDGE_CYCLE not in failure.plan.strata
-    assert not failure.plan.direct_policy_targets
-    assert not failure.plan.cycle_policy_targets
-    assert failure.plan.direct_actor_label_count == 0
-    assert failure.plan.risk_actor_candidate_count == 10
+    assert {witness.kind for witness in failure.incident.witnesses} == {WitnessKind.RISK_SEQUENCE}
+    assert len(failure.incident.witnesses[0].attributed_step_indices) == 10
 
 
 def test_detector_window_never_expands_recurrent_context_past_hard_bound() -> None:
@@ -876,7 +805,9 @@ def test_detector_window_never_expands_recurrent_context_past_hard_bound() -> No
     assert failure.plan.context.burn_in_steps == 32
     assert failure.plan.context.steps[0].episode_step == 80
     assert failure.plan.context.steps[-1].episode_step == 223
+    witness = failure.incident.witnesses[0]
+    assert witness.kind is WitnessKind.MULTI_EDGE_CYCLE
     attributed = tuple(
-        failure.plan.context.steps[index].episode_step for index in failure.plan.cycle_policy_targets[0].step_indices
+        failure.plan.context.steps[index].episode_step for index in witness.attributed_step_indices
     )
     assert attributed == tuple(range(112, 224))

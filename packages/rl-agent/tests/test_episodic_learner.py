@@ -10,7 +10,6 @@ os.environ["HIP_VISIBLE_DEVICES"] = ""
 import numpy as np
 import pytest
 import torch
-import torch.nn.functional as F
 
 from sts2_rl.encoding import (
     EncodedDecisionSnapshot,
@@ -22,7 +21,6 @@ from sts2_rl.encoding.snapshot import collate_encoded_snapshots, sparse_token_ta
 from sts2_rl.models import GroundedCandidateConfig, RecurrentCandidateModel
 from sts2_rl.training.config import EpisodicLearningConfig, OptimizationConfig
 from sts2_rl.training.episode_replay import (
-    ActSegmentHealth,
     BoundaryOutcome,
     BoundedEpisodicReplay,
     CompletedEpisode,
@@ -254,7 +252,6 @@ def _sequence(
         configured_burn_in_steps=configured_burn_in_steps,
         source_episode_won=episode.won,
         source_episode_authoritative=episode.completion.authoritative,
-        act_segment_health=episode.act_segment_health,
     )
 
 
@@ -262,17 +259,8 @@ def _learner(
     *,
     burn_in_steps: int = 0,
     learn_steps: int = 4,
-    primary_policy_weight: float = 0.25,
     task_value_weight: float = 0.25,
     revival_value_weight: float = 0.10,
-    revival_policy_weight: float = 0.05,
-    secondary_advantage_fraction: float = 0.25,
-    success_policy_trust_region_epsilon: float = 0.20,
-    success_imitation_exempt_surfaces: tuple[str, ...] = (),
-    act_segment_imitation_enabled: bool = False,
-    act_segment_policy_weight: float = 0.30,
-    act_segment_min_exit_hp_ratio: float = 0.35,
-    act_segment_max_revival_fraction: float = 0.34,
     combat_hp_loss_value_weight: float = 0.0,
     combat_hp_loss_reference: float = 80.0,
     dropout: float = 0.0,
@@ -292,23 +280,8 @@ def _learner(
             enabled=True,
             burn_in_steps=burn_in_steps,
             learn_steps=learn_steps,
-            primary_policy_weight=primary_policy_weight,
             task_value_weight=task_value_weight,
             revival_value_weight=revival_value_weight,
-            revival_policy_weight=revival_policy_weight,
-            secondary_advantage_fraction=secondary_advantage_fraction,
-            success_policy_trust_region_epsilon=(
-                success_policy_trust_region_epsilon
-            ),
-            success_imitation_exempt_surfaces=(
-                success_imitation_exempt_surfaces
-            ),
-            act_segment_imitation_enabled=act_segment_imitation_enabled,
-            act_segment_policy_weight=act_segment_policy_weight,
-            act_segment_min_exit_hp_ratio=act_segment_min_exit_hp_ratio,
-            act_segment_max_revival_fraction=(
-                act_segment_max_revival_fraction
-            ),
             combat_hp_loss_value_weight=combat_hp_loss_value_weight,
             combat_hp_loss_reference=combat_hp_loss_reference,
         ),
@@ -397,233 +370,11 @@ def test_local_boundary_cannot_conflict_with_shared_run_terminal_outcome() -> No
         )
 
 
-def _policy_gradient(model: RecurrentCandidateModel) -> torch.Tensor:
-    gradients = [
-        parameter.grad.detach().flatten()
-        for name, parameter in model.named_parameters()
-        if name.startswith("policy_head.") and parameter.grad is not None
-    ]
-    assert gradients
-    return torch.cat(gradients)
-
-
-def _zero_multiscale_heads(model: RecurrentCandidateModel) -> None:
-    for name in (
-        "combat_task_value_head",
-        "act_task_value_head",
-        "run_task_value_head",
-        "combat_revival_cost_value_head",
-        "act_revival_cost_value_head",
-        "run_revival_cost_value_head",
-    ):
-        for parameter in getattr(model, name).parameters():
-            torch.nn.init.zeros_(parameter)
-
-
-def _constant_head_output(head: torch.nn.Sequential, value: float) -> None:
-    for parameter in head.parameters():
-        torch.nn.init.zeros_(parameter)
-    final_linear = head[-1]
-    assert isinstance(final_linear, torch.nn.Linear)
-    torch.nn.init.constant_(final_linear.bias, value)
-
-
-def test_early_action_beyond_online_unroll_gets_run_policy_gradient() -> None:
-    learner, encoding = _learner(learn_steps=1)
-    snapshot = _snapshot(encoding, domain_id=0)
-    episode = _episode(
-        (snapshot,) * 40,
-        episode_id="long-run-success",
-        won=True,
-    )
-    assert len(episode.steps) > learner.maximum_unroll_length
-    assert episode.steps[0].run.success is True
-    assert episode.steps[0].run.return_steps == 40
-
-    sequence = _sequence(episode)
-    losses = learner._episodic_losses((sequence,), current_policy_version=0)
-    learner.model.zero_grad(set_to_none=True)
-    losses.total_loss.backward()
-
-    assert losses.policy_labels == 1
-    assert losses.task_value_labels == 2  # Act and complete-run boundaries.
-    gradient = _policy_gradient(learner.model)
-    assert torch.isfinite(gradient).all()
-    assert torch.count_nonzero(gradient) > 0
-
-
-def test_failed_horizon_is_value_only_without_anti_imitation_policy_label() -> None:
-    learner, encoding = _learner(learn_steps=1)
-    snapshot = _snapshot(encoding, domain_id=0)
-    episode = _episode((snapshot,) * 12, episode_id="long-run-failure", won=False)
-
-    losses = learner._episodic_losses(
-        (_sequence(episode),),
-        current_policy_version=0,
-    )
-
-    assert losses.task_value_labels == 2
-    assert losses.success_policy_candidate_labels == 0
-    assert losses.policy_labels == 0
-    assert losses.policy_active_sequences == 0
-    assert losses.failure_policy_suppressed_labels == 1
-    assert losses.policy_lag_suppressed_labels == 0
-    assert losses.revival_value_labels == 0
-    assert losses.efficiency_policy_labels == 0
-    assert losses.primary_policy_loss.detach().item() == 0.0
-    assert losses.revival_value_loss.detach().item() == 0.0
-    assert losses.revival_policy_loss.detach().item() == 0.0
-
-    learner.model.zero_grad(set_to_none=True)
-    losses.total_loss.backward()
-    assert all(
-        parameter.grad is None or torch.count_nonzero(parameter.grad) == 0
-        for name, parameter in learner.model.named_parameters()
-        if name.startswith("policy_head.")
-    )
-
-
-def _failed_run_after_act_one(
-    snapshot: EncodedDecisionSnapshot,
-    *,
-    exit_hp_ratio: float,
-    cumulative_revivals: int,
-    revival_budget: int = 64,
-) -> CompletedEpisode:
-    steps = (
-        EpisodeDecisionStep(
-            snapshot=snapshot,
-            step_index=0,
-            action_index=0,
-            behavior_log_probability=-0.6931471805599453,
-            policy_decision=True,
-            policy_version=0,
-            act=1,
-            combat_id=None,
-            task_reward=0.0,
-            discount=1.0,
-            revivals_before=0,
-            revivals_after=cumulative_revivals,
-            hp_loss_before=0.0,
-            hp_loss_after=10.0,
-            act_boundary=BoundaryOutcome.SUCCEEDED,
-            decision_surface="map",
-        ),
-        EpisodeDecisionStep(
-            snapshot=snapshot,
-            step_index=1,
-            action_index=1,
-            behavior_log_probability=-0.6931471805599453,
-            policy_decision=True,
-            policy_version=0,
-            act=2,
-            combat_id=None,
-            task_reward=-1.0,
-            discount=0.0,
-            revivals_before=cumulative_revivals,
-            revivals_after=cumulative_revivals,
-            hp_loss_before=10.0,
-            hp_loss_after=10.0,
-            act_boundary=BoundaryOutcome.FAILED,
-            decision_surface="map",
-        ),
-    )
-    return backfill_completed_episode(
-        episode_id="failed-after-act-one",
-        steps=steps,
-        completion=EpisodeCompletion(
-            authoritative=True,
-            won=False,
-            final_revivals=cumulative_revivals,
-            final_hp_loss=10.0,
-            terminal_reason="run_defeat",
-        ),
-        act_segment_health=(
-            ActSegmentHealth(
-                act=1,
-                boundary_step_index=0,
-                exit_hp_ratio=exit_hp_ratio,
-                cumulative_revivals=cumulative_revivals,
-                revival_budget=revival_budget,
-            ),
-        ),
-    )
-
-
-def test_healthy_act_prefix_in_failed_run_gets_lower_weight_policy_imitation() -> None:
-    learner, encoding = _learner(
-        learn_steps=1,
-        primary_policy_weight=0.25,
-        task_value_weight=0.0,
-        revival_value_weight=0.0,
-        revival_policy_weight=0.0,
-        act_segment_imitation_enabled=True,
-        act_segment_policy_weight=0.30,
-    )
-    snapshot = _snapshot(encoding, domain_id=0)
-    _zero_multiscale_heads(learner.model)
-    for parameter in learner.model.policy_head.parameters():
-        torch.nn.init.zeros_(parameter)
-
-    successful_run = _episode(
-        (snapshot,),
-        episode_id="complete-run-win",
-        won=True,
-    )
-    healthy_prefix = _failed_run_after_act_one(
-        snapshot,
-        exit_hp_ratio=0.60,
-        cumulative_revivals=4,
-    )
-    run_loss = learner._episodic_losses(
-        (_sequence(successful_run),),
-        current_policy_version=0,
-    )
-    prefix_loss = learner._episodic_losses(
-        (_sequence(healthy_prefix),),
-        current_policy_version=0,
-    )
-
-    assert prefix_loss.act_segment_policy_labels == 1
-    assert prefix_loss.act_segment_healthy_acts == 1
-    assert prefix_loss.policy_labels == 1
-    assert prefix_loss.efficiency_policy_labels == 0
-    assert prefix_loss.failure_policy_suppressed_labels == 0
-    assert prefix_loss.total_loss.detach().item() == pytest.approx(
-        0.30 * run_loss.total_loss.detach().item(),
-        rel=1.0e-5,
-    )
-
-
-def test_unhealthy_act_prefix_remains_value_only() -> None:
-    learner, encoding = _learner(
-        learn_steps=1,
-        act_segment_imitation_enabled=True,
-    )
-    episode = _failed_run_after_act_one(
-        _snapshot(encoding, domain_id=0),
-        exit_hp_ratio=0.20,
-        cumulative_revivals=24,
-    )
-    losses = learner._episodic_losses(
-        (_sequence(episode),),
-        current_policy_version=0,
-    )
-
-    assert losses.act_segment_policy_labels == 0
-    assert losses.act_segment_healthy_acts == 0
-    assert losses.act_segment_health_gate_suppressed_labels == 1
-    assert losses.policy_labels == 0
-    assert losses.failure_policy_suppressed_labels == 1
-
-
 def test_failed_combat_hp_loss_is_bounded_factual_value_supervision() -> None:
     learner, encoding = _learner(
         learn_steps=1,
-        primary_policy_weight=0.0,
         task_value_weight=0.0,
         revival_value_weight=0.0,
-        revival_policy_weight=0.0,
         combat_hp_loss_value_weight=0.10,
         combat_hp_loss_reference=80.0,
     )
@@ -660,10 +411,7 @@ def test_failed_combat_hp_loss_is_bounded_factual_value_supervision() -> None:
         ),
     )
 
-    losses = learner._episodic_losses(
-        (_sequence(episode),),
-        current_policy_version=0,
-    )
+    losses = learner._episodic_losses((_sequence(episode),))
     learner.model.zero_grad(set_to_none=True)
     losses.total_loss.backward()
 
@@ -676,69 +424,6 @@ def test_failed_combat_hp_loss_is_bounded_factual_value_supervision() -> None:
     )
 
 
-def test_stale_episode_keeps_value_labels_but_suppresses_policy_gradient() -> None:
-    learner, encoding = _learner(learn_steps=1)
-    snapshot = _snapshot(encoding, domain_id=0)
-    episode = _episode((snapshot,), episode_id="stale-success", won=True)
-
-    losses = learner._episodic_losses(
-        (_sequence(episode),),
-        current_policy_version=(
-            learner.episodic_config.policy_gradient_max_lag + 1
-        ),
-    )
-
-    assert losses.success_policy_candidate_labels == 1
-    assert losses.policy_labels == 0
-    assert losses.policy_active_sequences == 0
-    assert losses.policy_lag_suppressed_labels == 1
-    assert losses.failure_policy_suppressed_labels == 0
-    assert losses.task_value_labels == 2
-    assert losses.revival_value_labels == 2
-    assert losses.task_value_loss.detach().item() > 0.0
-
-
-def test_policy_label_classification_separates_fresh_stale_and_failed_sequences() -> None:
-    learner, encoding = _learner(learn_steps=1)
-    snapshot = _snapshot(encoding, domain_id=0)
-    current_policy_version = learner.episodic_config.policy_gradient_max_lag + 1
-    fresh_success = _episode(
-        (snapshot,),
-        episode_id="fresh-success",
-        won=True,
-        policy_versions=(current_policy_version,),
-    )
-    stale_success = _episode(
-        (snapshot,),
-        episode_id="stale-success",
-        won=True,
-        policy_versions=(0,),
-    )
-    stale_failure = _episode(
-        (snapshot,),
-        episode_id="stale-failure",
-        won=False,
-        policy_versions=(0,),
-    )
-
-    losses = learner._episodic_losses(
-        (
-            _sequence(fresh_success),
-            _sequence(stale_success),
-            _sequence(stale_failure),
-        ),
-        current_policy_version=current_policy_version,
-    )
-
-    assert losses.success_policy_candidate_labels == 2
-    assert losses.policy_labels == 1
-    assert losses.policy_active_sequences == 1
-    assert losses.policy_lag_suppressed_labels == 1
-    assert losses.failure_policy_suppressed_labels == 1
-    assert losses.task_value_labels == 6
-    assert losses.revival_value_labels == 4
-
-
 def test_forced_singleton_trains_values_without_any_policy_label() -> None:
     learner, encoding = _learner(learn_steps=1)
     singleton = _snapshot(encoding, domain_id=0, singleton=True)
@@ -749,18 +434,12 @@ def test_forced_singleton_trains_values_without_any_policy_label() -> None:
         policy_decisions=(False,),
     )
     sequence = _sequence(episode)
-    losses = learner._episodic_losses((sequence,), current_policy_version=0)
+    losses = learner._episodic_losses((sequence,))
     learner.model.zero_grad(set_to_none=True)
     losses.total_loss.backward()
 
     assert losses.task_value_labels == 2
     assert losses.revival_value_labels == 2
-    assert losses.success_policy_candidate_labels == 0
-    assert losses.policy_labels == 0
-    assert losses.policy_active_sequences == 0
-    assert losses.failure_policy_suppressed_labels == 0
-    assert losses.policy_lag_suppressed_labels == 0
-    assert losses.efficiency_policy_labels == 0
     assert losses.task_value_loss.detach().item() > 0.0
     assert losses.revival_value_loss.detach().item() > 0.0
     assert all(
@@ -786,10 +465,7 @@ def test_revival_value_log_observation_bounds_unlimited_revival_tail() -> None:
         policy_decisions=(False,),
     )
 
-    losses = learner._episodic_losses(
-        (_sequence(episode),),
-        current_policy_version=0,
-    )
+    losses = learner._episodic_losses((_sequence(episode),))
 
     assert losses.revival_value_labels == 2
     assert torch.isfinite(losses.revival_value_loss)
@@ -851,7 +527,7 @@ def test_sparse_exact_burn_in_matches_full_split_recurrent_history() -> None:
     full = recurrent_state(episode.steps[: sequence.learn_start_step])
     sparse = recurrent_state(sequence.burn_in)
     torch.testing.assert_close(sparse, full, atol=1e-6, rtol=1e-6)
-    losses = learner._episodic_losses((sequence,), current_policy_version=0)
+    losses = learner._episodic_losses((sequence,))
     assert losses.burn_in_steps == 3
     assert losses.learn_steps == 1
 
@@ -888,19 +564,17 @@ def test_dropout_replay_is_deterministic_exact_and_restores_model_mode() -> None
     )
 
     learner.model.train()
-    first = learner._episodic_losses((sparse,), current_policy_version=0)
+    first = learner._episodic_losses((sparse,))
     assert learner.model.training
-    second = learner._episodic_losses((sparse,), current_policy_version=0)
+    second = learner._episodic_losses((sparse,))
     assert learner.model.training
-    complete_history = learner._episodic_losses((full,), current_policy_version=0)
+    complete_history = learner._episodic_losses((full,))
     assert learner.model.training
 
     for name in (
         "total_loss",
-        "primary_policy_loss",
         "task_value_loss",
         "revival_value_loss",
-        "revival_policy_loss",
     ):
         torch.testing.assert_close(
             getattr(first, name),
@@ -916,12 +590,22 @@ def test_dropout_replay_is_deterministic_exact_and_restores_model_mode() -> None
         )
 
     learner.model.eval()
-    learner._episodic_losses((sparse,), current_policy_version=0)
+    learner._episodic_losses((sparse,))
     assert not learner.model.training
 
     learner.model.train()
-    with pytest.raises(ValueError, match="newer than the learner"):
-        learner._episodic_losses((sparse,), current_policy_version=-1)
+    mismatched = ReplaySequence(
+        episode_id=episode.episode_id,
+        start_step=0,
+        learn_start_step=5,
+        steps=episode.steps[:6],
+        burn_in_steps=5,
+        configured_burn_in_steps=3,
+        source_episode_won=episode.won,
+        source_episode_authoritative=episode.completion.authoritative,
+    )
+    with pytest.raises(ValueError, match="burn-in configuration"):
+        learner._episodic_losses((mismatched,))
     assert learner.model.training
 
 
@@ -951,305 +635,3 @@ def test_ten_thousand_step_source_keeps_graph_suffix_bounded() -> None:
     assert sequence.exact_recurrent_reconstruction
     assert len(sequence.learn_steps) == 32
     assert len(sequence.learn_steps) <= 32
-
-
-def test_secondary_revival_signal_cannot_reverse_or_exceed_primary_fraction() -> None:
-    primary_weight = 0.4
-    secondary_fraction = 0.25
-    learner, encoding = _learner(
-        learn_steps=1,
-        primary_policy_weight=primary_weight,
-        task_value_weight=0.0,
-        revival_value_weight=0.0,
-        revival_policy_weight=10.0,
-        secondary_advantage_fraction=secondary_fraction,
-    )
-    _zero_multiscale_heads(learner.model)
-    snapshot = _snapshot(encoding, domain_id=0)
-    episode = _episode(
-        (snapshot,),
-        episode_id="successful-but-costly",
-        won=True,
-        final_revivals=100,
-    )
-    losses = learner._episodic_losses(
-        (_sequence(episode),),
-        current_policy_version=0,
-    )
-    assert losses.efficiency_policy_labels == 1
-
-    learner.model.zero_grad(set_to_none=True)
-    losses.primary_policy_loss.backward(retain_graph=True)
-    primary_gradient = _policy_gradient(learner.model)
-    learner.model.zero_grad(set_to_none=True)
-    losses.total_loss.backward()
-    combined_gradient = _policy_gradient(learner.model)
-
-    assert torch.dot(primary_gradient, combined_gradient) > 0.0
-    ratio = combined_gradient.norm() / primary_gradient.norm()
-    lower = primary_weight * (1.0 - secondary_fraction)
-    upper = primary_weight * (1.0 + secondary_fraction)
-    assert float(ratio) >= lower - 1e-5
-    assert float(ratio) <= upper + 1e-5
-
-
-def test_success_tie_keeps_revival_preference_after_primary_calibration() -> None:
-    def update_probability(final_revivals: int) -> tuple[float, float, float]:
-        learner, encoding = _learner(
-            learn_steps=1,
-            primary_policy_weight=1.0,
-            task_value_weight=0.0,
-            revival_value_weight=0.0,
-            revival_policy_weight=10.0,
-            secondary_advantage_fraction=0.25,
-        )
-        snapshot = _snapshot(encoding, domain_id=0)
-        encoded = collate_encoded_snapshots(
-            (snapshot,),
-            expected_config=encoding,
-            expected_fingerprint=grounding_encoding_identity()[
-                "fingerprint_sha256"
-            ],
-            device=CPU,
-        )
-        # The helper trajectory contains the factual +1 run-terminal reward.
-        # Make the run value exactly calibrated so its policy advantage is
-        # zero; only the success-stratum revival tie-break may distinguish the
-        # two otherwise successful paths.
-        _constant_head_output(learner.model.run_task_value_head, 1.0)
-        with torch.no_grad():
-            before = float(
-                torch.softmax(learner.model(encoded).policy_logits, dim=-1)[0, 0]
-            )
-        episode = _episode(
-            (snapshot,),
-            episode_id=f"calibrated-success-{final_revivals}",
-            won=True,
-            final_revivals=final_revivals,
-        )
-        losses = learner._episodic_losses(
-            (_sequence(episode),),
-            current_policy_version=0,
-        )
-        assert losses.efficiency_policy_labels == 1
-        assert losses.primary_policy_loss.detach().item() == pytest.approx(0.0)
-        learner.optimizer.zero_grad(set_to_none=True)
-        losses.total_loss.backward()
-        learner.optimizer.step()
-        with torch.no_grad():
-            after = float(
-                torch.softmax(learner.model(encoded).policy_logits, dim=-1)[0, 0]
-            )
-        return before, after, float(losses.total_loss.detach().item())
-
-    low_before, low_after, low_loss = update_probability(0)
-    high_before, high_after, high_loss = update_probability(100)
-
-    assert low_before == pytest.approx(high_before)
-    assert low_after > low_before
-    assert high_after < high_before
-    assert low_loss != pytest.approx(0.0)
-    assert high_loss != pytest.approx(0.0)
-
-
-def test_revival_cost_cannot_override_primary_outside_success_tie_band() -> None:
-    learner, encoding = _learner(
-        learn_steps=1,
-        primary_policy_weight=1.0,
-        task_value_weight=0.0,
-        revival_value_weight=0.0,
-        revival_policy_weight=10.0,
-        secondary_advantage_fraction=0.25,
-    )
-    snapshot = _snapshot(encoding, domain_id=0)
-    encoded = collate_encoded_snapshots(
-        (snapshot,),
-        expected_config=encoding,
-        expected_fingerprint=grounding_encoding_identity()["fingerprint_sha256"],
-        device=CPU,
-    )
-    tolerance = learner.episodic_config.primary_success_tie_tolerance
-    # Successful target is +1. Set the task value just outside the explicit
-    # tie band, leaving a small but material positive completion advantage.
-    _constant_head_output(
-        learner.model.run_task_value_head,
-        1.0 - tolerance - 0.01,
-    )
-    with torch.no_grad():
-        before = float(
-            torch.softmax(learner.model(encoded).policy_logits, dim=-1)[0, 0]
-        )
-    costly_success = _episode(
-        (snapshot,),
-        episode_id="outside-tie-costly-success",
-        won=True,
-        final_revivals=100,
-    )
-    losses = learner._episodic_losses(
-        (_sequence(costly_success),),
-        current_policy_version=0,
-    )
-    learner.optimizer.zero_grad(set_to_none=True)
-    losses.total_loss.backward()
-    learner.optimizer.step()
-    with torch.no_grad():
-        after = float(
-            torch.softmax(learner.model(encoded).policy_logits, dim=-1)[0, 0]
-        )
-
-    # High revival cost may weaken but cannot reverse the material primary
-    # completion update outside the explicitly declared success-tie stratum.
-    assert after > before
-
-
-def test_importance_ratio_is_detached_so_rare_good_action_is_encouraged() -> None:
-    learner, encoding = _learner(
-        learn_steps=1,
-        primary_policy_weight=1.0,
-        task_value_weight=0.0,
-        revival_value_weight=0.0,
-        revival_policy_weight=0.0,
-        secondary_advantage_fraction=0.0,
-    )
-    snapshot = _snapshot(encoding, domain_id=0)
-    encoded = collate_encoded_snapshots(
-        (snapshot,),
-        expected_config=encoding,
-        expected_fingerprint=grounding_encoding_identity()["fingerprint_sha256"],
-        device=CPU,
-    )
-
-    # Make factual action 0 rare under the current policy while its recorded
-    # behavior probability remains 0.5.  With a differentiable rho, the
-    # product-rule term reverses the update once log(pi(a)) < -1.
-    preparation = torch.optim.Adam(learner.model.parameters(), lr=0.002)
-    for _ in range(100):
-        logits = learner.model(encoded).policy_logits
-        probability = float(torch.softmax(logits.detach(), dim=-1)[0, 0])
-        if probability < 0.2:
-            break
-        make_action_one_likely = -F.log_softmax(logits, dim=-1)[0, 1]
-        preparation.zero_grad(set_to_none=True)
-        make_action_one_likely.backward()
-        preparation.step()
-    with torch.no_grad():
-        before = float(
-            torch.softmax(learner.model(encoded).policy_logits, dim=-1)[0, 0]
-        )
-    assert 0.01 < before < 0.2
-
-    _zero_multiscale_heads(learner.model)
-    episode = _episode((snapshot,), episode_id="rare-good-action", won=True)
-    losses = learner._episodic_losses(
-        (_sequence(episode),),
-        current_policy_version=0,
-    )
-    assert float(losses.importance_ratios[0]) < 0.4
-    learner.optimizer.zero_grad(set_to_none=True)
-    losses.total_loss.backward()
-    learner.optimizer.step()
-    with torch.no_grad():
-        after = float(
-            torch.softmax(learner.model(encoded).policy_logits, dim=-1)[0, 0]
-        )
-
-    assert after > before
-
-
-def test_success_imitation_stops_outside_the_positive_trust_region() -> None:
-    learner, encoding = _learner(
-        learn_steps=1,
-        primary_policy_weight=1.0,
-        task_value_weight=1.0,
-        revival_value_weight=0.0,
-        revival_policy_weight=0.0,
-        secondary_advantage_fraction=0.0,
-        success_policy_trust_region_epsilon=0.20,
-    )
-    snapshot = _snapshot(encoding, domain_id=0)
-    encoded = collate_encoded_snapshots(
-        (snapshot,),
-        expected_config=encoding,
-        expected_fingerprint=grounding_encoding_identity()["fingerprint_sha256"],
-        device=CPU,
-    )
-    preparation = torch.optim.Adam(learner.model.parameters(), lr=0.003)
-    for _ in range(120):
-        logits = learner.model(encoded).policy_logits
-        probability = float(torch.softmax(logits.detach(), dim=-1)[0, 0])
-        if probability > 0.75:
-            break
-        make_action_zero_likely = -F.log_softmax(logits, dim=-1)[0, 0]
-        preparation.zero_grad(set_to_none=True)
-        make_action_zero_likely.backward()
-        preparation.step()
-    with torch.no_grad():
-        probability = float(
-            torch.softmax(learner.model(encoded).policy_logits, dim=-1)[0, 0]
-        )
-    assert probability > 0.60  # ratio > 1.2 against recorded behavior p=0.5
-
-    _zero_multiscale_heads(learner.model)
-    episode = _episode((snapshot,), episode_id="already-sharp-success", won=True)
-    losses = learner._episodic_losses(
-        (_sequence(episode),),
-        current_policy_version=0,
-    )
-
-    assert float(losses.importance_ratios[0]) > 1.20
-    assert losses.success_policy_candidate_labels == 1
-    assert losses.success_trust_region_suppressed_labels == 1
-    assert losses.policy_labels == 0
-    assert losses.policy_active_sequences == 0
-    assert losses.task_value_labels == 2
-    assert losses.task_value_loss.detach().item() > 0.0
-    assert losses.primary_policy_loss.detach().item() == 0.0
-
-    learner.model.zero_grad(set_to_none=True)
-    losses.total_loss.backward()
-    assert all(
-        parameter.grad is None or torch.count_nonzero(parameter.grad) == 0
-        for name, parameter in learner.model.named_parameters()
-        if name.startswith("policy_head.")
-    )
-
-
-def test_success_imitation_surface_exemption_keeps_value_learning() -> None:
-    learner, encoding = _learner(
-        learn_steps=1,
-        primary_policy_weight=1.0,
-        task_value_weight=1.0,
-        revival_value_weight=0.0,
-        revival_policy_weight=0.0,
-        secondary_advantage_fraction=0.0,
-        success_imitation_exempt_surfaces=("rest_site", "shop"),
-    )
-    snapshot = _snapshot(encoding, domain_id=0)
-    _zero_multiscale_heads(learner.model)
-    episode = _episode(
-        (snapshot,),
-        episode_id="successful-rest-site",
-        won=True,
-        decision_surfaces=("rest_site",),
-    )
-
-    losses = learner._episodic_losses(
-        (_sequence(episode),),
-        current_policy_version=0,
-    )
-
-    assert losses.success_policy_candidate_labels == 1
-    assert losses.success_surface_exempted_labels == 1
-    assert losses.policy_labels == 0
-    assert losses.efficiency_policy_labels == 0
-    assert losses.task_value_labels == 2
-    assert losses.task_value_loss.detach().item() > 0.0
-    assert losses.primary_policy_loss.detach().item() == 0.0
-
-    learner.model.zero_grad(set_to_none=True)
-    losses.total_loss.backward()
-    assert all(
-        parameter.grad is None or torch.count_nonzero(parameter.grad) == 0
-        for name, parameter in learner.model.named_parameters()
-        if name.startswith("policy_head.")
-    )

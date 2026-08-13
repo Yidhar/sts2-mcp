@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from sts2_rl.training import load_training_config
+from tests.archived_experiment_config import load_archived_training_config
 
 PACKAGE_ROOT = Path(__file__).parents[1]
 CHECKOUT_ROOT = PACKAGE_ROOT.parents[1]
@@ -22,8 +22,8 @@ def _load_contract() -> dict[str, Any]:
 
 
 def test_v29_350k_recipe_is_an_exact_lineage_continuation() -> None:
-    source = load_training_config(profile="preheat", config_path=SOURCE_CONFIG)
-    continuation = load_training_config(profile="preheat", config_path=CONTINUATION_CONFIG)
+    source = load_archived_training_config(profile="preheat", config_path=SOURCE_CONFIG)
+    continuation = load_archived_training_config(profile="preheat", config_path=CONTINUATION_CONFIG)
 
     # This is the production exact-resume identity check: only execution
     # horizon, output paths, checkpoint cadence, and evaluation schedules may
@@ -38,8 +38,8 @@ def test_v29_350k_recipe_is_an_exact_lineage_continuation() -> None:
 
 
 def test_v29_350k_recipe_preserves_completed_evaluation_state() -> None:
-    source = load_training_config(profile="preheat", config_path=SOURCE_CONFIG)
-    continuation = load_training_config(profile="preheat", config_path=CONTINUATION_CONFIG)
+    source = load_archived_training_config(profile="preheat", config_path=SOURCE_CONFIG)
+    continuation = load_archived_training_config(profile="preheat", config_path=CONTINUATION_CONFIG)
 
     assert set(source.runtime.evaluation_steps).issubset(continuation.runtime.evaluation_steps)
     assert set(source.runtime.early_evaluation_steps).issubset(continuation.runtime.early_evaluation_steps)
@@ -101,7 +101,7 @@ def test_v29_100k_exact_resume_contract_pins_source_and_absolute_horizon() -> No
         "usage": "exact_resume_only",
     }
 
-    continuation = load_training_config(profile="preheat", config_path=CHECKOUT_ROOT / contract["continuation_config"])
+    continuation = load_archived_training_config(profile="preheat", config_path=CHECKOUT_ROOT / contract["continuation_config"])
     assert (
         continuation.runtime.total_environment_steps - contract["environment_steps"]
         == contract["expected_additional_environment_steps"]

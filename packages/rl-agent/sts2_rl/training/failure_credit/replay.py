@@ -1,4 +1,4 @@
-"""Bounded, thread-safe owner for immutable failure-credit v5 evidence.
+"""Bounded, thread-safe owner for immutable failure-credit v6 evidence.
 
 The replay has two deliberately separate synchronization domains:
 
@@ -27,7 +27,6 @@ from .contracts import (
     EvidenceStratum,
 )
 from .corpus import (
-    ACTOR_QUOTA_STRATA,
     FAILURE_EVIDENCE_REPLAY_VERSION,
     EvidenceRecord,
     EvidenceSample,
@@ -55,22 +54,8 @@ _REPLAY_STATE_FIELDS: Final = frozenset(
         "oversize_count",
         "quota_deficit_count",
         "maximum_observed_record_nbytes",
-        "sampled_direct_actor_fresh_count",
-        "sampled_direct_lag_suppressed_critic_count",
-        "sampled_multi_edge_actor_fresh_count",
-        "sampled_multi_edge_lag_suppressed_critic_count",
-        "sampled_risk_actor_fresh_count",
-        "sampled_risk_lag_suppressed_critic_count",
-        "sampled_matched_pair_actor_fresh_count",
-        "sampled_matched_pair_lag_suppressed_critic_count",
     }
 )
-_ACTOR_METRIC_PREFIX: Final = {
-    EvidenceStratum.DIRECT_WITNESS: "direct",
-    EvidenceStratum.MULTI_EDGE_CYCLE: "multi_edge",
-    EvidenceStratum.RISK_SEQUENCE: "risk",
-    EvidenceStratum.MATCHED_OUTCOME_PAIR: "matched_pair",
-}
 
 # Highest learning value first.  The eviction policy treats this ordering as a
 # retention priority, not as a sampling weight.  Every live primary stratum is
@@ -150,7 +135,7 @@ def _record_storage_nbytes(record: EvidenceRecord) -> int:
 
 
 class BoundedFailureCreditReplay:
-    """Stratified bounded replay with exact v5 checkpoint semantics.
+    """Stratified bounded replay with exact v6 checkpoint semantics.
 
     Records are immutable values.  Every accepted ``put`` publishes a newly
     indexed corpus with a compare-and-swap style generation check; the
@@ -183,10 +168,6 @@ class BoundedFailureCreditReplay:
         self._record_sizes: tuple[int, ...] = ()
         self._incident_ids: frozenset[str] = frozenset()
         self._storage_nbytes = 0
-        self._actor_actionable_records = 0
-        self._direct_actor_eligible_records = 0
-        self._multi_edge_actor_eligible_records = 0
-        self._risk_actor_eligible_records = 0
         self._outcome_pair_count = 0
         self._stratum_counts: dict[EvidenceStratum, int] = {stratum: 0 for stratum in EvidenceStratum}
         self._put_count = 0
@@ -200,11 +181,6 @@ class BoundedFailureCreditReplay:
         self._oversize_count = 0
         self._quota_deficit_count = 0
         self._maximum_observed_record_nbytes = 0
-        self._sampled_actor_fresh_count: dict[EvidenceStratum, int] = {stratum: 0 for stratum in ACTOR_QUOTA_STRATA}
-        self._sampled_lag_suppressed_critic_count: dict[
-            EvidenceStratum,
-            int,
-        ] = {stratum: 0 for stratum in ACTOR_QUOTA_STRATA}
         self._generation = 0
         self._sample_lock = Lock()
         self._lock = Lock()
@@ -348,10 +324,6 @@ class BoundedFailureCreditReplay:
                 self._record_sizes = candidate_sizes
                 self._incident_ids = candidate_incident_ids
                 self._storage_nbytes = candidate_storage_nbytes
-                self._actor_actionable_records = candidate_metrics.actor_actionable_records
-                self._direct_actor_eligible_records = candidate_metrics.direct_actor_eligible_records
-                self._multi_edge_actor_eligible_records = candidate_metrics.multi_edge_actor_eligible_records
-                self._risk_actor_eligible_records = candidate_metrics.risk_actor_eligible_records
                 self._outcome_pair_count = candidate_metrics.outcome_pair_count
                 self._stratum_counts = candidate_stratum_counts
                 self._put_count += accepted_count
@@ -373,7 +345,7 @@ class BoundedFailureCreditReplay:
         comparison.  This is not an upsert: every incident must already be
         live, the original recurrent context must be the same object, and all
         original witnesses must remain present.  A byte-expanding replacement
-        may evict lower-priority evidence under the same deterministic v5
+        may evict lower-priority evidence under the same deterministic v6
         policy; if the complete replacement batch cannot fit, nothing changes.
         """
 
@@ -487,10 +459,6 @@ class BoundedFailureCreditReplay:
                 self._record_sizes = retained_sizes
                 self._incident_ids = frozenset(retained_ids)
                 self._storage_nbytes = storage_nbytes
-                self._actor_actionable_records = candidate_metrics.actor_actionable_records
-                self._direct_actor_eligible_records = candidate_metrics.direct_actor_eligible_records
-                self._multi_edge_actor_eligible_records = candidate_metrics.multi_edge_actor_eligible_records
-                self._risk_actor_eligible_records = candidate_metrics.risk_actor_eligible_records
                 self._outcome_pair_count = candidate_metrics.outcome_pair_count
                 self._stratum_counts = candidate_stratum_counts
                 self._eviction_count += eviction_count
@@ -503,12 +471,10 @@ class BoundedFailureCreditReplay:
         self,
         batch_size: int,
         *,
-        risk_actor_enabled: bool,
         quotas: tuple[StratumQuota, ...] = (),
         current_policy_version: int | None = None,
-        policy_gradient_max_lag: int | None = None,
     ) -> EvidenceSample:
-        """Sample critics broadly while satisfying actor quotas only from fresh data."""
+        """Sample critics broadly while satisfying per-stratum diversity quotas."""
 
         # ``ImmutableEvidenceCorpus.sample`` owns the canonical validation and
         # quota semantics.  The separate lock prevents concurrent sample calls
@@ -521,18 +487,11 @@ class BoundedFailureCreditReplay:
                 rng=self._rng,
                 quotas=quotas,
                 current_policy_version=current_policy_version,
-                policy_gradient_max_lag=policy_gradient_max_lag,
-                risk_actor_enabled=risk_actor_enabled,
             )
             with self._lock:
                 self._sample_request_count += 1
                 self._sample_count += len(result.records)
                 self._quota_deficit_count += result.quota_diagnostics.total_deficit
-                for status in result.quota_diagnostics.statuses:
-                    if status.stratum not in ACTOR_QUOTA_STRATA:
-                        continue
-                    self._sampled_actor_fresh_count[status.stratum] += status.selected_actor_fresh
-                    self._sampled_lag_suppressed_critic_count[status.stratum] += status.selected_stale_critic
             return result
 
     def snapshot(self) -> ImmutableEvidenceCorpus:
@@ -577,10 +536,6 @@ class BoundedFailureCreditReplay:
                 "oversize_count": self._oversize_count,
                 "quota_deficit_count": self._quota_deficit_count,
                 "maximum_observed_record_nbytes": (self._maximum_observed_record_nbytes),
-                "actor_actionable_records": self._actor_actionable_records,
-                "direct_actor_eligible_records": (self._direct_actor_eligible_records),
-                "multi_edge_actor_eligible_records": (self._multi_edge_actor_eligible_records),
-                "risk_actor_eligible_records": (self._risk_actor_eligible_records),
                 "outcome_pair_count": self._outcome_pair_count,
             }
             for stratum, count in self._stratum_counts.items():
@@ -588,15 +543,10 @@ class BoundedFailureCreditReplay:
                 result[f"evicted_primary_{stratum.value.lower()}_count"] = self._primary_stratum_eviction_counts[
                     stratum
                 ]
-            for stratum, prefix in _ACTOR_METRIC_PREFIX.items():
-                result[f"sampled_{prefix}_actor_fresh_count"] = self._sampled_actor_fresh_count[stratum]
-                result[f"sampled_{prefix}_lag_suppressed_critic_count"] = self._sampled_lag_suppressed_critic_count[
-                    stratum
-                ]
         return result
 
     def state_dict(self) -> dict[str, object]:
-        """Return a strict exact-resume v5 state, including owned RNG."""
+        """Return a strict exact-resume v6 state, including owned RNG."""
 
         with self._sample_lock:
             with self._lock:
@@ -620,32 +570,10 @@ class BoundedFailureCreditReplay:
                     "oversize_count": self._oversize_count,
                     "quota_deficit_count": self._quota_deficit_count,
                     "maximum_observed_record_nbytes": (self._maximum_observed_record_nbytes),
-                    "sampled_direct_actor_fresh_count": (
-                        self._sampled_actor_fresh_count[EvidenceStratum.DIRECT_WITNESS]
-                    ),
-                    "sampled_direct_lag_suppressed_critic_count": (
-                        self._sampled_lag_suppressed_critic_count[EvidenceStratum.DIRECT_WITNESS]
-                    ),
-                    "sampled_multi_edge_actor_fresh_count": (
-                        self._sampled_actor_fresh_count[EvidenceStratum.MULTI_EDGE_CYCLE]
-                    ),
-                    "sampled_multi_edge_lag_suppressed_critic_count": (
-                        self._sampled_lag_suppressed_critic_count[EvidenceStratum.MULTI_EDGE_CYCLE]
-                    ),
-                    "sampled_risk_actor_fresh_count": (self._sampled_actor_fresh_count[EvidenceStratum.RISK_SEQUENCE]),
-                    "sampled_risk_lag_suppressed_critic_count": (
-                        self._sampled_lag_suppressed_critic_count[EvidenceStratum.RISK_SEQUENCE]
-                    ),
-                    "sampled_matched_pair_actor_fresh_count": (
-                        self._sampled_actor_fresh_count[EvidenceStratum.MATCHED_OUTCOME_PAIR]
-                    ),
-                    "sampled_matched_pair_lag_suppressed_critic_count": (
-                        self._sampled_lag_suppressed_critic_count[EvidenceStratum.MATCHED_OUTCOME_PAIR]
-                    ),
                 }
 
     def load_state_dict(self, payload: object) -> None:
-        """Validate a complete v5 state before replacing this replay atomically."""
+        """Validate a complete v6 state before replacing this replay atomically."""
 
         if not isinstance(payload, dict):
             raise TypeError("failure evidence replay checkpoint must be an object")
@@ -678,14 +606,6 @@ class BoundedFailureCreditReplay:
             "oversize_count",
             "quota_deficit_count",
             "maximum_observed_record_nbytes",
-            "sampled_direct_actor_fresh_count",
-            "sampled_direct_lag_suppressed_critic_count",
-            "sampled_multi_edge_actor_fresh_count",
-            "sampled_multi_edge_lag_suppressed_critic_count",
-            "sampled_risk_actor_fresh_count",
-            "sampled_risk_lag_suppressed_critic_count",
-            "sampled_matched_pair_actor_fresh_count",
-            "sampled_matched_pair_lag_suppressed_critic_count",
         ):
             counters[name] = _integer(
                 payload.get(name),
@@ -697,13 +617,6 @@ class BoundedFailureCreditReplay:
             raise ValueError("failure evidence replay batch accounting is inconsistent")
         if counters["sample_count"] > (counters["sample_request_count"] * self.capacity):
             raise ValueError("failure evidence replay sample accounting is inconsistent")
-        for prefix in ("direct", "multi_edge", "risk", "matched_pair"):
-            if (
-                counters[f"sampled_{prefix}_actor_fresh_count"]
-                + counters[f"sampled_{prefix}_lag_suppressed_critic_count"]
-                > counters["sample_count"]
-            ):
-                raise ValueError("failure evidence replay actor-freshness accounting is inconsistent")
         largest_record = max(record_sizes, default=0)
         if counters["maximum_observed_record_nbytes"] < largest_record:
             raise ValueError("failure evidence replay maximum observed record size is inconsistent")
@@ -740,10 +653,6 @@ class BoundedFailureCreditReplay:
                 self._record_sizes = record_sizes
                 self._incident_ids = incident_ids
                 self._storage_nbytes = storage_nbytes
-                self._actor_actionable_records = corpus_metrics.actor_actionable_records
-                self._direct_actor_eligible_records = corpus_metrics.direct_actor_eligible_records
-                self._multi_edge_actor_eligible_records = corpus_metrics.multi_edge_actor_eligible_records
-                self._risk_actor_eligible_records = corpus_metrics.risk_actor_eligible_records
                 self._outcome_pair_count = corpus_metrics.outcome_pair_count
                 self._stratum_counts = stratum_counts
                 self._rng.bit_generator.state = deepcopy(rng_state)
@@ -758,18 +667,6 @@ class BoundedFailureCreditReplay:
                 self._oversize_count = counters["oversize_count"]
                 self._quota_deficit_count = counters["quota_deficit_count"]
                 self._maximum_observed_record_nbytes = counters["maximum_observed_record_nbytes"]
-                self._sampled_actor_fresh_count = {
-                    EvidenceStratum.DIRECT_WITNESS: counters["sampled_direct_actor_fresh_count"],
-                    EvidenceStratum.MULTI_EDGE_CYCLE: counters["sampled_multi_edge_actor_fresh_count"],
-                    EvidenceStratum.RISK_SEQUENCE: counters["sampled_risk_actor_fresh_count"],
-                    EvidenceStratum.MATCHED_OUTCOME_PAIR: counters["sampled_matched_pair_actor_fresh_count"],
-                }
-                self._sampled_lag_suppressed_critic_count = {
-                    EvidenceStratum.DIRECT_WITNESS: counters["sampled_direct_lag_suppressed_critic_count"],
-                    EvidenceStratum.MULTI_EDGE_CYCLE: counters["sampled_multi_edge_lag_suppressed_critic_count"],
-                    EvidenceStratum.RISK_SEQUENCE: counters["sampled_risk_lag_suppressed_critic_count"],
-                    EvidenceStratum.MATCHED_OUTCOME_PAIR: counters["sampled_matched_pair_lag_suppressed_critic_count"],
-                }
                 self._generation += 1
 
 

@@ -2,11 +2,13 @@
 """One-shot active-shape stress validation for the v29 liveness learner.
 
 This command is an execution validator, not a training entry point.  It
-constructs one typed, compiler-reviewed matched-outcome record whose two
-recurrent contexts each contain the maximum reviewed 256 decisions and whose
-every decision contains 256 legal candidates.  The production label compiler and
+constructs one typed, compiler-reviewed matched-outcome record whose replayed
+incident context contains the maximum reviewed 256 decisions and whose every
+decision contains 256 legal candidates.  The production label compiler and
 ``VTraceLearner.credit_plan_liveness_losses`` then execute forward and backward
-passes at both the calibration and mature-risk phase boundaries.
+passes at both the calibration and mature critic phase boundaries.  Since the
+v20 actor retirement the matched-outcome pair remains stored evidence only;
+no second context is replayed and no policy objective exists.
 
 The report has no training authority and performs no optimizer step.
 """
@@ -71,14 +73,11 @@ from sts2_rl.training.learner import (
 )
 from sts2_rl.training.sdpa import configure_rocm_sdpa_backend
 
-LIVENESS_HEAD_STRESS_REPORT_VERSION: Final = "sts2-liveness-head-active-shape-stress-v3"
+LIVENESS_HEAD_STRESS_REPORT_VERSION: Final = "sts2-liveness-head-active-shape-stress-v4"
 SYNTHETIC_EVIDENCE_AUTHORITY_VERSION: Final = "sts2-liveness-stress-synthetic-evidence-v1"
 FORMAL_STEPS: Final = 256
 FORMAL_CANDIDATES: Final = 256
 _PACKAGE_ROOT: Final = Path(__file__).resolve().parents[1]
-_DEFAULT_CONFIG: Final = (
-    _PACKAGE_ROOT / "config" / "experiments" / "full_run_revival_v29_failure_credit_v4_model_init.toml"
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -533,11 +532,6 @@ def _loss_values(
         for name in (
             "value_critic_loss",
             "critic_loss",
-            "risk_actor_loss",
-            "direct_avoid_loss",
-            "cycle_likelihood_loss",
-            "contrast_loss",
-            "completion_loss",
         )
     }
 
@@ -550,11 +544,6 @@ def _weighted_objective(
     return (
         config.liveness_value_critic_weight * losses.value_critic_loss
         + config.liveness_cost_critic_weight * losses.critic_loss
-        + config.liveness_cost_actor_weight * losses.risk_actor_loss
-        + config.liveness_direct_policy_weight * losses.direct_avoid_loss
-        + config.liveness_cycle_policy_weight * losses.cycle_likelihood_loss
-        + config.liveness_contrast_policy_weight * losses.contrast_loss
-        + config.liveness_completion_policy_weight * losses.completion_loss
     )
 
 
@@ -565,7 +554,6 @@ def _gradient_summary(
     tensors = 0
     nonzero_tensors = 0
     liveness_nonzero = 0
-    policy_nonzero = 0
     finite = True
     for name, parameter in model.named_parameters():
         gradient = parameter.grad
@@ -585,14 +573,11 @@ def _gradient_summary(
                 )
             ):
                 liveness_nonzero += 1
-            if name.startswith("policy_head."):
-                policy_nonzero += 1
     return {
         "finite": finite,
         "gradient_tensors": tensors,
         "nonzero_gradient_tensors": nonzero_tensors,
         "nonzero_liveness_head_tensors": liveness_nonzero,
-        "nonzero_policy_head_tensors": policy_nonzero,
         "global_l2_norm": math.sqrt(total_squared),
     }
 
@@ -682,7 +667,6 @@ def _run_phase(
         "name": name,
         "learner_update": learner_update,
         "calibration_active": (learner_update < learner.failure_credit_config.liveness_head_calibration_updates),
-        "risk_actor_enabled": (learner_update >= learner.failure_credit_config.liveness_risk_actor_start_update),
         "durations_seconds": {
             "forward_and_loss": forward_seconds,
             "backward": backward_seconds,
@@ -693,13 +677,7 @@ def _run_phase(
         "labels": {
             "value": losses.value_labels,
             "critic": losses.critic_labels,
-            "risk_actor": losses.risk_actor_labels,
-            "direct_avoid": losses.direct_avoid_labels,
-            "cycle": losses.cycle_labels,
-            "contrast": losses.contrast_labels,
-            "completion": losses.completion_labels,
-            "risk_actor_phase_suppressed": (losses.risk_actor_phase_suppressed_labels),
-            "policy_lag_suppressed": (losses.policy_lag_suppressed_labels),
+            "censored_suppressed": losses.censored_suppressed_labels,
         },
         "work": {
             "contexts": losses.replayed_contexts,
@@ -845,7 +823,7 @@ def run_liveness_head_stress(
 
     phase_updates = {
         "calibration": 0,
-        "mature": (training_config.failure_credit.liveness_risk_actor_start_update),
+        "mature": (training_config.failure_credit.liveness_head_calibration_updates),
     }
     manifests = {
         name: compile_liveness_label_manifest(
@@ -935,7 +913,9 @@ def run_liveness_head_stress(
     finally:
         hook.remove()
 
-    context_count = 2 if record.plan.contrast_policy_targets else 1
+    # Since the v20 actor retirement only the incident-owned context is
+    # replayed; the matched-outcome pair remains stored evidence.
+    context_count = 1
     expected_replayed_steps = shape.steps * context_count
     expected_candidates = expected_replayed_steps * shape.candidates
     expected_segments_per_context = math.ceil(shape.steps / training_config.failure_credit.liveness_tbptt_window_steps)
@@ -967,16 +947,13 @@ def run_liveness_head_stress(
     )
     phase_contract = (
         phases["calibration"]["calibration_active"]
-        and not phases["calibration"]["risk_actor_enabled"]
-        and phases["calibration"]["labels"]["risk_actor"] == 0
-        and phases["calibration"]["labels"]["risk_actor_phase_suppressed"] == shape.steps
-        and phases["calibration"]["labels"]["direct_avoid"] == 2
-        and phases["calibration"]["labels"]["contrast"] == 1
         and not phases["mature"]["calibration_active"]
-        and phases["mature"]["risk_actor_enabled"]
-        and phases["mature"]["labels"]["risk_actor"] == shape.steps
-        and phases["mature"]["labels"]["direct_avoid"] == 2
-        and phases["mature"]["labels"]["contrast"] == 1
+        and all(
+            phase["labels"]["value"] == shape.steps
+            and phase["labels"]["critic"] == shape.steps
+            and phase["labels"]["censored_suppressed"] == 0
+            for phase in phases.values()
+        )
     )
     work_accounting = all(
         phase["work"]["contexts"] == context_count
@@ -1002,18 +979,6 @@ def run_liveness_head_stress(
         and phase["gradients"]["nonzero_liveness_head_tensors"] > 0
         and phase["gradients"]["global_l2_norm"] > 0.0
         for phase in phases.values()
-    ) and (
-        phases["calibration"]["gradients"]["nonzero_policy_head_tensors"] > 0
-        and phases["mature"]["gradients"]["nonzero_policy_head_tensors"] > 0
-    )
-    matched_outcome_contrast = (
-        context_count == 2
-        and len(record.plan.contrast_policy_targets) == 1
-        and all(
-            len(manifest.contrast_groups) == 1 and manifest.contrast_groups[0].effective
-            for manifest in manifests.values()
-        )
-        and all(phase["labels"]["contrast"] == 1 for phase in phases.values())
     )
     gates = {
         "formal_shape_contract": (
@@ -1021,14 +986,13 @@ def run_liveness_head_stress(
             or (
                 shape.steps == FORMAL_STEPS
                 and shape.candidates == FORMAL_CANDIDATES
-                and context_count == 2
-                and expected_candidates == 131_072
+                and context_count == 1
+                and expected_candidates == 65_536
             )
         ),
         "production_manifest_work_accounting": work_accounting,
         "bounded_tbptt_segments": bounded_tbptt,
         "calibration_and_mature_phase_contract": phase_contract,
-        "matched_outcome_contrast_path": matched_outcome_contrast,
         "finite_losses": finite_losses,
         "finite_gradients": finite_gradients,
         "nonzero_expected_gradients": gradient_contract,
@@ -1062,7 +1026,6 @@ def run_liveness_head_stress(
             "maximum_candidates": (training_config.model.max_candidates),
             "tbptt_window_steps": (training_config.failure_credit.liveness_tbptt_window_steps),
             "calibration_updates": (training_config.failure_credit.liveness_head_calibration_updates),
-            "risk_actor_start_update": (training_config.failure_credit.liveness_risk_actor_start_update),
         },
         "initialization": source,
         "shape": {
@@ -1125,7 +1088,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--profile", default="preheat")
-    parser.add_argument("--config", type=Path, default=_DEFAULT_CONFIG)
+    parser.add_argument("--config", type=Path, default=None)
     parser.add_argument(
         "--initialization",
         choices=("frozen-v28", "synthetic"),
@@ -1141,18 +1104,29 @@ def main() -> int:
     artifact_root = _artifact_root(args.artifact_root)
     report_path = resolve_artifact_path(args.report, root=artifact_root)
     try:
-        config_path = args.config.expanduser().resolve()
-        training_config = load_training_config(
-            profile=args.profile,
-            config_path=config_path,
-        )
+        if args.config is not None:
+            config_path = args.config.expanduser().resolve()
+            training_config = load_training_config(
+                profile=args.profile,
+                config_path=config_path,
+            )
+            config_source = os.fspath(config_path)
+        else:
+            # The maintained profile plus the single mode override is the
+            # smallest reviewed learning-enabled configuration; archived
+            # experiment recipes no longer parse under strict config v20.
+            training_config = load_training_config(
+                profile=args.profile,
+                overrides=("failure_credit.mode=learning",),
+            )
+            config_source = f"profile:{args.profile}+failure_credit.mode=learning"
         device = _resolve_device(args.device)
         report = run_liveness_head_stress(
             training_config=training_config,
             device=device,
             initialization=args.initialization,
             artifact_root=artifact_root,
-            config_source=os.fspath(config_path),
+            config_source=config_source,
             require_formal_shape=True,
         )
     except Exception as exc:

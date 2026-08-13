@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from sts2_rl.training import load_training_config
+from tests.archived_experiment_config import load_archived_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PACKAGE_ROOT / "scripts/launch_v32_budget64_mature_model_init.py"
@@ -41,7 +41,7 @@ def _paths(tmp_path: Path) -> Any:
 
 
 def test_v32_recipe_is_finite_budget_and_inherits_mature_schedule() -> None:
-    config = load_training_config(profile="preheat", config_path=CONFIG)
+    config = load_archived_training_config(profile="preheat", config_path=CONFIG)
 
     assert config.curriculum.revival_budget == 64
     assert config.runtime.model_initialization_schedule_mode == "inherit"
@@ -55,7 +55,6 @@ def test_v32_recipe_is_finite_budget_and_inherits_mature_schedule() -> None:
     assert config.failure_credit.risk_sequence_quota == 1
     assert config.failure_credit.unresolved_stall_quota == 1
     assert config.failure_credit.completion_control_quota == 1
-    assert config.failure_credit.matched_outcome_pair_quota == 1
     assert config.runtime.evaluation_guard_min_liveness_episodes == 16
     assert config.runtime.evaluation_guard_liveness_baseline_failures == 2
     assert config.runtime.evaluation_guard_liveness_baseline_episodes == 16

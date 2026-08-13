@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from sts2_rl.training import load_training_config
+from tests.archived_experiment_config import load_archived_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PACKAGE_ROOT / "scripts/launch_v31_failure_credit_capacity_model_init.py"
@@ -61,7 +61,7 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
 
 
 def test_v31_recipe_expands_failure_replay_without_truncating_context() -> None:
-    config = load_training_config(profile="preheat", config_path=CONFIG)
+    config = load_archived_training_config(profile="preheat", config_path=CONFIG)
 
     assert config.failure_credit.replay_byte_capacity == 2_147_483_648
     assert config.failure_credit.maximum_context_steps == 256

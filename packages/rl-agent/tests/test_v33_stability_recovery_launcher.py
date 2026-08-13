@@ -61,11 +61,9 @@ def test_v33_recipe_matches_the_reviewed_stability_package() -> None:
     assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v20"
     assert config.curriculum.revival_budget == 64
     assert config.optimization.entropy_weight_end == pytest.approx(0.004)
-    assert config.failure_credit.liveness_completion_policy_weight == pytest.approx(0.15)
     assert config.failure_credit.liveness_gradient_clip_norm == pytest.approx(0.50)
     assert config.failure_credit.sample_records == 4
     assert config.failure_credit.liveness_records_per_autograd_batch == 4
-    assert config.episodic_learning.success_policy_trust_region_epsilon == pytest.approx(0.20)
     assert config.runtime.model_initialization_schedule_mode == "inherit"
     assert config.runtime.model_initialization_liveness_schedule_mode == "inherit"
     assert config.runtime.total_environment_steps == 100_000

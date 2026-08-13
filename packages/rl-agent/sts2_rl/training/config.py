@@ -514,6 +514,8 @@ class FailureCreditConfig:
     maximum_episode_completion_bytes: int = 134_217_728
     # Minimum evidence representation per learner sample. Deficits are
     # explicit metrics, never silently back-filled by unrelated evidence.
+    # These strata all carry factual value/cost critic labels, so the quotas
+    # remain critic evidence-diversity floors after the v20 actor retirement.
     direct_witness_quota: int = 1
     multi_edge_cycle_quota: int = 1
     risk_sequence_quota: int = 1
@@ -522,27 +524,16 @@ class FailureCreditConfig:
     # than letting those overlap records satisfy the whole risk policy.
     unresolved_stall_quota: int = 1
     completion_control_quota: int = 1
-    # Matched pairs are optional until the cross-episode matcher has produced
-    # a non-empty stratum, but remain an explicit sampling-policy field.
-    matched_outcome_pair_quota: int = 0
     # The matcher is stateless, but one terminal publication may expose many
     # retained completion controls. Bound how many failed incidents it may
     # enrich at once so a publication cannot create unbounded compile work.
     maximum_matched_pairs_per_publication: int = 8
-    # Critics may use all authoritative evidence. Actor labels older than this
-    # policy distance are retained for audit/value learning but suppressed.
-    policy_gradient_max_lag: int = 128
     # Newly initialized liveness heads first learn against detached world,
     # recurrent and candidate features.  This keeps their initially
     # uncalibrated gradients out of the inherited policy trunk while still
     # allowing the heads themselves to fit factual zero/one controls.  The
     # checkpointed learner-update counter is the sole phase clock.
     liveness_head_calibration_updates: int = 256
-    # The centered-risk actor consumes predictions from the new candidate
-    # cost head, so it starts only after the detached-head calibration phase.
-    # Direct/cycle/contrast witnesses do not depend on that head and remain
-    # independently eligible throughout calibration.
-    liveness_risk_actor_start_update: int = 512
     # Failure-credit records may share one recurrent replay/autograd graph.
     # The learner still reduces losses per record before averaging, so this is
     # an execution-only packing limit rather than a change to evidence weight.
@@ -563,23 +554,6 @@ class FailureCreditConfig:
     liveness_maximum_replayed_candidates_per_update: int = 1_048_576
     liveness_value_critic_weight: float = 0.10
     liveness_cost_critic_weight: float = 0.25
-    liveness_cost_actor_weight: float = 0.10
-    liveness_direct_policy_weight: float = 0.25
-    liveness_cycle_policy_weight: float = 0.10
-    liveness_contrast_policy_weight: float = 0.10
-    # Generic durable/FLOW completion is a zero-cost critic control, not
-    # evidence that the final action should be imitated.  Keep the standalone
-    # completion actor channel disabled unless a future evidence contract adds
-    # an explicit, causal PREFER witness.
-    liveness_completion_policy_weight: float = 0.0
-    liveness_risk_advantage_clip: float = 0.25
-    # A positive centered-risk label suppresses its factual selected action.
-    # Once the current policy has already pushed that action below this floor,
-    # repeating the same suppression has negligible behavioural value but can
-    # coherently translate the shared policy trunk.  Critics and negative-risk
-    # (recovery) labels remain active.  Zero preserves the pre-v17 behaviour.
-    liveness_risk_actor_min_selected_probability: float = 0.0
-    liveness_contrast_margin: float = 0.10
     # The complete formal liveness objective receives this independent
     # gradient-delta budget before episodic gradients and the global optimizer
     # clip are applied.  This prevents one sparse witness from consuming the
@@ -596,7 +570,6 @@ class FailureCreditConfig:
             "maximum_context_steps",
             "maximum_episode_completion_controls",
             "maximum_episode_completion_bytes",
-            "policy_gradient_max_lag",
             "liveness_records_per_autograd_batch",
             "liveness_tbptt_window_steps",
             "liveness_maximum_contexts_per_record",
@@ -623,21 +596,11 @@ class FailureCreditConfig:
             label="failure_credit.maximum_matched_pairs_per_publication",
             minimum=0,
         )
-        _require_int(
-            self.liveness_risk_actor_start_update,
-            label="failure_credit.liveness_risk_actor_start_update",
-            minimum=0,
-        )
         if self.burn_in_steps >= self.maximum_context_steps:
             raise ValueError("failure_credit.burn_in_steps must be smaller than " "maximum_context_steps")
         if self.maximum_episode_completion_bytes > self.replay_byte_capacity:
             raise ValueError(
                 "failure_credit.maximum_episode_completion_bytes cannot exceed " "failure_credit.replay_byte_capacity"
-            )
-        if self.liveness_risk_actor_start_update < self.liveness_head_calibration_updates:
-            raise ValueError(
-                "failure_credit.liveness_risk_actor_start_update cannot precede "
-                "failure_credit.liveness_head_calibration_updates"
             )
         if self.liveness_records_per_autograd_batch > self.sample_records:
             raise ValueError(
@@ -650,7 +613,6 @@ class FailureCreditConfig:
             "risk_sequence_quota",
             "unresolved_stall_quota",
             "completion_control_quota",
-            "matched_outcome_pair_quota",
         ):
             quota_total += _require_int(
                 getattr(self, name),
@@ -662,27 +624,12 @@ class FailureCreditConfig:
         for name in (
             "liveness_value_critic_weight",
             "liveness_cost_critic_weight",
-            "liveness_cost_actor_weight",
-            "liveness_direct_policy_weight",
-            "liveness_cycle_policy_weight",
-            "liveness_contrast_policy_weight",
-            "liveness_completion_policy_weight",
-            "liveness_risk_advantage_clip",
-            "liveness_risk_actor_min_selected_probability",
-            "liveness_contrast_margin",
             "liveness_gradient_clip_norm",
         ):
             _require_finite_number(
                 getattr(self, name),
                 label=f"failure_credit.{name}",
                 minimum=0.0,
-            )
-        if self.liveness_risk_advantage_clip > 1.0:
-            raise ValueError("failure_credit.liveness_risk_advantage_clip must be in [0, 1]")
-        if self.liveness_risk_actor_min_selected_probability >= 1.0:
-            raise ValueError(
-                "failure_credit.liveness_risk_actor_min_selected_probability "
-                "must be in [0, 1)"
             )
         if self.liveness_gradient_clip_norm <= 0.0:
             raise ValueError("failure_credit.liveness_gradient_clip_norm must be positive")
@@ -698,7 +645,7 @@ class FailureCreditConfig:
 
 @dataclass(frozen=True, slots=True)
 class EpisodicLearningConfig:
-    """Complete-episode labels replayed through short recurrent graphs.
+    """Complete-episode value labels replayed through short recurrent graphs.
 
     Completed training episodes remain detached CPU data. ``burn_in_steps``
     reconstructs recurrent state under ``no_grad`` and only ``learn_steps``
@@ -706,13 +653,10 @@ class EpisodicLearningConfig:
     activation memory. The two byte limits make the host-memory contract
     explicit and prevent one pathological episode from evicting the corpus.
 
-    Revival policy supervision is a secondary objective. Its implementation
-    must gate cost advantages on factual horizon success. Before the task value
-    classifies the horizon as successful, ``secondary_advantage_fraction``
-    caps cost against the primary residual. Only after success classification
-    *and* inside ``primary_success_tie_tolerance`` may it cap against one
-    nominal primary unit, so equal-primary successful paths can still be
-    ordered by revival cost without overriding a material completion residual.
+    Since v20 the plane supervises only the candidate-independent long-horizon
+    task/revival-cost value heads (and the optional combat HP-loss head).  The
+    run-success/act-segment/revival selected-action imitation channels and
+    their exemptions/ratchets were retired.
     """
 
     enabled: bool = False
@@ -721,64 +665,26 @@ class EpisodicLearningConfig:
     per_episode_capacity_bytes: int = 536_870_912
     max_segments_per_episode: int = 8
     sample_sequences: int = 2
-    # Reserve this many existing sampling slots for suffixes that are known to
-    # contain at least one successful policy label inside the strict policy-lag
-    # gate. Remaining slots keep the all-age value/outcome replay plane.
-    fresh_policy_sequences: int = 0
     burn_in_steps: int = 32
     learn_steps: int = 32
     # Complete runs contain far more combat actions than build/route/resource
     # decisions.  This fraction reserves replay sequences for factual
-    # non-combat policy decisions, stratified by their observed decision
-    # surface.  It changes replay sampling only: no action is fabricated, no
-    # reward is rewritten, and the one-pass FIFO V-trace plane is untouched.
+    # non-combat decisions, stratified by their observed decision surface, so
+    # sparse macro decisions still receive long-horizon value labels.  It
+    # changes replay sampling only: no action is fabricated, no reward is
+    # rewritten, and the one-pass FIFO V-trace plane is untouched.
     macro_sample_fraction: float = 0.0
-    primary_policy_weight: float = 0.25
     task_value_weight: float = 0.25
     revival_value_weight: float = 0.10
-    revival_policy_weight: float = 0.05
-    secondary_advantage_fraction: float = 0.25
-    primary_success_tie_tolerance: float = 0.05
-    importance_ratio_clip: float = 1.0
-    # Positive-advantage success imitation stops once the current policy is
-    # already more than this multiplicative trust region above the factual
-    # behavior policy.  Value labels remain active.
-    success_policy_trust_region_epsilon: float = 0.20
-    # Successful complete episodes remain factual value supervision on every
-    # surface, but selected-action imitation can become a one-way ratchet on
-    # sparse strategic entry surfaces.  Listed surface identities therefore
-    # stay available to value/SMDP learning while being excluded from repeated
-    # success imitation and from the reserved fresh-policy sampler.
-    success_imitation_exempt_surfaces: tuple[str, ...] = ()
-    # A failed run can still contain a factually completed, healthy Act.  This
-    # optional lower imitation rung reuses the exact observed actions from that
-    # Act instead of treating the entire failed run as value-only.  Run wins
-    # remain the dominant rung; no failed final Act is imitated.
-    act_segment_imitation_enabled: bool = False
-    # Multiplicative fraction of ``primary_policy_weight``.  Keeping this at
-    # or below one makes a complete run win structurally dominant even when
-    # failed-prefix examples are much more numerous.
-    act_segment_policy_weight: float = 0.30
-    act_segment_min_exit_hp_ratio: float = 0.35
-    act_segment_max_revival_fraction: float = 0.34
     # Candidate-independent, bounded factual HP-loss regression for completed
     # combats.  A zero weight keeps the auxiliary head dormant while retaining
     # an explicit ABI for model-initialization migrations.
     combat_hp_loss_value_weight: float = 0.0
     combat_hp_loss_reference: float = 80.0
-    # Old complete episodes remain useful factual value targets, but their
-    # selected-action likelihood must not continue moving a much newer policy.
-    # The learner therefore keeps value supervision and suppresses only policy
-    # gradients whose behavior version exceeds this strict lag.
-    policy_gradient_max_lag: int = 128
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
             raise TypeError("episodic_learning.enabled must be a boolean")
-        if not isinstance(self.act_segment_imitation_enabled, bool):
-            raise TypeError(
-                "episodic_learning.act_segment_imitation_enabled must be a boolean"
-            )
         for name in (
             "replay_capacity_episodes",
             "replay_capacity_bytes",
@@ -786,47 +692,12 @@ class EpisodicLearningConfig:
             "max_segments_per_episode",
             "sample_sequences",
             "learn_steps",
-            "policy_gradient_max_lag",
         ):
             _require_int(
                 getattr(self, name),
                 label=f"episodic_learning.{name}",
                 minimum=1,
             )
-        _require_int(
-            self.fresh_policy_sequences,
-            label="episodic_learning.fresh_policy_sequences",
-            minimum=0,
-        )
-        if self.fresh_policy_sequences > self.sample_sequences:
-            raise ValueError("episodic_learning.fresh_policy_sequences cannot exceed " "sample_sequences")
-        surfaces = self.success_imitation_exempt_surfaces
-        if not isinstance(surfaces, tuple):
-            surfaces = tuple(surfaces)
-            object.__setattr__(self, "success_imitation_exempt_surfaces", surfaces)
-        normalized_surfaces: list[str] = []
-        for index, surface in enumerate(surfaces):
-            if not isinstance(surface, str):
-                raise TypeError(
-                    "episodic_learning.success_imitation_exempt_surfaces"
-                    f"[{index}] must be text"
-                )
-            normalized = surface.strip().lower()
-            if (
-                not normalized
-                or normalized != surface
-                or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in normalized)
-            ):
-                raise ValueError(
-                    "episodic_learning.success_imitation_exempt_surfaces "
-                    "must contain canonical lowercase surface keys"
-                )
-            if normalized in normalized_surfaces:
-                raise ValueError(
-                    "episodic_learning.success_imitation_exempt_surfaces "
-                    "contains a duplicate surface"
-                )
-            normalized_surfaces.append(normalized)
         _require_int(
             self.burn_in_steps,
             label="episodic_learning.burn_in_steps",
@@ -841,10 +712,8 @@ class EpisodicLearningConfig:
         if self.per_episode_capacity_bytes > self.replay_capacity_bytes:
             raise ValueError("episodic_learning.per_episode_capacity_bytes cannot exceed " "replay_capacity_bytes")
         for name in (
-            "primary_policy_weight",
             "task_value_weight",
             "revival_value_weight",
-            "revival_policy_weight",
             "combat_hp_loss_value_weight",
         ):
             _require_finite_number(
@@ -852,24 +721,6 @@ class EpisodicLearningConfig:
                 label=f"episodic_learning.{name}",
                 minimum=0.0,
             )
-        _require_finite_number(
-            self.act_segment_policy_weight,
-            label="episodic_learning.act_segment_policy_weight",
-            minimum=0.0,
-            maximum=1.0,
-        )
-        _require_finite_number(
-            self.act_segment_min_exit_hp_ratio,
-            label="episodic_learning.act_segment_min_exit_hp_ratio",
-            minimum=0.0,
-            maximum=1.0,
-        )
-        _require_finite_number(
-            self.act_segment_max_revival_fraction,
-            label="episodic_learning.act_segment_max_revival_fraction",
-            minimum=0.0,
-            maximum=1.0,
-        )
         hp_reference = _require_finite_number(
             self.combat_hp_loss_reference,
             label="episodic_learning.combat_hp_loss_reference",
@@ -878,30 +729,6 @@ class EpisodicLearningConfig:
             raise ValueError(
                 "episodic_learning.combat_hp_loss_reference must be positive"
             )
-        _require_finite_number(
-            self.secondary_advantage_fraction,
-            label="episodic_learning.secondary_advantage_fraction",
-            minimum=0.0,
-            maximum=1.0,
-        )
-        _require_finite_number(
-            self.primary_success_tie_tolerance,
-            label="episodic_learning.primary_success_tie_tolerance",
-            minimum=0.0,
-            maximum=0.5,
-        )
-        importance_ratio_clip = _require_finite_number(
-            self.importance_ratio_clip,
-            label="episodic_learning.importance_ratio_clip",
-        )
-        if importance_ratio_clip <= 0.0:
-            raise ValueError("episodic_learning.importance_ratio_clip must be positive")
-        _require_finite_number(
-            self.success_policy_trust_region_epsilon,
-            label="episodic_learning.success_policy_trust_region_epsilon",
-            minimum=0.0,
-            maximum=1.0,
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1366,12 +1193,6 @@ class TrainingConfig:
         # new lineage schedule before comparison so a checkpoint written from
         # this exact config can resume without a tuple/list false mismatch.
         rollout["deterministic_probe_environment_steps"] = list(self.rollout.deterministic_probe_environment_steps)
-        episodic_learning = payload["episodic_learning"]
-        if not isinstance(episodic_learning, dict):  # pragma: no cover - asdict invariant
-            raise TypeError("serialized episodic learning config must be an object")
-        episodic_learning["success_imitation_exempt_surfaces"] = list(
-            self.episodic_learning.success_imitation_exempt_surfaces
-        )
         runtime = payload["runtime"]
         if not isinstance(runtime, dict):  # pragma: no cover - asdict invariant
             raise TypeError("serialized runtime config must be an object")
@@ -1535,14 +1356,25 @@ def model_initialization_config_from_mapping(
     ``lifecycle_entry_support_weight``,
     ``lifecycle_entry_support_probability_floor`` and
     ``macro_option_group_completion_weight`` from every older payload before
-    construction. These are training/data/model semantics, so V19 checkpoints are accepted only for
+    construction. V20 further retires the run-success/act-segment/revival
+    selected-action imitation channels with their exemptions/ratchets and the
+    liveness policy-actor family with its actor-freshness stratification: the
+    reviewed migration strips the retired ``episodic_learning`` keys
+    (``fresh_policy_sequences``, ``primary_policy_weight``,
+    ``revival_policy_weight``, ``secondary_advantage_fraction``,
+    ``primary_success_tie_tolerance``, ``importance_ratio_clip``,
+    ``success_policy_trust_region_epsilon``,
+    ``success_imitation_exempt_surfaces``, the ``act_segment_*`` family and
+    ``policy_gradient_max_lag``) and the retired ``failure_credit`` keys
+    (``policy_gradient_max_lag``, ``matched_outcome_pair_quota`` and the
+    ``liveness_*`` actor weights/gates) from every older payload before
+    construction; a V20 payload that still contains any of them fails the
+    strict parser. These are training/data/model semantics, so V19 checkpoints are accepted only for
     model-parameter initialization; optimizer/replay/RNG state cannot cross
     the boundary.
     V11 checkpoints
     can initialize compatible shared parameters only; their missing liveness
-    head is freshly initialized by the reviewed checkpoint overlay.  V10 also
-    predates ``fresh_policy_sequences``, so that field receives its
-    behavior-preserving disabled value before applying the same V12 migration.
+    head is freshly initialized by the reviewed checkpoint overlay.
 
     This helper is deliberately separate from :func:`training_config_from_mapping`.
     Exact resume continues to call that strict parser, so a pre-V12 checkpoint
@@ -1570,18 +1402,6 @@ def model_initialization_config_from_mapping(
             f"from {source_version!r} to {CONFIG_VERSION!r}"
         )
     migrated = dict(payload)
-    if source_version == _MODEL_INITIALIZATION_SOURCE_CONFIG_V10:
-        raw_episodic = payload.get("episodic_learning")
-        if not isinstance(raw_episodic, Mapping):
-            raise ValueError(
-                "reviewed V10 model-initialization config migration requires " "an episodic_learning table"
-            )
-        if "fresh_policy_sequences" in raw_episodic:
-            raise ValueError("V10 model-initialization config unexpectedly contains " "fresh_policy_sequences")
-        migrated["episodic_learning"] = {
-            **dict(raw_episodic),
-            "fresh_policy_sequences": 0,
-        }
     if source_version in {
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V10,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V11,
@@ -1682,26 +1502,25 @@ def model_initialization_config_from_mapping(
             f"{source_version} model-initialization config has no "
             "failure_credit table after reviewed migration"
         )
-    if source_version in {
-        _MODEL_INITIALIZATION_SOURCE_CONFIG_V17,
-        _MODEL_INITIALIZATION_SOURCE_CONFIG_V18,
-        _MODEL_INITIALIZATION_SOURCE_CONFIG_V19,
-    }:
-        if "liveness_risk_actor_min_selected_probability" not in raw_failure:
-            raise ValueError(
-                "V17 model-initialization config is missing its risk-actor "
-                "saturation floor"
-            )
-    else:
-        if "liveness_risk_actor_min_selected_probability" in raw_failure:
-            raise ValueError(
-                f"{source_version} model-initialization config unexpectedly "
-                "contains the V17 risk-actor saturation floor"
-            )
-        migrated["failure_credit"] = {
-            **dict(raw_failure),
-            "liveness_risk_actor_min_selected_probability": 0.0,
-        }
+    # V20 retired the liveness policy actors and their actor-freshness
+    # stratification.  Strip the retired keys from every older payload; a V20
+    # payload containing them fails the strict parser.
+    migrated_failure = dict(raw_failure)
+    for retired_failure_field in (
+        "policy_gradient_max_lag",
+        "matched_outcome_pair_quota",
+        "liveness_risk_actor_start_update",
+        "liveness_cost_actor_weight",
+        "liveness_direct_policy_weight",
+        "liveness_cycle_policy_weight",
+        "liveness_contrast_policy_weight",
+        "liveness_completion_policy_weight",
+        "liveness_risk_advantage_clip",
+        "liveness_risk_actor_min_selected_probability",
+        "liveness_contrast_margin",
+    ):
+        migrated_failure.pop(retired_failure_field, None)
+    migrated["failure_credit"] = migrated_failure
 
     raw_episodic = migrated.get("episodic_learning")
     if not isinstance(raw_episodic, Mapping):
@@ -1709,31 +1528,7 @@ def model_initialization_config_from_mapping(
             f"{source_version} model-initialization config has no "
             "episodic_learning table after reviewed migration"
         )
-    if source_version in {
-        _MODEL_INITIALIZATION_SOURCE_CONFIG_V17,
-        _MODEL_INITIALIZATION_SOURCE_CONFIG_V18,
-        _MODEL_INITIALIZATION_SOURCE_CONFIG_V19,
-    }:
-        if "success_imitation_exempt_surfaces" not in raw_episodic:
-            raise ValueError(
-                "V17 model-initialization config is missing its success-"
-                "imitation surface exemption"
-            )
-    else:
-        if "success_imitation_exempt_surfaces" in raw_episodic:
-            raise ValueError(
-                f"{source_version} model-initialization config unexpectedly "
-                "contains the V17 success-imitation surface exemption"
-            )
-        raw_episodic = {
-            **dict(raw_episodic),
-            "success_imitation_exempt_surfaces": (),
-        }
-    v18_fields = {
-        "act_segment_imitation_enabled": False,
-        "act_segment_policy_weight": 0.30,
-        "act_segment_min_exit_hp_ratio": 0.35,
-        "act_segment_max_revival_fraction": 0.34,
+    v18_value_fields = {
         "combat_hp_loss_value_weight": 0.0,
         "combat_hp_loss_reference": 80.0,
     }
@@ -1741,25 +1536,46 @@ def model_initialization_config_from_mapping(
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V18,
         _MODEL_INITIALIZATION_SOURCE_CONFIG_V19,
     }:
-        missing_v18 = set(v18_fields) - set(raw_episodic)
+        missing_v18 = set(v18_value_fields) - set(raw_episodic)
         if missing_v18:
             raise ValueError(
                 "V18 model-initialization config is missing episodic fields: "
                 + ", ".join(sorted(missing_v18))
             )
-        migrated["episodic_learning"] = dict(raw_episodic)
+        migrated_episodic = dict(raw_episodic)
     else:
-        unexpected_v18 = set(v18_fields).intersection(raw_episodic)
+        unexpected_v18 = set(v18_value_fields).intersection(raw_episodic)
         if unexpected_v18:
             raise ValueError(
                 f"{source_version} model-initialization config unexpectedly "
                 "contains V18 episodic fields: "
                 + ", ".join(sorted(unexpected_v18))
             )
-        migrated["episodic_learning"] = {
+        migrated_episodic = {
             **dict(raw_episodic),
-            **v18_fields,
+            **v18_value_fields,
         }
+    # V20 retired the run-success/act-segment/revival selected-action
+    # imitation channels and their exemptions/ratchets.  Strip the retired
+    # keys from every older payload; a V20 payload containing them fails the
+    # strict parser.
+    for retired_episodic_field in (
+        "fresh_policy_sequences",
+        "primary_policy_weight",
+        "revival_policy_weight",
+        "secondary_advantage_fraction",
+        "primary_success_tie_tolerance",
+        "importance_ratio_clip",
+        "success_policy_trust_region_epsilon",
+        "success_imitation_exempt_surfaces",
+        "act_segment_imitation_enabled",
+        "act_segment_policy_weight",
+        "act_segment_min_exit_hp_ratio",
+        "act_segment_max_revival_fraction",
+        "policy_gradient_max_lag",
+    ):
+        migrated_episodic.pop(retired_episodic_field, None)
+    migrated["episodic_learning"] = migrated_episodic
 
     raw_transaction = migrated.get("transaction_learning")
     if not isinstance(raw_transaction, Mapping):  # pragma: no cover - checked above

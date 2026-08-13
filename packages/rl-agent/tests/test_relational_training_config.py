@@ -25,6 +25,7 @@ from sts2_rl.training.config import (
     EpisodicLearningConfig,
     model_initialization_config_from_mapping,
 )
+from tests.archived_experiment_config import load_archived_training_config
 
 
 def _remove_v15_transaction_lifecycle_fields(payload: dict[str, object]) -> None:
@@ -53,13 +54,57 @@ def _remove_v16_guard_field(payload: dict[str, object]) -> None:
     runtime.pop("evaluation_guard_enforcement_start_steps")
 
 
-def _remove_v17_stability_fields(payload: dict[str, object]) -> None:
+_RETIRED_V20_EPISODIC_FIELDS: dict[str, object] = {
+    "fresh_policy_sequences": 1,
+    "primary_policy_weight": 0.25,
+    "revival_policy_weight": 0.05,
+    "secondary_advantage_fraction": 0.25,
+    "primary_success_tie_tolerance": 0.05,
+    "importance_ratio_clip": 1.0,
+    "success_policy_trust_region_epsilon": 0.20,
+    "success_imitation_exempt_surfaces": ["rest_site"],
+    "act_segment_imitation_enabled": True,
+    "act_segment_policy_weight": 0.30,
+    "act_segment_min_exit_hp_ratio": 0.35,
+    "act_segment_max_revival_fraction": 0.34,
+    "policy_gradient_max_lag": 128,
+}
+_RETIRED_V20_FAILURE_FIELDS: dict[str, object] = {
+    "policy_gradient_max_lag": 128,
+    "matched_outcome_pair_quota": 1,
+    "liveness_risk_actor_start_update": 512,
+    "liveness_cost_actor_weight": 0.10,
+    "liveness_direct_policy_weight": 0.25,
+    "liveness_cycle_policy_weight": 0.10,
+    "liveness_contrast_policy_weight": 0.10,
+    "liveness_completion_policy_weight": 0.0,
+    "liveness_risk_advantage_clip": 0.25,
+    "liveness_risk_actor_min_selected_probability": 0.0,
+    "liveness_contrast_margin": 0.10,
+}
+
+
+def _add_retired_v20_imitation_and_actor_fields(payload: dict[str, object]) -> None:
+    # Reproduce a real pre-v20 payload: it still spelled out the retired
+    # imitation channels and liveness policy-actor keys that config v20
+    # deleted.
     failure = payload["failure_credit"]
     episodic = payload["episodic_learning"]
     assert isinstance(failure, dict)
     assert isinstance(episodic, dict)
-    failure.pop("liveness_risk_actor_min_selected_probability")
-    episodic.pop("success_imitation_exempt_surfaces")
+    episodic.update(_RETIRED_V20_EPISODIC_FIELDS)
+    failure.update(_RETIRED_V20_FAILURE_FIELDS)
+
+
+def _assert_retired_v20_fields_are_stripped(payload: dict[str, object]) -> None:
+    failure = payload["failure_credit"]
+    episodic = payload["episodic_learning"]
+    assert isinstance(failure, dict)
+    assert isinstance(episodic, dict)
+    for field in _RETIRED_V20_EPISODIC_FIELDS:
+        assert field not in episodic
+    for field in _RETIRED_V20_FAILURE_FIELDS:
+        assert field not in failure
 
 
 def _remove_v18_act_prefix_fields(payload: dict[str, object]) -> None:
@@ -68,10 +113,6 @@ def _remove_v18_act_prefix_fields(payload: dict[str, object]) -> None:
     assert isinstance(episodic, dict)
     assert isinstance(transaction, dict)
     for field in (
-        "act_segment_imitation_enabled",
-        "act_segment_policy_weight",
-        "act_segment_min_exit_hp_ratio",
-        "act_segment_max_revival_fraction",
         "combat_hp_loss_value_weight",
         "combat_hp_loss_reference",
     ):
@@ -107,33 +148,20 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
     assert preheat.curriculum.revival_budget == -1
     assert preheat.optimization.discount == 1.0
     assert preheat.transaction_learning.enabled
-    # Failure-credit v4 generic completions are zero-cost critic controls.
-    # They are not causal PREFER evidence for the final action.
-    assert default.failure_credit.liveness_completion_policy_weight == 0.0
-    assert combat.failure_credit.liveness_completion_policy_weight == 0.0
-    assert preheat.failure_credit.liveness_completion_policy_weight == 0.0
     assert not default.episodic_learning.enabled
     assert not combat.episodic_learning.enabled
     assert preheat.episodic_learning.enabled
     assert preheat.episodic_learning.sample_sequences == 2
-    assert default.episodic_learning.fresh_policy_sequences == 0
-    assert combat.episodic_learning.fresh_policy_sequences == 0
-    assert preheat.episodic_learning.fresh_policy_sequences == 0
     assert preheat.episodic_learning.burn_in_steps == 32
     assert preheat.episodic_learning.learn_steps == 32
     assert preheat.episodic_learning.macro_sample_fraction == 0.5
     assert default.episodic_learning.macro_sample_fraction == 0.0
     assert combat.episodic_learning.macro_sample_fraction == 0.0
-    assert preheat.episodic_learning.primary_success_tie_tolerance == 0.05
-    assert preheat.episodic_learning.policy_gradient_max_lag == 128
     assert preheat.episodic_learning.revival_value_weight == 0.02
     assert preheat.transaction_learning.pairwise_ranking_weight == 0.10
     assert default.failure_credit.unresolved_stall_quota == 1
     assert combat.failure_credit.unresolved_stall_quota == 1
     assert preheat.failure_credit.unresolved_stall_quota == 1
-    assert default.failure_credit.matched_outcome_pair_quota == 0
-    assert combat.failure_credit.matched_outcome_pair_quota == 0
-    assert preheat.failure_credit.matched_outcome_pair_quota == 0
     assert preheat.optimization.entropy_weight == 0.02
     assert preheat.optimization.entropy_weight_end == 0.004
     assert preheat.optimization.entropy_decay_updates == 2_000
@@ -206,53 +234,26 @@ def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_si
 
 def test_failure_credit_quota_budget_accounts_for_all_learnable_strata() -> None:
     valid = FailureCreditConfig(
-        sample_records=6,
+        sample_records=5,
         direct_witness_quota=1,
         multi_edge_cycle_quota=1,
         risk_sequence_quota=1,
         unresolved_stall_quota=1,
         completion_control_quota=1,
-        matched_outcome_pair_quota=1,
     )
-    assert valid.sample_records == 6
+    assert valid.sample_records == 5
 
     with pytest.raises(
         ValueError,
         match=r"evidence quotas cannot exceed sample_records",
     ):
         FailureCreditConfig(
-            sample_records=5,
+            sample_records=4,
             direct_witness_quota=1,
             multi_edge_cycle_quota=1,
             risk_sequence_quota=1,
             unresolved_stall_quota=1,
             completion_control_quota=1,
-            matched_outcome_pair_quota=1,
-        )
-
-
-def test_v17_stability_controls_are_fail_closed() -> None:
-    assert (
-        FailureCreditConfig(
-            liveness_risk_actor_min_selected_probability=0.01,
-        ).liveness_risk_actor_min_selected_probability
-        == pytest.approx(0.01)
-    )
-    with pytest.raises(ValueError, match=r"must be in \[0, 1\)"):
-        FailureCreditConfig(
-            liveness_risk_actor_min_selected_probability=1.0,
-        )
-
-    assert EpisodicLearningConfig(
-        success_imitation_exempt_surfaces=("rest_site", "shop"),
-    ).success_imitation_exempt_surfaces == ("rest_site", "shop")
-    with pytest.raises(ValueError, match=r"canonical lowercase"):
-        EpisodicLearningConfig(
-            success_imitation_exempt_surfaces=("RestSite",),
-        )
-    with pytest.raises(ValueError, match=r"duplicate surface"):
-        EpisodicLearningConfig(
-            success_imitation_exempt_surfaces=("shop", "shop"),
         )
 
 
@@ -260,7 +261,7 @@ def test_v29_failure_credit_lineage_retires_transaction_v3_explicitly() -> None:
     overlay = (
         Path(__file__).parents[1] / "config" / "experiments" / "full_run_revival_v29_failure_credit_v4_model_init.toml"
     )
-    config = load_training_config(
+    config = load_archived_training_config(
         profile="preheat",
         config_path=overlay,
     )
@@ -269,8 +270,6 @@ def test_v29_failure_credit_lineage_retires_transaction_v3_explicitly() -> None:
     assert config.failure_credit.mode == "learning"
     assert config.failure_credit.sample_records == 8
     assert config.failure_credit.unresolved_stall_quota == 1
-    assert config.failure_credit.matched_outcome_pair_quota == 0
-    assert config.failure_credit.liveness_completion_policy_weight == 0.0
     assert config.rollout.deterministic_probe_interval_episodes > 0
     assert config.episodic_learning.enabled
     assert config.curriculum.revival_budget == -1
@@ -362,11 +361,11 @@ def test_v25_budget64_overlay_changes_only_the_revival_curriculum_lineage() -> N
 
 def test_v26_fresh_policy_overlay_preserves_model_and_reward_contracts() -> None:
     experiment_root = Path(__file__).parents[1] / "config" / "experiments"
-    predecessor = load_training_config(
+    predecessor = load_archived_training_config(
         profile="preheat",
         config_path=(experiment_root / "full_run_revival_v25_budget64_model_init.toml"),
     )
-    restored_signal = load_training_config(
+    restored_signal = load_archived_training_config(
         profile="preheat",
         config_path=(experiment_root / "full_run_revival_v26_fresh_policy_credit_model_init.toml"),
     )
@@ -380,11 +379,9 @@ def test_v26_fresh_policy_overlay_preserves_model_and_reward_contracts() -> None
     assert restored_signal.environment == predecessor.environment
     assert restored_signal.diagnostics == predecessor.diagnostics
 
-    assert predecessor.episodic_learning.fresh_policy_sequences == 0
-    assert restored_signal.episodic_learning == replace(
-        predecessor.episodic_learning,
-        fresh_policy_sequences=1,
-    )
+    # The retired fresh-policy reservation key is projected away, so the
+    # archived recipe's surviving episodic contract equals its predecessor.
+    assert restored_signal.episodic_learning == predecessor.episodic_learning
     assert predecessor.rollout.queue_capacity == 64
     assert restored_signal.rollout == replace(
         predecessor.rollout,
@@ -392,10 +389,6 @@ def test_v26_fresh_policy_overlay_preserves_model_and_reward_contracts() -> None
     )
 
     expected_lineage = predecessor.lineage_mapping()
-    expected_lineage["episodic_learning"] = {
-        **expected_lineage["episodic_learning"],
-        "fresh_policy_sequences": 1,
-    }
     expected_lineage["rollout"] = {
         **expected_lineage["rollout"],
         "queue_capacity": 24,
@@ -419,11 +412,11 @@ def test_v26_fresh_policy_overlay_preserves_model_and_reward_contracts() -> None
 def test_v27_infinite_random_init_restores_preheat_exploration_with_v26_signal() -> None:
     experiment_root = Path(__file__).parents[1] / "config" / "experiments"
     preheat = load_training_config(profile="preheat")
-    v26 = load_training_config(
+    v26 = load_archived_training_config(
         profile="preheat",
         config_path=(experiment_root / "full_run_revival_v26_fresh_policy_credit_model_init.toml"),
     )
-    fresh = load_training_config(
+    fresh = load_archived_training_config(
         profile="preheat",
         config_path=(experiment_root / "full_run_revival_v27_infinite_random_init.toml"),
     )
@@ -448,10 +441,7 @@ def test_v27_infinite_random_init_restores_preheat_exploration_with_v26_signal()
     assert fresh.transaction_learning == preheat.transaction_learning
     assert fresh.environment == preheat.environment
     assert fresh.diagnostics == preheat.diagnostics
-    assert fresh.episodic_learning == replace(
-        preheat.episodic_learning,
-        fresh_policy_sequences=1,
-    )
+    assert fresh.episodic_learning == preheat.episodic_learning
     assert fresh.rollout == replace(preheat.rollout, queue_capacity=24)
     assert fresh.rollout.deterministic_probe_interval_episodes == 16
 
@@ -459,10 +449,6 @@ def test_v27_infinite_random_init_restores_preheat_exploration_with_v26_signal()
     expected_lineage["curriculum"] = {
         **expected_lineage["curriculum"],
         "epsilon_decay_steps": 150_000,
-    }
-    expected_lineage["episodic_learning"] = {
-        **expected_lineage["episodic_learning"],
-        "fresh_policy_sequences": 1,
     }
     expected_lineage["rollout"] = {
         **expected_lineage["rollout"],
@@ -672,11 +658,11 @@ def test_preheat_and_standard_discount_contracts_fail_closed() -> None:
 
 def test_v32_budget64_inherits_mature_schedules_without_changing_model_shape() -> None:
     experiment_root = Path(__file__).parents[1] / "config" / "experiments"
-    v31 = load_training_config(
+    v31 = load_archived_training_config(
         profile="preheat",
         config_path=(experiment_root / "full_run_revival_v31_failure_credit_capacity_model_init.toml"),
     )
-    v32 = load_training_config(
+    v32 = load_archived_training_config(
         profile="preheat",
         config_path=(experiment_root / "full_run_revival_v32_budget64_mature_model_init.toml"),
     )
@@ -691,7 +677,6 @@ def test_v32_budget64_inherits_mature_schedules_without_changing_model_shape() -
     assert v32.failure_credit.risk_sequence_quota == 1
     assert v32.failure_credit.unresolved_stall_quota == 1
     assert v32.failure_credit.completion_control_quota == 1
-    assert v32.failure_credit.matched_outcome_pair_quota == 1
     assert v32.runtime.seed == v31.runtime.seed == 5_000_000
     assert v32.runtime.evaluation_guard_min_liveness_episodes == 16
     assert v32.runtime.evaluation_guard_liveness_baseline_failures == 2
@@ -749,28 +734,29 @@ def test_v10_config_migration_is_model_initialization_only_and_opt_in() -> None:
     _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v10"
     _remove_v18_act_prefix_fields(source)
-    _remove_v17_stability_fields(source)
     _remove_v16_guard_field(source)
     _remove_v15_transaction_lifecycle_fields(source)
     source.pop("failure_credit")
+    # A real v10 payload spelled out the retired imitation weights that
+    # config v20 deleted; the reviewed migration must strip them.
     episodic = source["episodic_learning"]
     assert isinstance(episodic, dict)
-    del episodic["fresh_policy_sequences"]
-    with pytest.raises(ValueError, match=r"unsupported training config version"):
+    episodic["primary_policy_weight"] = 0.25
+    episodic["revival_policy_weight"] = 0.05
+    with pytest.raises(
+        ValueError,
+        match=r"unknown (episodic_learning|failure_credit) config keys|unsupported training config version",
+    ):
         training_config_from_mapping(source)
 
     migrated = model_initialization_config_from_mapping(source)
     assert migrated.version == CONFIG_VERSION
-    assert migrated.episodic_learning.fresh_policy_sequences == 0
     assert not migrated.failure_credit.shadow_enabled
-
-    unexpected = dict(source)
-    unexpected["episodic_learning"] = {
-        **episodic,
-        "fresh_policy_sequences": 1,
-    }
-    with pytest.raises(ValueError, match=r"unexpectedly contains"):
-        model_initialization_config_from_mapping(unexpected)
+    migrated_episodic = migrated.to_mapping()["episodic_learning"]
+    assert isinstance(migrated_episodic, dict)
+    assert "primary_policy_weight" not in migrated_episodic
+    assert "revival_policy_weight" not in migrated_episodic
+    assert "fresh_policy_sequences" not in migrated_episodic
 
     unsupported = dict(source)
     unsupported["version"] = "sts2-relational-curriculum-config-v9"
@@ -783,7 +769,6 @@ def test_v11_exact_resume_is_rejected_but_model_initialization_is_reviewed() -> 
     _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v11"
     _remove_v18_act_prefix_fields(source)
-    _remove_v17_stability_fields(source)
     _remove_v16_guard_field(source)
     _remove_v15_transaction_lifecycle_fields(source)
     source.pop("failure_credit")
@@ -801,7 +786,6 @@ def test_v13_config_migration_is_model_init_only() -> None:
     _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v13"
     _remove_v18_act_prefix_fields(source)
-    _remove_v17_stability_fields(source)
     _remove_v16_guard_field(source)
     _remove_v15_transaction_lifecycle_fields(source)
 
@@ -823,7 +807,6 @@ def test_v14_transaction_lifecycle_migration_is_model_init_only() -> None:
     _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v14"
     _remove_v18_act_prefix_fields(source)
-    _remove_v17_stability_fields(source)
     _remove_v16_guard_field(source)
     _remove_v15_transaction_lifecycle_fields(source)
 
@@ -838,7 +821,6 @@ def test_v14_transaction_lifecycle_migration_is_model_init_only() -> None:
     _remove_v19_transaction_actor_fields(unexpected)
     unexpected["version"] = "sts2-relational-curriculum-config-v14"
     _remove_v18_act_prefix_fields(unexpected)
-    _remove_v17_stability_fields(unexpected)
     with pytest.raises(ValueError, match=r"unexpectedly contains V15"):
         model_initialization_config_from_mapping(unexpected)
 
@@ -848,7 +830,6 @@ def test_v15_guard_recovery_migration_is_model_init_only() -> None:
     _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v15"
     _remove_v18_act_prefix_fields(source)
-    _remove_v17_stability_fields(source)
     _remove_v16_guard_field(source)
     # A real v15 payload legitimately carried the retired entry-support
     # corridor keys; the reviewed migration must strip them.
@@ -875,7 +856,6 @@ def test_v15_guard_recovery_migration_is_model_init_only() -> None:
     _remove_v19_transaction_actor_fields(unexpected)
     unexpected["version"] = "sts2-relational-curriculum-config-v15"
     _remove_v18_act_prefix_fields(unexpected)
-    _remove_v17_stability_fields(unexpected)
     with pytest.raises(ValueError, match=r"V16 evaluation guard"):
         model_initialization_config_from_mapping(unexpected)
 
@@ -885,26 +865,17 @@ def test_v16_stability_migration_is_model_init_only() -> None:
     _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v16"
     _remove_v18_act_prefix_fields(source)
-    _remove_v17_stability_fields(source)
 
     with pytest.raises(ValueError, match=r"unsupported training config version"):
         training_config_from_mapping(source)
 
     migrated = model_initialization_config_from_mapping(source)
     assert migrated.version == CONFIG_VERSION
-    assert migrated.failure_credit.liveness_risk_actor_min_selected_probability == 0.0
-    assert migrated.episodic_learning.success_imitation_exempt_surfaces == ()
     assert (
         migrated.runtime.evaluation_guard_enforcement_start_steps
         == TrainingConfig().runtime.evaluation_guard_enforcement_start_steps
     )
-
-    unexpected = TrainingConfig().to_mapping()
-    _remove_v19_transaction_actor_fields(unexpected)
-    unexpected["version"] = "sts2-relational-curriculum-config-v16"
-    _remove_v18_act_prefix_fields(unexpected)
-    with pytest.raises(ValueError, match=r"V17 risk-actor saturation floor"):
-        model_initialization_config_from_mapping(unexpected)
+    _assert_retired_v20_fields_are_stripped(migrated.to_mapping())
 
 
 def test_v17_act_prefix_and_hp_loss_migration_is_model_init_only() -> None:
@@ -912,16 +883,21 @@ def test_v17_act_prefix_and_hp_loss_migration_is_model_init_only() -> None:
     _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v17"
     _remove_v18_act_prefix_fields(source)
+    # A real v17 payload spelled out the retired imitation channels and
+    # liveness policy-actor keys; the reviewed migration must strip them.
+    _add_retired_v20_imitation_and_actor_fields(source)
 
-    with pytest.raises(ValueError, match=r"unsupported training config version"):
+    with pytest.raises(
+        ValueError,
+        match=r"unknown (episodic_learning|failure_credit) config keys|unsupported training config version",
+    ):
         training_config_from_mapping(source)
 
     migrated = model_initialization_config_from_mapping(source)
     assert migrated.version == CONFIG_VERSION
-    assert not migrated.episodic_learning.act_segment_imitation_enabled
-    assert migrated.episodic_learning.act_segment_policy_weight == pytest.approx(0.30)
     assert migrated.episodic_learning.combat_hp_loss_value_weight == 0.0
     assert migrated.transaction_learning.lifecycle_smdp_horizon == "transaction_exit"
+    _assert_retired_v20_fields_are_stripped(migrated.to_mapping())
 
     unexpected = TrainingConfig().to_mapping()
     _remove_v19_transaction_actor_fields(unexpected)
@@ -1067,8 +1043,6 @@ def test_episodic_learning_config_is_byte_bounded_and_fail_closed() -> None:
     config = EpisodicLearningConfig(enabled=True)
     assert config.replay_capacity_episodes == 64
     assert config.sample_sequences * config.learn_steps == 64
-    assert config.fresh_policy_sequences == 0
-    assert config.policy_gradient_max_lag == 128
     with pytest.raises(TypeError, match=r"enabled must be a boolean"):
         EpisodicLearningConfig(enabled=1)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match=r"per_episode_capacity_bytes"):
@@ -1076,14 +1050,10 @@ def test_episodic_learning_config_is_byte_bounded_and_fail_closed() -> None:
             replay_capacity_bytes=1024,
             per_episode_capacity_bytes=2048,
         )
-    with pytest.raises(ValueError, match=r"secondary_advantage_fraction"):
-        EpisodicLearningConfig(secondary_advantage_fraction=1.01)
-    with pytest.raises(ValueError, match=r"primary_success_tie_tolerance"):
-        EpisodicLearningConfig(primary_success_tie_tolerance=0.51)
-    with pytest.raises(ValueError, match=r"importance_ratio_clip"):
-        EpisodicLearningConfig(importance_ratio_clip=0.0)
     with pytest.raises(ValueError, match=r"task_value_weight"):
         EpisodicLearningConfig(task_value_weight=float("nan"))
+    with pytest.raises(ValueError, match=r"combat_hp_loss_reference"):
+        EpisodicLearningConfig(combat_hp_loss_reference=0.0)
     with pytest.raises(TypeError, match=r"macro_sample_fraction"):
         EpisodicLearningConfig(macro_sample_fraction=True)
     with pytest.raises(ValueError, match=r"macro_sample_fraction"):
@@ -1092,15 +1062,6 @@ def test_episodic_learning_config_is_byte_bounded_and_fail_closed() -> None:
         EpisodicLearningConfig(macro_sample_fraction=1.01)
     with pytest.raises(ValueError, match=r"macro_sample_fraction"):
         EpisodicLearningConfig(macro_sample_fraction=float("nan"))
-    with pytest.raises(TypeError, match=r"fresh_policy_sequences"):
-        EpisodicLearningConfig(fresh_policy_sequences=True)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match=r"fresh_policy_sequences"):
-        EpisodicLearningConfig(fresh_policy_sequences=-1)
-    with pytest.raises(ValueError, match=r"cannot exceed sample_sequences"):
-        EpisodicLearningConfig(
-            sample_sequences=2,
-            fresh_policy_sequences=3,
-        )
 
 
 def test_missing_episodic_section_uses_disabled_compatibility_defaults() -> None:
@@ -1130,14 +1091,54 @@ def test_episodic_learning_contract_is_part_of_lineage_identity() -> None:
     assert round_tripped.episodic_learning.macro_sample_fraction == 0.5
     assert round_tripped == changed_sampling
 
-    changed_fresh_sampling = replace(
+    changed_value_weight = replace(
         base,
         episodic_learning=replace(
             base.episodic_learning,
-            fresh_policy_sequences=1,
+            revival_value_weight=0.02,
         ),
     )
-    assert changed_fresh_sampling.lineage_mapping() != base.lineage_mapping()
-    fresh_round_trip = training_config_from_mapping(changed_fresh_sampling.to_mapping())
-    assert fresh_round_trip.episodic_learning.fresh_policy_sequences == 1
-    assert fresh_round_trip == changed_fresh_sampling
+    assert changed_value_weight.lineage_mapping() != base.lineage_mapping()
+    value_round_trip = training_config_from_mapping(changed_value_weight.to_mapping())
+    assert value_round_trip.episodic_learning.revival_value_weight == 0.02
+    assert value_round_trip == changed_value_weight
+
+
+def test_v20_imitation_and_liveness_actor_retirement_is_stripped_and_refused() -> None:
+    # A real v18 payload carried every retired imitation and liveness-actor
+    # key; the reviewed model-initialization migration strips them all.
+    source = TrainingConfig().to_mapping()
+    _remove_v19_transaction_actor_fields(source)
+    source["version"] = "sts2-relational-curriculum-config-v18"
+    _add_retired_v20_imitation_and_actor_fields(source)
+
+    with pytest.raises(
+        ValueError,
+        match=r"unknown (episodic_learning|failure_credit) config keys|unsupported training config version",
+    ):
+        training_config_from_mapping(source)
+
+    migrated = model_initialization_config_from_mapping(source)
+    assert migrated.version == CONFIG_VERSION
+    _assert_retired_v20_fields_are_stripped(migrated.to_mapping())
+
+    # A v20 payload that still contains any retired key is corrupt and must
+    # fail closed on both parsing paths instead of being migrated.
+    for field, value in _RETIRED_V20_EPISODIC_FIELDS.items():
+        stale = TrainingConfig().to_mapping()
+        stale_episodic = stale["episodic_learning"]
+        assert isinstance(stale_episodic, dict)
+        stale_episodic[field] = value
+        with pytest.raises(ValueError, match=r"unknown episodic_learning config keys"):
+            training_config_from_mapping(stale)
+        with pytest.raises(ValueError, match=r"unknown episodic_learning config keys"):
+            model_initialization_config_from_mapping(stale)
+    for field, value in _RETIRED_V20_FAILURE_FIELDS.items():
+        stale = TrainingConfig().to_mapping()
+        stale_failure = stale["failure_credit"]
+        assert isinstance(stale_failure, dict)
+        stale_failure[field] = value
+        with pytest.raises(ValueError, match=r"unknown failure_credit config keys"):
+            training_config_from_mapping(stale)
+        with pytest.raises(ValueError, match=r"unknown failure_credit config keys"):
+            model_initialization_config_from_mapping(stale)

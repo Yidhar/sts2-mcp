@@ -31,12 +31,13 @@ import numpy.typing as npt
 
 from sts2_rl.encoding import EncodedDecisionSnapshot, GroundedEncodingConfig
 
-# v4 adds factual Act-boundary health receipts and the floor coordinate needed
-# by long-horizon transaction options.  Neither field is a model feature or a
-# reward.  Exact resume rejects older sidecars because healthy failed-prefix
-# policy eligibility cannot be reconstructed after raw observations are gone.
-EPISODE_TRAJECTORY_VERSION: Final = "sts2-complete-episode-v4"
-EPISODIC_REPLAY_VERSION: Final = "sts2-episodic-replay-v4"
+# v5 retires the v4 Act-boundary health receipts together with the act-segment
+# imitation channel; episodic replay now serves only long-horizon value
+# labels.  Exact resume rejects older sidecars: their payloads carry the
+# retired ``act_segment_health`` field and fail closed here instead of being
+# silently reinterpreted.
+EPISODE_TRAJECTORY_VERSION: Final = "sts2-complete-episode-v5"
+EPISODIC_REPLAY_VERSION: Final = "sts2-episodic-replay-v5"
 COMBAT_DOMAIN_ID: Final = 1
 COMBAT_DECISION_SURFACE: Final = "combat"
 
@@ -61,7 +62,6 @@ _DECISION_SCALAR_BYTES: Final = (
     + 1  # act_boundary: uint8
     + 1  # policy_decision: bool
 )
-_ACT_SEGMENT_HEALTH_BYTES: Final = 8 + 8 + 8 + 8 + 8
 _OBSERVED_HORIZON_BYTES: Final = (
     1  # observed bitmap
     + 1  # success bitmap
@@ -374,57 +374,6 @@ class HorizonTargets:
 
 
 @dataclass(frozen=True, slots=True)
-class ActSegmentHealth:
-    """Factual resource state at one successful real Act boundary."""
-
-    act: int
-    boundary_step_index: int
-    exit_hp_ratio: float
-    cumulative_revivals: int
-    revival_budget: int
-
-    def __post_init__(self) -> None:
-        _integer(self.act, label="act segment act", minimum=1)
-        _integer(
-            self.boundary_step_index,
-            label="act segment boundary_step_index",
-        )
-        ratio = _finite(self.exit_hp_ratio, label="act segment exit_hp_ratio")
-        if not 0.0 <= ratio <= 1.0:
-            raise ValueError("act segment exit_hp_ratio must be in [0, 1]")
-        _integer(
-            self.cumulative_revivals,
-            label="act segment cumulative_revivals",
-        )
-        _integer(self.revival_budget, label="act segment revival_budget", minimum=1)
-
-    def healthy(
-        self,
-        *,
-        minimum_exit_hp_ratio: float,
-        maximum_revival_fraction: float,
-    ) -> bool:
-        minimum = _finite(
-            minimum_exit_hp_ratio,
-            label="minimum_exit_hp_ratio",
-        )
-        fraction = _finite(
-            maximum_revival_fraction,
-            label="maximum_revival_fraction",
-        )
-        if not 0.0 <= minimum <= 1.0 or not 0.0 <= fraction <= 1.0:
-            raise ValueError("Act health thresholds must be in [0, 1]")
-        maximum_revivals = math.floor(fraction * self.revival_budget)
-        return bool(
-            self.exit_hp_ratio >= minimum
-            and self.cumulative_revivals <= maximum_revivals
-        )
-
-    def storage_nbytes(self) -> int:
-        return _ACT_SEGMENT_HEALTH_BYTES
-
-
-@dataclass(frozen=True, slots=True)
 class BackfilledEpisodeStep:
     """One decision plus exact combat/Act/run targets known at completion."""
 
@@ -467,7 +416,6 @@ class CompletedEpisode:
     episode_id: str
     steps: tuple[BackfilledEpisodeStep, ...]
     completion: EpisodeCompletion
-    act_segment_health: tuple[ActSegmentHealth, ...] = ()
     data_partition: str = "training"
     version: str = EPISODE_TRAJECTORY_VERSION
 
@@ -479,13 +427,6 @@ class CompletedEpisode:
             raise TypeError("completed episode contains a non-backfilled step")
         if not isinstance(self.completion, EpisodeCompletion):
             raise TypeError("completed episode completion has the wrong type")
-        if not isinstance(self.act_segment_health, tuple) or not all(
-            isinstance(item, ActSegmentHealth) for item in self.act_segment_health
-        ):
-            raise TypeError("completed episode Act health receipts are invalid")
-        acts = tuple(item.act for item in self.act_segment_health)
-        if acts != tuple(sorted(set(acts))):
-            raise ValueError("completed episode Act health receipts must be unique and sorted")
         if not isinstance(self.data_partition, str) or not self.data_partition.strip():
             raise ValueError("completed episode data_partition must be non-empty")
         if self.version != EPISODE_TRAJECTORY_VERSION:
@@ -493,15 +434,6 @@ class CompletedEpisode:
         for expected, step in enumerate(self.steps):
             if step.step_index != expected:
                 raise ValueError("completed episode step indexes must be contiguous from zero")
-        for receipt in self.act_segment_health:
-            if receipt.boundary_step_index >= len(self.steps):
-                raise ValueError("Act health receipt boundary lies outside the episode")
-            boundary = self.steps[receipt.boundary_step_index].decision
-            if (
-                boundary.act != receipt.act
-                or boundary.act_boundary is not BoundaryOutcome.SUCCEEDED
-            ):
-                raise ValueError("Act health receipt does not match a successful boundary")
 
     @property
     def won(self) -> bool | None:
@@ -513,7 +445,6 @@ class CompletedEpisode:
             + len(self.data_partition.encode("utf-8"))
             + len(self.version.encode("utf-8"))
             + self.completion.storage_nbytes()
-            + sum(item.storage_nbytes() for item in self.act_segment_health)
             + sum(step.storage_nbytes() for step in self.steps)
         )
 
@@ -617,7 +548,6 @@ def backfill_completed_episode(
     episode_id: str,
     steps: tuple[EpisodeDecisionStep, ...],
     completion: EpisodeCompletion,
-    act_segment_health: tuple[ActSegmentHealth, ...] = (),
     data_partition: str = "training",
 ) -> CompletedEpisode:
     """Backfill exact long-horizon labels in one reverse ``O(T)`` pass.
@@ -693,7 +623,6 @@ def backfill_completed_episode(
         episode_id=episode_id,
         steps=tuple(reversed(reversed_results)),
         completion=completion,
-        act_segment_health=act_segment_health,
         data_partition=data_partition,
     )
 
@@ -731,7 +660,6 @@ def _validate_completed_episode_payload(episode: CompletedEpisode) -> CompletedE
         episode_id=canonical.episode_id,
         steps=tuple(step.decision for step in canonical.steps),
         completion=canonical.completion,
-        act_segment_health=canonical.act_segment_health,
         data_partition=canonical.data_partition,
     )
     stored_targets = tuple(
@@ -767,7 +695,6 @@ class ReplaySequence:
     configured_burn_in_steps: int
     source_episode_won: bool | None
     source_episode_authoritative: bool
-    act_segment_health: tuple[ActSegmentHealth, ...] = ()
     exact_recurrent_reconstruction: bool = True
 
     def __post_init__(self) -> None:
@@ -812,10 +739,6 @@ class ReplaySequence:
             raise TypeError("source_episode_won must be boolean or None")
         if not isinstance(self.source_episode_authoritative, bool):
             raise TypeError("source_episode_authoritative must be boolean")
-        if not isinstance(self.act_segment_health, tuple) or not all(
-            isinstance(item, ActSegmentHealth) for item in self.act_segment_health
-        ):
-            raise TypeError("replay sequence Act health receipts are invalid")
 
     @property
     def burn_in_no_grad(self) -> bool:
@@ -838,70 +761,6 @@ class ReplaySequence:
 
 
 @dataclass(frozen=True, slots=True)
-class EpisodicReplaySampleDiagnostics:
-    """Ephemeral facts about one replay sampling decision.
-
-    These diagnostics are deliberately not part of the persisted replay ABI.
-    They describe the relationship between the immutable stored trajectories
-    and the *current* policy version, so serializing them would only preserve a
-    stale derived view.  Exact resume remains governed by the replay items and
-    RNG state.
-    """
-
-    fresh_policy_quota_requested: int = 0
-    fresh_policy_quota_filled: int = 0
-    fresh_policy_candidate_episodes: int = 0
-    fresh_policy_candidate_decisions: int = 0
-    fresh_policy_surface_exempted_decisions: int = 0
-    sampled_fresh_policy_lag_min: int | None = None
-    sampled_fresh_policy_lag_mean: float | None = None
-    sampled_fresh_policy_lag_max: int | None = None
-
-    @property
-    def fresh_policy_quota_missed(self) -> int:
-        return self.fresh_policy_quota_requested - self.fresh_policy_quota_filled
-
-    def to_mapping(self) -> dict[str, int | float | None]:
-        return {
-            "fresh_policy_quota_requested": self.fresh_policy_quota_requested,
-            "fresh_policy_quota_filled": self.fresh_policy_quota_filled,
-            "fresh_policy_quota_missed": self.fresh_policy_quota_missed,
-            "fresh_policy_candidate_episodes": self.fresh_policy_candidate_episodes,
-            "fresh_policy_candidate_decisions": self.fresh_policy_candidate_decisions,
-            "fresh_policy_surface_exempted_decisions": (
-                self.fresh_policy_surface_exempted_decisions
-            ),
-            "sampled_fresh_policy_lag_min": self.sampled_fresh_policy_lag_min,
-            "sampled_fresh_policy_lag_mean": self.sampled_fresh_policy_lag_mean,
-            "sampled_fresh_policy_lag_max": self.sampled_fresh_policy_lag_max,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class EpisodicReplaySample:
-    """Sequences for one learner update plus non-persistent sampling facts."""
-
-    sequences: tuple[ReplaySequence, ...]
-    diagnostics: EpisodicReplaySampleDiagnostics
-
-
-@dataclass(frozen=True, slots=True)
-class _VersionedDecisionIndexes:
-    """Immutable step indexes sharing one behavior-policy version."""
-
-    policy_version: int
-    step_indexes: tuple[int, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _SurfacePolicyIndex:
-    """Successful primary-policy decisions for one runtime surface."""
-
-    decision_surface: str
-    versions: tuple[_VersionedDecisionIndexes, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class _EpisodeSamplingIndex:
     """Ephemeral O(steps)-to-build metadata used by every later sample.
 
@@ -912,9 +771,6 @@ class _EpisodeSamplingIndex:
 
     episode_id: str
     storage_nbytes: int
-    maximum_policy_version: int | None
-    successful_policy_by_surface: tuple[_SurfacePolicyIndex, ...]
-    act_success_policy_by_surface: tuple[_SurfacePolicyIndex, ...]
     macro_policy_by_surface: tuple[tuple[str, tuple[int, ...]], ...]
     noncombat_step_indexes: tuple[int, ...]
 
@@ -926,77 +782,20 @@ def _build_episode_sampling_index(
 ) -> _EpisodeSamplingIndex:
     """Scan one immutable episode once when it enters replay."""
 
-    # Preserve the exact original step order as contiguous behavior-version
-    # runs.  Sampling can filter whole runs by lag without scanning decisions,
-    # while a given RNG offset still selects the same decision as the legacy
-    # step-by-step implementation even if a malformed producer interleaves
-    # policy versions.
-    successful: dict[str, list[tuple[int, list[int]]]] = {}
-    act_success: dict[str, list[tuple[int, list[int]]]] = {}
     macro: dict[str, list[int]] = {}
     noncombat: list[int] = []
-    maximum_policy_version: int | None = None
     for step in episode.steps:
         decision = step.decision
         if step.snapshot.domain_id != COMBAT_DOMAIN_ID:
             noncombat.append(step.step_index)
         if not decision.policy_decision:
             continue
-        maximum_policy_version = (
-            decision.policy_version
-            if maximum_policy_version is None
-            else max(maximum_policy_version, decision.policy_version)
-        )
         if decision.snapshot.domain_id != COMBAT_DOMAIN_ID:
             macro.setdefault(decision.decision_surface, []).append(step.step_index)
-        primary = _primary_policy_target(step)
-        failed_run_with_successful_act = bool(
-            step.run.observed
-            and step.run.success is False
-            and step.act.observed
-            and step.act.success is True
-        )
-        if primary is None or (
-            primary.success is not True and not failed_run_with_successful_act
-        ):
-            continue
-        target_index = act_success if failed_run_with_successful_act else successful
-        version_runs = target_index.setdefault(decision.decision_surface, [])
-        if version_runs and version_runs[-1][0] == decision.policy_version:
-            version_runs[-1][1].append(step.step_index)
-        else:
-            version_runs.append((decision.policy_version, [step.step_index]))
 
     return _EpisodeSamplingIndex(
         episode_id=episode.episode_id,
         storage_nbytes=storage_nbytes,
-        maximum_policy_version=maximum_policy_version,
-        successful_policy_by_surface=tuple(
-            _SurfacePolicyIndex(
-                decision_surface=surface,
-                versions=tuple(
-                    _VersionedDecisionIndexes(
-                        policy_version=policy_version,
-                        step_indexes=tuple(indexes),
-                    )
-                    for policy_version, indexes in version_runs
-                ),
-            )
-            for surface, version_runs in successful.items()
-        ),
-        act_success_policy_by_surface=tuple(
-            _SurfacePolicyIndex(
-                decision_surface=surface,
-                versions=tuple(
-                    _VersionedDecisionIndexes(
-                        policy_version=policy_version,
-                        step_indexes=tuple(indexes),
-                    )
-                    for policy_version, indexes in version_runs
-                ),
-            )
-            for surface, version_runs in act_success.items()
-        ),
         macro_policy_by_surface=tuple((surface, tuple(indexes)) for surface, indexes in macro.items()),
         noncombat_step_indexes=tuple(noncombat),
     )
@@ -1063,7 +862,6 @@ def _replay_sequence(
         configured_burn_in_steps=burn_in_steps,
         source_episode_won=episode.won,
         source_episode_authoritative=episode.completion.authoritative,
-        act_segment_health=episode.act_segment_health,
     )
 
 
@@ -1148,189 +946,6 @@ def _stratified_episode_order(
         if not added:
             return tuple(result)
         offset += 1
-
-
-def _primary_policy_target(step: BackfilledEpisodeStep) -> HorizonTargets | None:
-    """Mirror the learner's longest-observed primary-horizon selection."""
-
-    for target in (step.run, step.act, step.combat):
-        if target.observed:
-            return target
-    return None
-
-
-def healthy_act_segment_for_step(
-    step: BackfilledEpisodeStep,
-    receipts: tuple[ActSegmentHealth, ...],
-    *,
-    minimum_exit_hp_ratio: float,
-    maximum_revival_fraction: float,
-) -> bool | None:
-    """Return factual Act-prefix health, or ``None`` when no Act succeeded.
-
-    A successful Act target without its matching boundary receipt is an ABI
-    violation when the feature is enabled; silently treating it as healthy or
-    unhealthy would make policy eligibility depend on missing data.
-    """
-
-    if not step.act.observed or step.act.success is not True:
-        return None
-    receipt = next((item for item in receipts if item.act == step.decision.act), None)
-    if receipt is None:
-        raise ValueError(
-            "successful Act target has no matching factual health receipt"
-        )
-    return receipt.healthy(
-        minimum_exit_hp_ratio=minimum_exit_hp_ratio,
-        maximum_revival_fraction=maximum_revival_fraction,
-    )
-
-
-def _fresh_policy_candidates(
-    episodes: tuple[CompletedEpisode, ...],
-    sampling_indexes: tuple[_EpisodeSamplingIndex, ...],
-    *,
-    episode_order: tuple[int, ...],
-    current_policy_version: int,
-    maximum_policy_lag: int,
-    exempt_surfaces: frozenset[str],
-    act_segment_imitation_enabled: bool = False,
-    act_segment_min_exit_hp_ratio: float = 0.35,
-    act_segment_max_revival_fraction: float = 0.34,
-    rng: np.random.Generator,
-) -> tuple[tuple[tuple[int, int, int], ...], int, int, int]:
-    """Return one surface-balanced fresh successful decision per episode.
-
-    The returned triples are ``(episode_index, decision_index, policy_lag)``.
-    A candidate is useful only when starting the differentiable suffix at that
-    exact decision would produce a policy label in the current learner.  Merely
-    selecting an episode that contains a fresh action is insufficient because a
-    random window from the same episode may still be entirely stale or forced.
-
-    Complete run wins are visited before censored lower-horizon successes.  The
-    latter remain valid factual policy targets when run outcome is unobserved,
-    but they must not displace an available full-run success.
-    """
-
-    per_episode: dict[
-        int,
-        dict[str, tuple[tuple[_VersionedDecisionIndexes, ...], int]],
-    ] = {}
-    full_run_successes: set[int] = set()
-    candidate_decisions = 0
-    exempted_decisions = 0
-    for episode_index in episode_order:
-        episode = episodes[episode_index]
-        sampling_index = sampling_indexes[episode_index]
-        if (
-            sampling_index.maximum_policy_version is not None
-            and sampling_index.maximum_policy_version > current_policy_version
-        ):
-            raise ValueError("episodic replay contains a behavior policy newer than the learner")
-        per_surface: dict[
-            str,
-            tuple[tuple[_VersionedDecisionIndexes, ...], int],
-        ] = {}
-        # Complete-run (and legacy censored lower-horizon) successes are
-        # already classified at put time.  Preserve that O(index) fast path:
-        # sampling must not rescan decisions or re-run target classification.
-        indexed_surfaces: list[tuple[_SurfacePolicyIndex, bool]] = [
-            (surface_index, False)
-            for surface_index in sampling_index.successful_policy_by_surface
-        ]
-        if act_segment_imitation_enabled:
-            indexed_surfaces.extend(
-                (surface_index, True)
-                for surface_index in sampling_index.act_success_policy_by_surface
-            )
-
-        for surface_index, requires_act_health in indexed_surfaces:
-            eligible_versions_list: list[_VersionedDecisionIndexes] = []
-            for version in surface_index.versions:
-                if not 0 <= current_policy_version - version.policy_version <= maximum_policy_lag:
-                    continue
-                if not requires_act_health:
-                    eligible_versions_list.append(version)
-                    continue
-                healthy_indexes = tuple(
-                    index
-                    for index in version.step_indexes
-                    if healthy_act_segment_for_step(
-                        episode.steps[index],
-                        episode.act_segment_health,
-                        minimum_exit_hp_ratio=act_segment_min_exit_hp_ratio,
-                        maximum_revival_fraction=act_segment_max_revival_fraction,
-                    )
-                    is True
-                )
-                if healthy_indexes:
-                    eligible_versions_list.append(
-                        _VersionedDecisionIndexes(
-                            policy_version=version.policy_version,
-                            step_indexes=healthy_indexes,
-                        )
-                    )
-            eligible_versions = tuple(eligible_versions_list)
-            eligible_count = sum(len(version.step_indexes) for version in eligible_versions)
-            if surface_index.decision_surface in exempt_surfaces:
-                exempted_decisions += eligible_count
-                continue
-            if eligible_count:
-                previous_versions, previous_count = per_surface.get(
-                    surface_index.decision_surface,
-                    ((), 0),
-                )
-                per_surface[surface_index.decision_surface] = (
-                    previous_versions + eligible_versions,
-                    previous_count + eligible_count,
-                )
-                candidate_decisions += eligible_count
-        if not per_surface:
-            continue
-        per_episode[episode_index] = per_surface
-        if episode.completion.authoritative and episode.won is True:
-            full_run_successes.add(episode_index)
-
-    surface_counts: Counter[str] = Counter()
-    result: list[tuple[int, int, int]] = []
-    prioritized_order = tuple(index for index in episode_order if index in full_run_successes) + tuple(
-        index for index in episode_order if index in per_episode and index not in full_run_successes
-    )
-    for episode_index in prioritized_order:
-        candidates = per_episode[episode_index]
-        # A non-combat fresh suffix can satisfy both the fresh-policy and the
-        # existing macro reservation with one GPU slot.  Prefer that overlap;
-        # fall back to combat only when the episode has no eligible macro
-        # decision.  Online V-trace already supplies dense combat policy
-        # gradients, whereas map/build/resource decisions otherwise receive
-        # very sparse long-horizon action credit.
-        eligible_surfaces = tuple(surface for surface in candidates if surface != COMBAT_DECISION_SURFACE) or tuple(
-            candidates
-        )
-        minimum_count = min(surface_counts[surface] for surface in eligible_surfaces)
-        least_used = tuple(surface for surface in eligible_surfaces if surface_counts[surface] == minimum_count)
-        surface = least_used[int(rng.integers(0, len(least_used)))]
-        versions, decision_count = candidates[surface]
-        selected_offset = int(rng.integers(0, decision_count))
-        decision_index: int | None = None
-        lag: int | None = None
-        for version in versions:
-            if selected_offset < len(version.step_indexes):
-                decision_index = version.step_indexes[selected_offset]
-                lag = current_policy_version - version.policy_version
-                break
-            selected_offset -= len(version.step_indexes)
-        if decision_index is None or lag is None:  # pragma: no cover - index invariant
-            raise RuntimeError("fresh policy sampling index is internally inconsistent")
-        result.append((episode_index, decision_index, lag))
-        surface_counts[surface] += 1
-
-    return (
-        tuple(result),
-        len(per_episode),
-        candidate_decisions,
-        exempted_decisions,
-    )
 
 
 class BoundedEpisodicReplay:
@@ -1445,129 +1060,16 @@ class BoundedEpisodicReplay:
         burn_in_steps: int,
         macro_sample_fraction: float = 0.0,
     ) -> tuple[ReplaySequence, ...]:
-        """Sample the legacy all-age value/outcome-stratified replay view."""
+        """Sample the all-age value/outcome-stratified replay view.
 
-        return self._sample(
-            maximum,
-            learn_steps=learn_steps,
-            burn_in_steps=burn_in_steps,
-            macro_sample_fraction=macro_sample_fraction,
-            current_policy_version=None,
-            policy_gradient_max_lag=None,
-            fresh_policy_sequences=0,
-            success_imitation_exempt_surfaces=(),
-            act_segment_imitation_enabled=False,
-            act_segment_min_exit_hp_ratio=0.0,
-            act_segment_max_revival_fraction=0.0,
-        ).sequences
-
-    def sample_for_learning(
-        self,
-        maximum: int,
-        *,
-        learn_steps: int,
-        burn_in_steps: int,
-        macro_sample_fraction: float,
-        current_policy_version: int,
-        policy_gradient_max_lag: int,
-        fresh_policy_sequences: int,
-        success_imitation_exempt_surfaces: tuple[str, ...] = (),
-        act_segment_imitation_enabled: bool = False,
-        act_segment_min_exit_hp_ratio: float = 0.35,
-        act_segment_max_revival_fraction: float = 0.34,
-    ) -> EpisodicReplaySample:
-        """Reserve fresh successful policy credit without deleting old value data.
-
-        Fresh reservations consume slots from ``maximum``; they do not enlarge
-        the GPU graph.  Any remaining slots retain the existing all-age,
-        outcome-stratified sampler so stale and failed episodes continue to
-        supervise factual value heads.  When no policy-eligible trajectory is
-        available, the method safely falls back to the all-age sampler rather
-        than fabricating an action label or returning an empty batch.
+        ``macro_sample_fraction`` reserves sequence slots whose differentiable
+        suffix starts at a factual non-combat decision, so sparse macro
+        decisions still receive long-horizon value labels.  No behavior-policy
+        freshness filter exists on this plane: since v20 episodic replay
+        supervises only value heads and every stored trajectory remains a
+        factual target regardless of its behavior-policy age.
         """
 
-        _integer(
-            maximum,
-            label="episodic replay sample maximum",
-            minimum=1,
-        )
-        _integer(
-            current_policy_version,
-            label="episodic replay current_policy_version",
-        )
-        _integer(
-            policy_gradient_max_lag,
-            label="episodic replay policy_gradient_max_lag",
-        )
-        _integer(
-            fresh_policy_sequences,
-            label="episodic replay fresh_policy_sequences",
-        )
-        if current_policy_version < 0 or policy_gradient_max_lag < 0:
-            raise ValueError("episodic replay policy versions and lag must be non-negative")
-        if not 0 <= fresh_policy_sequences <= maximum:
-            raise ValueError(
-                "episodic replay fresh_policy_sequences must be in [0, maximum]"
-            )
-        if not isinstance(success_imitation_exempt_surfaces, tuple) or any(
-            not isinstance(surface, str) or not surface
-            for surface in success_imitation_exempt_surfaces
-        ):
-            raise ValueError(
-                "episodic replay success-imitation exemptions must be a "
-                "tuple of non-empty surface keys"
-            )
-        if len(set(success_imitation_exempt_surfaces)) != len(
-            success_imitation_exempt_surfaces
-        ):
-            raise ValueError(
-                "episodic replay success-imitation exemptions contain duplicates"
-            )
-        if not isinstance(act_segment_imitation_enabled, bool):
-            raise TypeError(
-                "episodic replay act_segment_imitation_enabled must be boolean"
-            )
-        for label, value in (
-            ("act_segment_min_exit_hp_ratio", act_segment_min_exit_hp_ratio),
-            (
-                "act_segment_max_revival_fraction",
-                act_segment_max_revival_fraction,
-            ),
-        ):
-            normalized = _finite(value, label=f"episodic replay {label}")
-            if not 0.0 <= normalized <= 1.0:
-                raise ValueError(f"episodic replay {label} must be in [0, 1]")
-        return self._sample(
-            maximum,
-            learn_steps=learn_steps,
-            burn_in_steps=burn_in_steps,
-            macro_sample_fraction=macro_sample_fraction,
-            current_policy_version=current_policy_version,
-            policy_gradient_max_lag=policy_gradient_max_lag,
-            fresh_policy_sequences=fresh_policy_sequences,
-            success_imitation_exempt_surfaces=(
-                success_imitation_exempt_surfaces
-            ),
-            act_segment_imitation_enabled=act_segment_imitation_enabled,
-            act_segment_min_exit_hp_ratio=act_segment_min_exit_hp_ratio,
-            act_segment_max_revival_fraction=act_segment_max_revival_fraction,
-        )
-
-    def _sample(
-        self,
-        maximum: int,
-        *,
-        learn_steps: int,
-        burn_in_steps: int,
-        macro_sample_fraction: float,
-        current_policy_version: int | None,
-        policy_gradient_max_lag: int | None,
-        fresh_policy_sequences: int,
-        success_imitation_exempt_surfaces: tuple[str, ...],
-        act_segment_imitation_enabled: bool,
-        act_segment_min_exit_hp_ratio: float,
-        act_segment_max_revival_fraction: float,
-    ) -> EpisodicReplaySample:
         _integer(maximum, label="episodic replay sample maximum", minimum=1)
         _integer(learn_steps, label="episodic replay learn_steps", minimum=1)
         _integer(burn_in_steps, label="episodic replay burn_in_steps")
@@ -1581,12 +1083,7 @@ class BoundedEpisodicReplay:
         with self._sample_lock:
             with self._lock:
                 if not self._items:
-                    return EpisodicReplaySample(
-                        sequences=(),
-                        diagnostics=EpisodicReplaySampleDiagnostics(
-                            fresh_policy_quota_requested=fresh_policy_sequences,
-                        ),
-                    )
+                    return ()
                 episodes = tuple(self._items)
                 sampling_indexes = tuple(self._sampling_indexes)
                 if len(episodes) != len(sampling_indexes):  # pragma: no cover
@@ -1608,90 +1105,13 @@ class BoundedEpisodicReplay:
                 int(math.ceil(maximum * macro_fraction)),
             )
             macro_added = 0
-            fresh_lags: list[int] = []
-            fresh_candidate_episodes = 0
-            fresh_candidate_decisions = 0
-            fresh_surface_exempted_decisions = 0
-            if fresh_policy_sequences:
-                if current_policy_version is None or policy_gradient_max_lag is None:
-                    raise RuntimeError("fresh policy sampling is missing its policy contract")
-                (
-                    fresh_candidates,
-                    fresh_candidate_episodes,
-                    fresh_candidate_decisions,
-                    fresh_surface_exempted_decisions,
-                ) = _fresh_policy_candidates(
-                    episodes,
-                    sampling_indexes,
-                    episode_order=order,
-                    current_policy_version=current_policy_version,
-                    maximum_policy_lag=policy_gradient_max_lag,
-                    exempt_surfaces=frozenset(
-                        success_imitation_exempt_surfaces
-                    ),
-                    act_segment_imitation_enabled=(
-                        act_segment_imitation_enabled
-                    ),
-                    act_segment_min_exit_hp_ratio=(
-                        act_segment_min_exit_hp_ratio
-                    ),
-                    act_segment_max_revival_fraction=(
-                        act_segment_max_revival_fraction
-                    ),
-                    rng=self._rng,
-                )
-                for episode_index, decision_index, lag in fresh_candidates:
-                    if len(fresh_lags) >= fresh_policy_sequences:
-                        break
-                    if per_episode_count[episode_index] >= self.max_segments_per_episode:
-                        continue
-                    key = (episode_index, decision_index)
-                    if key in selected_starts:
-                        continue
-                    episode = episodes[episode_index]
-                    sequences.append(
-                        _replay_sequence(
-                            episode,
-                            learn_start=decision_index,
-                            learn_steps=learn_steps,
-                            burn_in_steps=burn_in_steps,
-                            sampling_index=sampling_indexes[episode_index],
-                        )
-                    )
-                    selected_starts.add(key)
-                    per_episode_count[episode_index] += 1
-                    fresh_lags.append(lag)
-                    if (
-                        episode.steps[decision_index].snapshot.domain_id != COMBAT_DOMAIN_ID
-                        and macro_added < macro_limit
-                    ):
-                        macro_added += 1
 
-            def result() -> EpisodicReplaySample:
+            def result() -> tuple[ReplaySequence, ...]:
                 self._sample_count += len(sequences)
                 self._macro_sample_count += macro_added
-                return EpisodicReplaySample(
-                    sequences=tuple(sequences),
-                    diagnostics=EpisodicReplaySampleDiagnostics(
-                        fresh_policy_quota_requested=fresh_policy_sequences,
-                        fresh_policy_quota_filled=len(fresh_lags),
-                        fresh_policy_candidate_episodes=fresh_candidate_episodes,
-                        fresh_policy_candidate_decisions=fresh_candidate_decisions,
-                        fresh_policy_surface_exempted_decisions=(
-                            fresh_surface_exempted_decisions
-                        ),
-                        sampled_fresh_policy_lag_min=(min(fresh_lags) if fresh_lags else None),
-                        sampled_fresh_policy_lag_mean=(
-                            float(sum(fresh_lags) / len(fresh_lags)) if fresh_lags else None
-                        ),
-                        sampled_fresh_policy_lag_max=(max(fresh_lags) if fresh_lags else None),
-                    ),
-                )
+                return tuple(sequences)
 
-            if len(sequences) >= maximum:
-                return result()
-
-            if macro_added < macro_limit:
+            if macro_limit:
                 for episode_index, decision_index in _macro_surface_candidates(
                     sampling_indexes,
                     episode_order=order,
@@ -1908,17 +1328,13 @@ class BoundedEpisodicReplay:
 __all__ = [
     "EPISODE_TRAJECTORY_VERSION",
     "EPISODIC_REPLAY_VERSION",
-    "ActSegmentHealth",
     "BackfilledEpisodeStep",
     "BoundaryOutcome",
     "BoundedEpisodicReplay",
     "CompletedEpisode",
     "EpisodeCompletion",
     "EpisodeDecisionStep",
-    "EpisodicReplaySample",
-    "EpisodicReplaySampleDiagnostics",
     "HorizonTargets",
     "ReplaySequence",
     "backfill_completed_episode",
-    "healthy_act_segment_for_step",
 ]

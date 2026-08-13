@@ -1053,7 +1053,6 @@ def test_collector_shadow_emits_separate_formal_failure_credit_records() -> None
         assert all(
             record.incident.provenance.run_id == "collector-shadow-test" for record in episode.failure_credit_records
         )
-        assert all(record.plan.actor_label_count == 0 for record in episode.failure_credit_records)
         # Legacy transaction-v3 remains an independent compatibility plane.
         assert episode.transaction_traces == ()
     finally:
@@ -1097,14 +1096,12 @@ def test_runtime_failure_credit_quotas_cover_every_learnable_stratum() -> None:
         _config(),
         failure_credit=FailureCreditConfig(
             mode="learning",
-            sample_records=6,
+            sample_records=5,
             direct_witness_quota=1,
             multi_edge_cycle_quota=1,
             risk_sequence_quota=1,
             unresolved_stall_quota=1,
             completion_control_quota=1,
-            matched_outcome_pair_quota=1,
-            liveness_risk_actor_start_update=512,
         ),
     )
 
@@ -1116,20 +1113,9 @@ def test_runtime_failure_credit_quotas_cover_every_learnable_stratum() -> None:
         EvidenceStratum.RISK_SEQUENCE: 1,
         EvidenceStratum.UNRESOLVED_STALL: 1,
         EvidenceStratum.COMPLETION_CONTROL: 1,
-        EvidenceStratum.MATCHED_OUTCOME_PAIR: 1,
     }
     assert EvidenceStratum.CENSORED not in {item.stratum for item in quotas}
-
-    calibration_quotas = runtime_module._failure_credit_quotas(
-        config,
-        learner_updates=511,
-    )
-    assert EvidenceStratum.RISK_SEQUENCE not in {item.stratum for item in calibration_quotas}
-    mature_quotas = runtime_module._failure_credit_quotas(
-        config,
-        learner_updates=512,
-    )
-    assert {item.stratum: item.minimum for item in mature_quotas} == {item.stratum: item.minimum for item in quotas}
+    assert EvidenceStratum.MATCHED_OUTCOME_PAIR not in {item.stratum for item in quotas}
 
 
 def test_failure_credit_retention_covers_every_configured_stall_window() -> None:
@@ -1333,13 +1319,12 @@ def test_epsilon_exploration_balances_semantic_branches_after_strict_grouping(
 def test_baseline_inspection_exposes_active_shapes_separately_from_capacities() -> None:
     config = _config()
     report = inspect_baseline(config)
-    assert report["pipeline"] == ("bounded-fifo-async-vtrace-failure-credit-v5-v9")
+    assert report["pipeline"] == ("bounded-fifo-async-vtrace-failure-credit-v6-v9")
     assert report["active_shape_batching"] is True
     assert report["deterministic_probe_environment_steps"] == []
     assert report["encoding_capacities"]["candidates"] == 6
     assert report["candidate_shape"][1] < 6
     assert report["episodic_learning"]["macro_sample_fraction"] == 0.0
-    assert report["episodic_learning"]["act_segment_imitation_enabled"] is False
     assert report["episodic_learning"]["combat_hp_loss_value_weight"] == 0.0
     assert report["transaction_learning"]["lifecycle_smdp_horizon"] == (
         "transaction_exit"
@@ -2736,7 +2721,6 @@ def test_runtime_failure_credit_modes_preserve_shadow_isolation_and_episode_orde
             risk_sequence_quota=0,
             unresolved_stall_quota=0,
             completion_control_quota=1,
-            matched_outcome_pair_quota=0,
         ),
         runtime=replace(
             base.runtime,
@@ -2754,7 +2738,7 @@ def test_runtime_failure_credit_modes_preserve_shadow_isolation_and_episode_orde
     metrics_path = next((tmp_path / "runs" / f"failure-credit-{mode}").glob("run-*/metrics.jsonl"))
     events = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
     run_start = next(item for item in events if item["event"] == "run_start")
-    assert run_start["pipeline"] == ("bounded-fifo-async-vtrace-failure-credit-v5-v9")
+    assert run_start["pipeline"] == ("bounded-fifo-async-vtrace-failure-credit-v6-v9")
     train_episode = next(item for item in events if item["event"] == "train_episode")
     assert train_episode["failure_credit_mode"] == mode
     assert train_episode["failure_credit_records_emitted"] >= 1
@@ -2774,8 +2758,6 @@ def test_runtime_failure_credit_modes_preserve_shadow_isolation_and_episode_orde
         assert learner_update["liveness_credit_plans"] >= 1
         assert learner_update["liveness_value_labels"] >= 1
         assert learner_update["liveness_q_labels"] >= 1
-        # Generic completion is a zero-cost critic control, not PREFER.
-        assert learner_update["liveness_completion_policy_labels"] == 0
         assert metadata["liveness_cost_heads_enabled"] is True
         assert metadata["failure_credit_replay_enabled"] is True
         assert metadata["failure_credit_replay_spec"]["size"] >= 1
@@ -2856,7 +2838,6 @@ def test_terminal_native_exit_cannot_flush_pending_before_evidence_boundary(
             risk_sequence_quota=0,
             unresolved_stall_quota=0,
             completion_control_quota=1,
-            matched_outcome_pair_quota=0,
         ),
         runtime=replace(
             base.runtime,
@@ -2957,7 +2938,6 @@ def test_boundary_result_visible_before_rollout_tail_is_drained_before_release(
             risk_sequence_quota=0,
             unresolved_stall_quota=0,
             completion_control_quota=1,
-            matched_outcome_pair_quota=0,
         ),
         runtime=replace(
             base.runtime,

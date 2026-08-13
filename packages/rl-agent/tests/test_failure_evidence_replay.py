@@ -20,9 +20,6 @@ from sts2_rl.training.failure_credit import (
     CreditCompiler,
     CreditPlan,
     CreditProvenance,
-    CyclePolicyCredit,
-    DirectPolicyCredit,
-    DirectPolicyTarget,
     EvidenceRecord,
     EvidenceStratum,
     FailureIncident,
@@ -33,7 +30,6 @@ from sts2_rl.training.failure_credit import (
     MatchedOutcomePair,
     OutcomeArm,
     PolicyWitness,
-    RiskSequenceCredit,
     StratumQuota,
     TargetAuthority,
     WitnessKind,
@@ -162,35 +158,6 @@ def _context(
     )
 
 
-def _multi_step_context(
-    identity: str,
-    *,
-    policy_versions: tuple[int, ...],
-) -> LearningContext:
-    if not policy_versions:
-        raise ValueError("test context requires at least one policy version")
-    base = _context(identity, policy_version=policy_versions[0])
-    template = base.steps[0]
-    return replace(
-        base,
-        steps=tuple(
-            replace(
-                template,
-                decision_id=f"decision-{identity}-{index}",
-                episode_step=index,
-                policy_version=policy_version,
-                node=_identity(
-                    "node",
-                    f"node-instance-{identity}-{index}",
-                    loop_identity=f"loop-node-{index}",
-                    comparison_identity=f"comparison-node-{index}",
-                ),
-            )
-            for index, policy_version in enumerate(policy_versions)
-        ),
-    )
-
-
 def _record(
     identity: str,
     *,
@@ -221,28 +188,24 @@ def _record(
         task_q_targets=(),
         liveness_value_targets=(),
         liveness_q_targets=(),
-        direct_policy_targets=(),
-        cycle_policy_targets=(),
-        contrast_policy_targets=(),
-        risk_sequences=(),
         strata=strata,
         provenance=provenance,
     )
     return EvidenceRecord(incident=incident, plan=plan)
 
 
-def _actor_record(
+def _failed_record(
     identity: str,
     *,
     stratum: EvidenceStratum,
-    policy_version: int,
+    policy_version: int = 4,
 ) -> EvidenceRecord:
     if stratum not in {
         EvidenceStratum.DIRECT_WITNESS,
         EvidenceStratum.MULTI_EDGE_CYCLE,
         EvidenceStratum.RISK_SEQUENCE,
     }:
-        raise ValueError("test actor record requires an actor evidence stratum")
+        raise ValueError("test failed record requires a failure evidence stratum")
     context = _context(identity, policy_version=policy_version)
     provenance = _provenance(policy_version=policy_version)
     incident = FailureIncident(
@@ -260,41 +223,6 @@ def _actor_record(
         progress_epoch=1,
         provenance=provenance,
     )
-    direct = (
-        (
-            DirectPolicyCredit(
-                step_index=0,
-                target=DirectPolicyTarget.AVOID,
-                witness_id=f"direct-{identity}",
-            ),
-        )
-        if stratum is EvidenceStratum.DIRECT_WITNESS
-        else ()
-    )
-    cycle = (
-        (
-            CyclePolicyCredit(
-                step_indices=(0,),
-                behavior_mean_log_probability=-0.693147,
-                margin=0.1,
-                witness_id=f"cycle-{identity}",
-            ),
-        )
-        if stratum is EvidenceStratum.MULTI_EDGE_CYCLE
-        else ()
-    )
-    risk = (
-        (
-            RiskSequenceCredit(
-                step_indices=(0,),
-                terminal_cost=1.0,
-                discount=0.99,
-                witness_id=None,
-            ),
-        )
-        if stratum is EvidenceStratum.RISK_SEQUENCE
-        else ()
-    )
     return EvidenceRecord(
         incident=incident,
         plan=CreditPlan(
@@ -305,120 +233,20 @@ def _actor_record(
             task_q_targets=(),
             liveness_value_targets=(),
             liveness_q_targets=(),
-            direct_policy_targets=direct,
-            cycle_policy_targets=cycle,
-            contrast_policy_targets=(),
-            risk_sequences=risk,
             strata=(stratum,),
             provenance=provenance,
         ),
     )
 
 
-def _multi_step_actor_record(
-    identity: str,
-    *,
-    stratum: EvidenceStratum,
-    policy_versions: tuple[int, ...],
-    provenance_policy_version: int | None = None,
-) -> EvidenceRecord:
-    if stratum not in {
-        EvidenceStratum.DIRECT_WITNESS,
-        EvidenceStratum.MULTI_EDGE_CYCLE,
-        EvidenceStratum.RISK_SEQUENCE,
-    }:
-        raise ValueError("test actor record requires an actor evidence stratum")
-    context = _multi_step_context(
-        identity,
-        policy_versions=policy_versions,
-    )
-    provenance = _provenance(
-        policy_version=(max(policy_versions) if provenance_policy_version is None else provenance_policy_version)
-    )
-    incident = FailureIncident(
-        incident_id=f"incident-{identity}",
-        scope_key="scope",
-        failure_kind="deadlock",
-        outcome=FailureOutcome.DEADLOCK_STALL,
-        task_authority=TargetAuthority.OBJECTIVE_CONFIRMED,
-        local_authority=TargetAuthority.DETECTOR_CONFIRMED,
-        task_return=-1.0,
-        local_failure_cost=1.0,
-        context=context,
-        witnesses=(),
-        detector_window_steps=64,
-        progress_epoch=1,
-        provenance=provenance,
-    )
-    step_indices = tuple(range(len(context.steps)))
-    return EvidenceRecord(
-        incident=incident,
-        plan=CreditPlan(
-            plan_id=f"plan-{identity}",
-            incident_id=incident.incident_id,
-            context=context,
-            task_value_targets=(),
-            task_q_targets=(),
-            liveness_value_targets=(),
-            liveness_q_targets=(),
-            direct_policy_targets=(
-                tuple(
-                    DirectPolicyCredit(
-                        step_index=index,
-                        target=DirectPolicyTarget.AVOID,
-                        witness_id=f"direct-{identity}-{index}",
-                    )
-                    for index in step_indices
-                )
-                if stratum is EvidenceStratum.DIRECT_WITNESS
-                else ()
-            ),
-            cycle_policy_targets=(
-                (
-                    CyclePolicyCredit(
-                        step_indices=step_indices,
-                        behavior_mean_log_probability=-0.693147,
-                        margin=0.1,
-                        witness_id=f"cycle-{identity}",
-                    ),
-                )
-                if stratum is EvidenceStratum.MULTI_EDGE_CYCLE
-                else ()
-            ),
-            contrast_policy_targets=(),
-            risk_sequences=(
-                (
-                    RiskSequenceCredit(
-                        step_indices=step_indices,
-                        terminal_cost=1.0,
-                        discount=0.99,
-                        witness_id=f"risk-{identity}",
-                    ),
-                )
-                if stratum is EvidenceStratum.RISK_SEQUENCE
-                else ()
-            ),
-            strata=(stratum,),
-            provenance=provenance,
-        ),
-    )
-
-
-def _matched_pair_record(
-    identity: str,
-    *,
-    better_policy_version: int = 4,
-    worse_policy_version: int = 4,
-) -> EvidenceRecord:
+def _matched_pair_record(identity: str) -> EvidenceRecord:
     better_context = _context(
         f"{identity}-better",
         action_index=0,
-        policy_version=better_policy_version,
     )
     worse_context = _context(
         f"{identity}-worse",
         action_index=1,
-        policy_version=worse_policy_version,
     )
     better_incident_id = f"incident-{identity}-better"
     worse_incident_id = f"incident-{identity}-worse"
@@ -460,12 +288,7 @@ def _matched_pair_record(
         witnesses=(witness,),
         detector_window_steps=64,
         progress_epoch=1,
-        provenance=_provenance(
-            policy_version=max(
-                better_policy_version,
-                worse_policy_version,
-            )
-        ),
+        provenance=_provenance(),
     )
     return EvidenceRecord(
         incident=incident,
@@ -585,10 +408,9 @@ def test_put_many_builds_and_publishes_one_corpus_for_an_atomic_episode_batch(
         seed=21,
     )
     assert replay.put(_record("batch-old"))
-    direct = _actor_record(
+    direct = _failed_record(
         "batch-direct",
         stratum=EvidenceStratum.DIRECT_WITNESS,
-        policy_version=4,
     )
     pair = _matched_pair_record("batch-pair")
     tail = _record("batch-tail")
@@ -645,235 +467,6 @@ def test_put_many_oversize_rejects_the_whole_batch_before_publication() -> None:
     assert metrics["oversize_count"] == 1
 
 
-@pytest.mark.parametrize(
-    ("stratum", "metric_prefix"),
-    (
-        (EvidenceStratum.DIRECT_WITNESS, "direct"),
-        (EvidenceStratum.MULTI_EDGE_CYCLE, "multi_edge"),
-        (EvidenceStratum.RISK_SEQUENCE, "risk"),
-    ),
-)
-def test_actor_quotas_use_fresh_records_and_leave_stale_records_for_critic_fill(
-    stratum: EvidenceStratum,
-    metric_prefix: str,
-) -> None:
-    replay = BoundedFailureCreditReplay(
-        capacity=2,
-        byte_capacity=100_000_000,
-        seed=23,
-    )
-    stale = _actor_record(
-        f"{metric_prefix}-stale",
-        stratum=stratum,
-        policy_version=10,
-    )
-    fresh = _actor_record(
-        f"{metric_prefix}-fresh",
-        stratum=stratum,
-        policy_version=100,
-    )
-    assert replay.put_many((stale, fresh)) == 2
-
-    sample = replay.sample(
-        2,
-        risk_actor_enabled=True,
-        quotas=(StratumQuota(stratum, 1),),
-        current_policy_version=100,
-        policy_gradient_max_lag=5,
-    )
-    status = sample.quota_diagnostics.statuses[0]
-    assert status.requested == 1
-    assert status.available_total == 2
-    assert status.available_actor_fresh == 1
-    assert status.selected_actor_fresh == 1
-    assert status.selected_stale_critic == 1
-    assert status.deficit == 0
-    assert sample.quota_diagnostics.satisfied
-    assert sample.records[0].incident.incident_id.endswith("-fresh")
-    assert {record.incident.incident_id for record in sample.records} == {
-        stale.incident.incident_id,
-        fresh.incident.incident_id,
-    }
-    metrics = replay.metrics()
-    assert metrics[f"{metric_prefix}_actor_eligible_records"] == 2
-    assert metrics[f"sampled_{metric_prefix}_actor_fresh_count"] == 1
-    assert metrics[f"sampled_{metric_prefix}_lag_suppressed_critic_count"] == 1
-
-
-def test_actor_quota_uses_exact_row_and_group_freshness_semantics() -> None:
-    direct = _multi_step_actor_record(
-        "mixed-direct",
-        stratum=EvidenceStratum.DIRECT_WITNESS,
-        policy_versions=(10, 100),
-    )
-    cycle = _multi_step_actor_record(
-        "mixed-cycle",
-        stratum=EvidenceStratum.MULTI_EDGE_CYCLE,
-        policy_versions=(10, 100),
-    )
-    risk = _multi_step_actor_record(
-        "mixed-risk",
-        stratum=EvidenceStratum.RISK_SEQUENCE,
-        policy_versions=(10, 100),
-    )
-    replay = BoundedFailureCreditReplay(
-        capacity=3,
-        byte_capacity=100_000_000,
-        seed=232,
-    )
-    assert replay.put_many((direct, cycle, risk)) == 3
-
-    sample = replay.sample(
-        3,
-        risk_actor_enabled=True,
-        quotas=(
-            StratumQuota(EvidenceStratum.DIRECT_WITNESS, 1),
-            StratumQuota(EvidenceStratum.MULTI_EDGE_CYCLE, 1),
-            StratumQuota(EvidenceStratum.RISK_SEQUENCE, 1),
-        ),
-        current_policy_version=100,
-        policy_gradient_max_lag=5,
-    )
-    statuses = {status.stratum: status for status in sample.quota_diagnostics.statuses}
-    # Direct and risk targets are independent rows: their fresh row can train
-    # even though another row in the same record is stale.
-    assert statuses[EvidenceStratum.DIRECT_WITNESS].available_actor_fresh == 1
-    assert statuses[EvidenceStratum.RISK_SEQUENCE].available_actor_fresh == 1
-    # A cycle is one indivisible likelihood group.  Every referenced row must
-    # be fresh, so one stale edge prevents this record satisfying the quota.
-    assert statuses[EvidenceStratum.MULTI_EDGE_CYCLE].available_actor_fresh == 0
-    assert statuses[EvidenceStratum.MULTI_EDGE_CYCLE].deficit == 1
-
-
-def test_risk_actor_quota_is_phase_disabled_until_the_learner_head_is_ready() -> None:
-    replay = BoundedFailureCreditReplay(
-        capacity=1,
-        byte_capacity=100_000_000,
-        seed=233,
-    )
-    assert replay.put(
-        _actor_record(
-            "risk-phase",
-            stratum=EvidenceStratum.RISK_SEQUENCE,
-            policy_version=100,
-        )
-    )
-    quota = (StratumQuota(EvidenceStratum.RISK_SEQUENCE, 1),)
-
-    calibration = replay.sample(
-        1,
-        risk_actor_enabled=False,
-        quotas=quota,
-        current_policy_version=100,
-        policy_gradient_max_lag=0,
-    )
-    calibration_status = calibration.quota_diagnostics.statuses[0]
-    assert calibration_status.available_total == 1
-    assert calibration_status.available_actor_fresh == 0
-    assert calibration_status.selected_stale_critic == 1
-    assert calibration_status.deficit == 1
-
-    mature = replay.sample(
-        1,
-        risk_actor_enabled=True,
-        quotas=quota,
-        current_policy_version=100,
-        policy_gradient_max_lag=0,
-    )
-    mature_status = mature.quota_diagnostics.statuses[0]
-    assert mature_status.available_actor_fresh == 1
-    assert mature_status.selected_actor_fresh == 1
-    assert mature_status.deficit == 0
-
-
-def test_matched_pair_actor_quota_requires_both_arms_fresh_and_roundtrips_counters() -> None:
-    stale_arm = _matched_pair_record(
-        "pair-stale-arm",
-        better_policy_version=100,
-        worse_policy_version=10,
-    )
-    both_fresh = _matched_pair_record(
-        "pair-both-fresh",
-        better_policy_version=99,
-        worse_policy_version=100,
-    )
-    replay = BoundedFailureCreditReplay(
-        capacity=2,
-        byte_capacity=100_000_000,
-        seed=234,
-    )
-    assert replay.put_many((stale_arm, both_fresh)) == 2
-    sample = replay.sample(
-        2,
-        risk_actor_enabled=True,
-        quotas=(StratumQuota(EvidenceStratum.MATCHED_OUTCOME_PAIR, 1),),
-        current_policy_version=100,
-        policy_gradient_max_lag=5,
-    )
-    status = sample.quota_diagnostics.statuses[0]
-    assert status.available_total == 2
-    assert status.available_actor_fresh == 1
-    assert status.selected_actor_fresh == 1
-    assert status.selected_stale_critic == 1
-    assert sample.records[0] == both_fresh
-
-    state = pickle.loads(pickle.dumps(replay.state_dict()))
-    assert state["sampled_matched_pair_actor_fresh_count"] == 1
-    assert state["sampled_matched_pair_lag_suppressed_critic_count"] == 1
-    metrics = replay.metrics()
-    assert metrics["sampled_matched_pair_actor_fresh_count"] == 1
-    assert metrics["sampled_matched_pair_lag_suppressed_critic_count"] == 1
-
-    restored = BoundedFailureCreditReplay(
-        capacity=2,
-        byte_capacity=100_000_000,
-        seed=999,
-    )
-    restored.load_state_dict(state)
-    assert restored.state_dict() == state
-    assert restored.metrics() == metrics
-
-
-def test_stale_actor_record_can_fill_critic_batch_but_not_actor_quota() -> None:
-    replay = BoundedFailureCreditReplay(
-        capacity=1,
-        byte_capacity=100_000_000,
-        seed=24,
-    )
-    stale = _actor_record(
-        "stale-only",
-        stratum=EvidenceStratum.RISK_SEQUENCE,
-        policy_version=3,
-    )
-    assert replay.put(stale)
-
-    sample = replay.sample(
-        1,
-        risk_actor_enabled=True,
-        quotas=(StratumQuota(EvidenceStratum.RISK_SEQUENCE, 1),),
-        current_policy_version=100,
-        policy_gradient_max_lag=5,
-    )
-    assert sample.records == (stale,)
-    status = sample.quota_diagnostics.statuses[0]
-    assert status.available_total == 1
-    assert status.available_actor_fresh == 0
-    assert status.selected_actor_fresh == 0
-    assert status.selected_stale_critic == 1
-    assert status.deficit == 1
-    assert not sample.quota_diagnostics.satisfied
-
-    with pytest.raises(
-        ValueError,
-        match="require policy freshness parameters",
-    ):
-        replay.sample(
-            1,
-            risk_actor_enabled=True,
-            quotas=(StratumQuota(EvidenceStratum.RISK_SEQUENCE, 1),),
-        )
-
-
 def test_quota_sampling_and_metrics_cover_all_seven_strata() -> None:
     replay = BoundedFailureCreditReplay(
         capacity=len(EvidenceStratum),
@@ -881,21 +474,18 @@ def test_quota_sampling_and_metrics_cover_all_seven_strata() -> None:
         seed=3,
     )
     records = (
-        _actor_record(
+        _failed_record(
             "stratum-direct",
             stratum=EvidenceStratum.DIRECT_WITNESS,
-            policy_version=4,
         ),
-        _actor_record(
+        _failed_record(
             "stratum-multi",
             stratum=EvidenceStratum.MULTI_EDGE_CYCLE,
-            policy_version=4,
         ),
         _matched_pair_record("stratum-pair"),
-        _actor_record(
+        _failed_record(
             "stratum-risk",
             stratum=EvidenceStratum.RISK_SEQUENCE,
-            policy_version=4,
         ),
         _record(
             "stratum-unresolved",
@@ -914,13 +504,16 @@ def test_quota_sampling_and_metrics_cover_all_seven_strata() -> None:
     quotas = tuple(StratumQuota(stratum=stratum, minimum=1) for stratum in EvidenceStratum)
     sample = replay.sample(
         len(EvidenceStratum),
-        risk_actor_enabled=True,
         quotas=quotas,
         current_policy_version=4,
-        policy_gradient_max_lag=0,
     )
     assert sample.quota_diagnostics.satisfied
     assert {status.stratum for status in sample.quota_diagnostics.statuses} == set(EvidenceStratum)
+    for status in sample.quota_diagnostics.statuses:
+        assert status.requested == 1
+        assert status.available >= 1
+        assert status.selected >= 1
+        assert status.deficit == 0
     metrics = replay.metrics()
     for stratum in EvidenceStratum:
         assert int(metrics[f"stratum_{stratum.value.lower()}_size"]) >= 1
@@ -938,10 +531,8 @@ def test_quota_sampling_and_metrics_cover_all_seven_strata() -> None:
     )
     deficit = deficit_replay.sample(
         1,
-        risk_actor_enabled=True,
         quotas=(StratumQuota(EvidenceStratum.DIRECT_WITNESS, 1),),
         current_policy_version=4,
-        policy_gradient_max_lag=0,
     )
     assert deficit.quota_diagnostics.total_deficit == 1
     assert deficit_replay.metrics()["quota_deficit_count"] == 1
@@ -969,7 +560,6 @@ def test_replay_metrics_use_publication_caches_not_full_corpus_scan(
     )
     metrics = replay.metrics()
     assert metrics["size"] == 1
-    assert metrics["actor_actionable_records"] == 1
     assert metrics["outcome_pair_count"] == 1
     assert metrics["stratum_matched_outcome_pair_size"] == 1
 
@@ -1008,13 +598,13 @@ def test_matched_pair_is_inserted_checkpointed_and_evicted_atomically() -> None:
     assert restored.metrics()["admission_rejection_count"] == 1
 
 
-def test_completion_flood_cannot_evict_last_direct_or_multi_edge_actor_records() -> None:
-    direct = _actor_record(
+def test_completion_flood_cannot_evict_last_direct_or_multi_edge_records() -> None:
+    direct = _failed_record(
         "protected-direct",
         stratum=EvidenceStratum.DIRECT_WITNESS,
         policy_version=10,
     )
-    multi = _actor_record(
+    multi = _failed_record(
         "protected-multi",
         stratum=EvidenceStratum.MULTI_EDGE_CYCLE,
         policy_version=10,
@@ -1035,18 +625,18 @@ def test_completion_flood_cannot_evict_last_direct_or_multi_edge_actor_records()
     assert replay.metrics()["evicted_primary_completion_control_count"] >= 18
 
 
-def test_actor_stratum_refresh_replaces_stale_peer_before_protected_other_strata() -> None:
-    direct_old = _actor_record(
+def test_stratum_refresh_replaces_oldest_peer_before_protected_other_strata() -> None:
+    direct_old = _failed_record(
         "direct-old",
         stratum=EvidenceStratum.DIRECT_WITNESS,
         policy_version=1,
     )
-    multi = _actor_record(
+    multi = _failed_record(
         "multi-stays",
         stratum=EvidenceStratum.MULTI_EDGE_CYCLE,
         policy_version=1,
     )
-    direct_fresh = _actor_record(
+    direct_fresh = _failed_record(
         "direct-fresh",
         stratum=EvidenceStratum.DIRECT_WITNESS,
         policy_version=100,
@@ -1063,7 +653,7 @@ def test_actor_stratum_refresh_replaces_stale_peer_before_protected_other_strata
     assert replay.metrics()["evicted_primary_direct_witness_count"] == 1
 
 
-def test_exact_v5_roundtrip_preserves_rng_counters_and_next_sample() -> None:
+def test_exact_v6_roundtrip_preserves_rng_counters_and_next_sample() -> None:
     replay = BoundedFailureCreditReplay(
         capacity=4,
         byte_capacity=100_000_000,
@@ -1072,7 +662,7 @@ def test_exact_v5_roundtrip_preserves_rng_counters_and_next_sample() -> None:
     records = tuple(_record(f"roundtrip-{index}") for index in range(4))
     for record in records:
         assert replay.put(record)
-    replay.sample(2, risk_actor_enabled=True)
+    replay.sample(2)
     assert not replay.put(records[0])
 
     payload = pickle.loads(pickle.dumps(replay.state_dict()))
@@ -1085,81 +675,13 @@ def test_exact_v5_roundtrip_preserves_rng_counters_and_next_sample() -> None:
     assert restored.metrics() == replay.metrics()
     assert _incident_ids(restored) == _incident_ids(replay)
 
-    expected = tuple(record.incident.incident_id for record in replay.sample(3, risk_actor_enabled=True).records)
-    actual = tuple(record.incident.incident_id for record in restored.sample(3, risk_actor_enabled=True).records)
+    expected = tuple(record.incident.incident_id for record in replay.sample(3).records)
+    actual = tuple(record.incident.incident_id for record in restored.sample(3).records)
     assert actual == expected
     assert restored.metrics() == replay.metrics()
 
 
-def test_exact_v5_roundtrip_preserves_actor_fresh_sampling_and_counters() -> None:
-    replay = BoundedFailureCreditReplay(
-        capacity=4,
-        byte_capacity=100_000_000,
-        seed=25,
-    )
-    records = (
-        _actor_record(
-            "roundtrip-stale",
-            stratum=EvidenceStratum.DIRECT_WITNESS,
-            policy_version=10,
-        ),
-        _actor_record(
-            "roundtrip-fresh-98",
-            stratum=EvidenceStratum.DIRECT_WITNESS,
-            policy_version=98,
-        ),
-        _actor_record(
-            "roundtrip-fresh-99",
-            stratum=EvidenceStratum.DIRECT_WITNESS,
-            policy_version=99,
-        ),
-        _actor_record(
-            "roundtrip-fresh-100",
-            stratum=EvidenceStratum.DIRECT_WITNESS,
-            policy_version=100,
-        ),
-    )
-    assert replay.put_many(records) == len(records)
-    quota = (StratumQuota(EvidenceStratum.DIRECT_WITNESS, 1),)
-    replay.sample(
-        2,
-        risk_actor_enabled=True,
-        quotas=quota,
-        current_policy_version=100,
-        policy_gradient_max_lag=5,
-    )
-
-    payload = pickle.loads(pickle.dumps(replay.state_dict()))
-    restored = BoundedFailureCreditReplay(
-        capacity=4,
-        byte_capacity=100_000_000,
-        seed=999,
-    )
-    restored.load_state_dict(payload)
-    assert restored.metrics() == replay.metrics()
-
-    expected = replay.sample(
-        2,
-        risk_actor_enabled=True,
-        quotas=quota,
-        current_policy_version=100,
-        policy_gradient_max_lag=5,
-    )
-    actual = restored.sample(
-        2,
-        risk_actor_enabled=True,
-        quotas=quota,
-        current_policy_version=100,
-        policy_gradient_max_lag=5,
-    )
-    assert tuple(record.incident.incident_id for record in actual.records) == tuple(
-        record.incident.incident_id for record in expected.records
-    )
-    assert actual.quota_diagnostics == expected.quota_diagnostics
-    assert restored.metrics() == replay.metrics()
-
-
-def test_exact_v5_sampling_is_independent_of_python_hash_seed(
+def test_exact_v6_sampling_is_independent_of_python_hash_seed(
     tmp_path: Path,
 ) -> None:
     replay = BoundedFailureCreditReplay(
@@ -1168,7 +690,7 @@ def test_exact_v5_sampling_is_independent_of_python_hash_seed(
         seed=250,
     )
     records = tuple(
-        _actor_record(
+        _failed_record(
             f"cross-process-{index:02d}",
             stratum=EvidenceStratum.DIRECT_WITNESS,
             policy_version=100,
@@ -1176,7 +698,7 @@ def test_exact_v5_sampling_is_independent_of_python_hash_seed(
         for index in range(12)
     )
     assert replay.put_many(records) == len(records)
-    state_path = tmp_path / "failure-replay-v5.pkl"
+    state_path = tmp_path / "failure-replay-v6.pkl"
     state_path.write_bytes(pickle.dumps(replay.state_dict()))
     script = """
 import json
@@ -1198,10 +720,8 @@ replay = BoundedFailureCreditReplay(
 replay.load_state_dict(pickle.loads(Path(sys.argv[1]).read_bytes()))
 sample = replay.sample(
     6,
-    risk_actor_enabled=True,
     quotas=(StratumQuota(EvidenceStratum.DIRECT_WITNESS, 3),),
     current_policy_version=100,
-    policy_gradient_max_lag=0,
 )
 print(json.dumps([record.incident.incident_id for record in sample.records]))
 """
@@ -1226,14 +746,14 @@ print(json.dumps([record.incident.incident_id for record in sample.records]))
     assert run_with_hash_seed("1") == run_with_hash_seed("987654")
 
 
-def test_future_actor_evidence_is_rejected_without_advancing_rng_or_counters() -> None:
+def test_future_evidence_is_rejected_without_advancing_rng_or_counters() -> None:
     replay = BoundedFailureCreditReplay(
         capacity=1,
         byte_capacity=100_000_000,
         seed=26,
     )
     assert replay.put(
-        _actor_record(
+        _failed_record(
             "future-policy",
             stratum=EvidenceStratum.RISK_SEQUENCE,
             policy_version=101,
@@ -1247,38 +767,8 @@ def test_future_actor_evidence_is_rejected_without_advancing_rng_or_counters() -
     ):
         replay.sample(
             1,
-            risk_actor_enabled=True,
             quotas=(StratumQuota(EvidenceStratum.RISK_SEQUENCE, 1),),
             current_policy_version=100,
-            policy_gradient_max_lag=5,
-        )
-
-    assert pickle.dumps(replay.state_dict()) == original
-
-
-def test_future_row_is_rejected_before_rng_even_when_plan_provenance_is_current() -> None:
-    replay = BoundedFailureCreditReplay(
-        capacity=1,
-        byte_capacity=100_000_000,
-        seed=261,
-    )
-    assert replay.put(
-        _multi_step_actor_record(
-            "future-row-only",
-            stratum=EvidenceStratum.DIRECT_WITNESS,
-            policy_versions=(100, 101),
-            provenance_policy_version=100,
-        )
-    )
-    original = pickle.dumps(replay.state_dict())
-
-    with pytest.raises(ValueError, match="newer than the learner"):
-        replay.sample(
-            1,
-            risk_actor_enabled=True,
-            quotas=(StratumQuota(EvidenceStratum.DIRECT_WITNESS, 1),),
-            current_policy_version=100,
-            policy_gradient_max_lag=5,
         )
 
     assert pickle.dumps(replay.state_dict()) == original
@@ -1315,6 +805,40 @@ def test_load_rejects_v3_capacity_and_corrupt_accounting_without_mutation() -> N
     assert pickle.dumps(replay.state_dict()) == original
 
 
+def test_load_refuses_retired_v5_version_and_actor_counter_payloads() -> None:
+    replay = BoundedFailureCreditReplay(
+        capacity=2,
+        byte_capacity=100_000_000,
+        seed=27,
+    )
+    assert replay.put(_record("refusal"))
+    original = pickle.dumps(replay.state_dict())
+
+    # A payload claiming the retired actor-freshness replay version must fail
+    # closed even when every remaining field is v6-shaped.
+    v5 = pickle.loads(original)
+    v5["version"] = "sts2-failure-evidence-replay-v5"
+    with pytest.raises(
+        ValueError,
+        match="unsupported failure evidence replay checkpoint schema",
+    ):
+        replay.load_state_dict(v5)
+
+    # A v6-versioned payload still carrying the retired actor counters is a
+    # different schema, never a silently ignored superset.
+    actor_counters = pickle.loads(original)
+    actor_counters["actor_actionable_records"] = 1
+    actor_counters["sampled_direct_actor_fresh_count"] = 0
+    actor_counters["sampled_direct_lag_suppressed_critic_count"] = 0
+    with pytest.raises(
+        ValueError,
+        match="unsupported failure evidence replay checkpoint schema",
+    ):
+        replay.load_state_dict(actor_counters)
+
+    assert pickle.dumps(replay.state_dict()) == original
+
+
 def test_sampling_releases_publication_lock_before_quota_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1334,10 +858,8 @@ def test_sampling_releases_publication_lock_before_quota_work(
         *,
         batch_size: int,
         rng: np.random.Generator,
-        risk_actor_enabled: bool,
         quotas: tuple[StratumQuota, ...] = (),
         current_policy_version: int | None = None,
-        policy_gradient_max_lag: int | None = None,
     ) -> object:
         entered.set()
         if not release.wait(timeout=5):
@@ -1346,16 +868,14 @@ def test_sampling_releases_publication_lock_before_quota_work(
             corpus,
             batch_size=batch_size,
             rng=rng,
-            risk_actor_enabled=risk_actor_enabled,
             quotas=quotas,
             current_policy_version=current_policy_version,
-            policy_gradient_max_lag=policy_gradient_max_lag,
         )
 
     monkeypatch.setattr(ImmutableEvidenceCorpus, "sample", blocking_sample)
 
     def run_sample() -> None:
-        result = replay.sample(1, risk_actor_enabled=True)
+        result = replay.sample(1)
         sampled.extend(record.incident.incident_id for record in result.records)
 
     sampler = Thread(target=run_sample)

@@ -441,6 +441,11 @@ def test_v5_failure_credit_checkpoint_roundtrip_restores_replay_and_heads(
         source.optimizer.step()
         expected_model = {key: value.detach().clone() for key, value in source.model.state_dict().items()}
         expected_replay = source.failure_credit_replay.state_dict()
+        # The persisted sidecar is the v6 evidence replay: no actor-freshness
+        # accounting survives in the exact-resume payload.
+        assert expected_replay["version"] == "sts2-failure-evidence-replay-v6"
+        assert "actor_actionable_records" not in expected_replay
+        assert not any("actor_fresh" in key or "lag_suppressed" in key for key in expected_replay)
         state = TrainingState(
             environment_steps=23,
             learner_updates=2,
@@ -464,10 +469,12 @@ def test_v5_failure_credit_checkpoint_roundtrip_restores_replay_and_heads(
     assert metadata["failure_credit_abi"] == (checkpointing_module._failure_credit_abi())
     assert metadata["failure_credit_abi"]["collector"] == checkpointing_module.FAILURE_CREDIT_COLLECTOR_VERSION
     assert metadata["failure_credit_abi"]["detector"] == checkpointing_module.FAILURE_CREDIT_DETECTOR_VERSION
+    assert metadata["failure_credit_abi"]["replay"] == "sts2-failure-evidence-replay-v6"
     assert metadata["failure_credit_mode"] == "learning"
     assert metadata["liveness_cost_heads_enabled"] is True
     assert metadata["failure_credit_replay_enabled"] is True
     assert isinstance(metadata["failure_credit_replay_spec"], dict)
+    assert metadata["failure_credit_replay_spec"]["version"] == "sts2-failure-evidence-replay-v6"
     assert (checkpoint / "failure_credit_replay.pkl").is_file()
     assert _liveness_state(expected_model)
 

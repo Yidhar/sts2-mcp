@@ -65,14 +65,6 @@ def test_v47_recipe_is_factual_isolated_macro_awr() -> None:
     assert tx.macro_option_value_weight == pytest.approx(0.10)
     assert tx.macro_option_actor_weight == pytest.approx(0.03)
     assert tx.macro_option_actor_temperature == pytest.approx(0.25)
-    assert set(config.episodic_learning.success_imitation_exempt_surfaces) == {
-        "rest_site",
-        "shop",
-        "card_reward",
-        "card_reward_selection",
-        "upgrade_selection",
-        "removal_selection",
-    }
     assert config.curriculum.revival_budget == 40
     assert config.runtime.total_environment_steps == 30_000
     assert config.runtime.evaluation_steps == (0, 5_000, 10_000, 20_000)

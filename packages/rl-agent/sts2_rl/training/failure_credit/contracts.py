@@ -166,11 +166,6 @@ class WitnessKind(StrEnum):
     COMPLETION_CONTROL = EvidenceStratum.COMPLETION_CONTROL
 
 
-class DirectPolicyTarget(StrEnum):
-    AVOID = "avoid"
-    PREFER = "prefer"
-
-
 @dataclass(frozen=True, slots=True)
 class CreditProvenance:
     """Exact source/semantic ABI for one incident and its compiled credit."""
@@ -648,84 +643,14 @@ class ScalarCredit:
 
 
 @dataclass(frozen=True, slots=True)
-class DirectPolicyCredit:
-    step_index: int
-    target: DirectPolicyTarget
-    witness_id: str
-
-    def __post_init__(self) -> None:
-        _non_negative_integer(self.step_index, label="direct policy step_index")
-        if not isinstance(self.target, DirectPolicyTarget):
-            raise TypeError("direct policy target has the wrong type")
-        _key(self.witness_id, label="direct policy witness_id")
-
-
-@dataclass(frozen=True, slots=True)
-class CyclePolicyCredit:
-    step_indices: tuple[int, ...]
-    behavior_mean_log_probability: float
-    margin: float
-    witness_id: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.step_indices, tuple) or not self.step_indices:
-            raise ValueError("cycle policy credit requires at least one step")
-        for value in self.step_indices:
-            _non_negative_integer(value, label="cycle policy step_index")
-        if len(set(self.step_indices)) != len(self.step_indices):
-            raise ValueError("cycle policy step indices must be unique")
-        behavior = _finite(
-            self.behavior_mean_log_probability,
-            label="cycle behavior_mean_log_probability",
-        )
-        if behavior > 1e-7:
-            raise ValueError("cycle behavior_mean_log_probability cannot exceed zero")
-        if _finite(self.margin, label="cycle margin") <= 0.0:
-            raise ValueError("cycle margin must be positive")
-        _key(self.witness_id, label="cycle policy witness_id")
-
-
-@dataclass(frozen=True, slots=True)
-class ContrastPolicyCredit:
-    pair: MatchedOutcomePair
-    margin: float
-    witness_id: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.pair, MatchedOutcomePair):
-            raise TypeError("contrast policy pair has the wrong type")
-        if _finite(self.margin, label="contrast margin") <= 0.0:
-            raise ValueError("contrast margin must be positive")
-        _key(self.witness_id, label="contrast policy witness_id")
-
-
-@dataclass(frozen=True, slots=True)
-class RiskSequenceCredit:
-    step_indices: tuple[int, ...]
-    terminal_cost: float
-    discount: float
-    witness_id: str | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.step_indices, tuple) or not self.step_indices:
-            raise ValueError("risk sequence requires at least one learning step")
-        for value in self.step_indices:
-            _non_negative_integer(value, label="risk sequence step_index")
-        if len(set(self.step_indices)) != len(self.step_indices):
-            raise ValueError("risk sequence step indices must be unique")
-        cost = _finite(self.terminal_cost, label="risk terminal_cost")
-        if not 0.0 <= cost <= 1.0:
-            raise ValueError("risk terminal_cost must be in [0, 1]")
-        discount = _finite(self.discount, label="risk discount")
-        if not 0.0 < discount <= 1.0:
-            raise ValueError("risk discount must be in (0, 1]")
-        if self.witness_id is not None:
-            _key(self.witness_id, label="risk witness_id")
-
-
-@dataclass(frozen=True, slots=True)
 class CreditPlan:
-    """Learner-ready immutable targets compiled from one incident."""
+    """Learner-ready immutable value/critic targets compiled from one incident.
+
+    Since v20 a plan carries only scalar value/Q critic targets and its
+    stratum classification.  The direct/cycle/contrast/risk policy-credit
+    channels were retired; detector witnesses remain stored on the incident as
+    factual evidence and matched-outcome pairs remain atomic values there.
+    """
 
     plan_id: str
     incident_id: str
@@ -734,10 +659,6 @@ class CreditPlan:
     task_q_targets: tuple[ScalarCredit, ...]
     liveness_value_targets: tuple[ScalarCredit, ...]
     liveness_q_targets: tuple[ScalarCredit, ...]
-    direct_policy_targets: tuple[DirectPolicyCredit, ...]
-    cycle_policy_targets: tuple[CyclePolicyCredit, ...]
-    contrast_policy_targets: tuple[ContrastPolicyCredit, ...]
-    risk_sequences: tuple[RiskSequenceCredit, ...]
     strata: tuple[EvidenceStratum, ...]
     provenance: CreditProvenance
     compiler_version: str = FAILURE_CREDIT_COMPILER_VERSION
@@ -753,10 +674,6 @@ class CreditPlan:
             ("task_q_targets", self.task_q_targets, ScalarCredit),
             ("liveness_value_targets", self.liveness_value_targets, ScalarCredit),
             ("liveness_q_targets", self.liveness_q_targets, ScalarCredit),
-            ("direct_policy_targets", self.direct_policy_targets, DirectPolicyCredit),
-            ("cycle_policy_targets", self.cycle_policy_targets, CyclePolicyCredit),
-            ("contrast_policy_targets", self.contrast_policy_targets, ContrastPolicyCredit),
-            ("risk_sequences", self.risk_sequences, RiskSequenceCredit),
         ):
             if not isinstance(values, tuple) or not all(isinstance(item, expected) for item in values):
                 raise TypeError(f"{label} has the wrong typed tuple")
@@ -776,50 +693,10 @@ class CreditPlan:
         ):
             if scalar_target.step_index >= len(self.context.steps):
                 raise ValueError("credit target references a step outside its learning context")
-        for direct_target in self.direct_policy_targets:
-            if direct_target.step_index >= len(self.context.steps):
-                raise ValueError("direct policy target references a step outside its learning context")
-        for cycle_target in self.cycle_policy_targets:
-            if any(index >= len(self.context.steps) for index in cycle_target.step_indices):
-                raise ValueError("cycle target references a step outside its learning context")
-        for risk_target in self.risk_sequences:
-            if any(index >= len(self.context.steps) for index in risk_target.step_indices):
-                raise ValueError("risk sequence references a step outside its learning context")
         if self.compiler_version != FAILURE_CREDIT_COMPILER_VERSION:
             raise ValueError(f"unsupported credit compiler: {self.compiler_version!r}")
         if self.schema_version != FAILURE_CREDIT_SCHEMA_VERSION:
             raise ValueError(f"unsupported failure-credit schema: {self.schema_version!r}")
-
-    @property
-    def direct_actor_label_count(self) -> int:
-        """Return factual non-Q actor labels in this plan.
-
-        Direct, cycle, and contrast targets have an explicit policy target.
-        Risk sequences are reported separately because their actor direction
-        is derived from the calibrated liveness Q head.
-        """
-
-        return (
-            len(self.direct_policy_targets)
-            + len(self.cycle_policy_targets)
-            + len(self.contrast_policy_targets)
-        )
-
-    @property
-    def risk_actor_candidate_count(self) -> int:
-        """Return decision rows that may become centered-risk actor labels."""
-
-        return sum(
-            int(not self.context.steps[step_index].forced)
-            for sequence in self.risk_sequences
-            for step_index in sequence.step_indices
-        )
-
-    @property
-    def actor_label_count(self) -> int:
-        """Return all policy-relevant labels before freshness suppression."""
-
-        return self.direct_actor_label_count + self.risk_actor_candidate_count
 
     @property
     def target_count(self) -> int:
@@ -831,10 +708,6 @@ class CreditPlan:
                 len(self.task_q_targets),
                 len(self.liveness_value_targets),
                 len(self.liveness_q_targets),
-                len(self.direct_policy_targets),
-                len(self.cycle_policy_targets),
-                len(self.contrast_policy_targets),
-                len(self.risk_sequences),
             )
         )
 
@@ -842,12 +715,8 @@ class CreditPlan:
 __all__ = [
     "FAILURE_CREDIT_COMPILER_VERSION",
     "FAILURE_CREDIT_SCHEMA_VERSION",
-    "ContrastPolicyCredit",
     "CreditPlan",
     "CreditProvenance",
-    "CyclePolicyCredit",
-    "DirectPolicyCredit",
-    "DirectPolicyTarget",
     "EvidenceStratum",
     "FailureIncident",
     "FailureOutcome",
@@ -858,7 +727,6 @@ __all__ = [
     "MatchedOutcomePair",
     "OutcomeArm",
     "PolicyWitness",
-    "RiskSequenceCredit",
     "ScalarCredit",
     "SemanticKey",
     "TargetAuthority",

@@ -75,28 +75,16 @@ from .trajectory import TrajectoryJournal
 # Human-readable training-system ABI persisted in inspection and run_start
 # telemetry.  Exact-resume safety is enforced independently by the config,
 # encoding, replay and objective checkpoint contracts; this marker makes the
-# failure-credit-v4 publication/sampling order distinguishable in metrics.
-_TRAINING_PIPELINE_ABI = "bounded-fifo-async-vtrace-failure-credit-v5-v9"
+# failure-credit publication/sampling order distinguishable in metrics.
+_TRAINING_PIPELINE_ABI = "bounded-fifo-async-vtrace-failure-credit-v6-v9"
 
 
 def _failure_credit_quotas(
     config: TrainingConfig,
-    *,
-    learner_updates: int | None = None,
 ) -> tuple[StratumQuota, ...]:
-    """Return the explicit v4 evidence minima for one learner sample.
-
-    ``None`` describes the configured mature-phase quotas for static
-    provenance.  A live learner update suppresses the risk-actor quota until
-    that actor channel is enabled; risk records may still be sampled normally
-    for critic calibration, but cannot falsely satisfy an actor quota.
-    """
+    """Return the explicit critic evidence-diversity minima for one sample."""
 
     credit = config.failure_credit
-    if learner_updates is not None and (
-        isinstance(learner_updates, bool) or not isinstance(learner_updates, int) or learner_updates < 0
-    ):
-        raise ValueError("learner_updates must be a non-negative integer or None")
     return tuple(
         StratumQuota(stratum=stratum, minimum=minimum)
         for stratum, minimum in (
@@ -120,17 +108,8 @@ def _failure_credit_quotas(
                 EvidenceStratum.COMPLETION_CONTROL,
                 credit.completion_control_quota,
             ),
-            (
-                EvidenceStratum.MATCHED_OUTCOME_PAIR,
-                credit.matched_outcome_pair_quota,
-            ),
         )
         if minimum > 0
-        and (
-            stratum is not EvidenceStratum.RISK_SEQUENCE
-            or learner_updates is None
-            or learner_updates >= credit.liveness_risk_actor_start_update
-        )
     )
 
 
@@ -769,7 +748,6 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
             "sample_records": config.failure_credit.sample_records,
             "burn_in_steps": config.failure_credit.burn_in_steps,
             "maximum_context_steps": (config.failure_credit.maximum_context_steps),
-            "policy_gradient_max_lag": (config.failure_credit.policy_gradient_max_lag),
             "sampling_quotas": {item.stratum.value: item.minimum for item in _failure_credit_quotas(config)},
             "censored_quota": 0,
         },
@@ -779,35 +757,17 @@ def inspect_baseline(config: TrainingConfig) -> dict[str, Any]:
             "replay_capacity_bytes": config.episodic_learning.replay_capacity_bytes,
             "per_episode_capacity_bytes": (config.episodic_learning.per_episode_capacity_bytes),
             "sample_sequences": config.episodic_learning.sample_sequences,
-            "fresh_policy_sequences": (config.episodic_learning.fresh_policy_sequences),
             "burn_in_steps": config.episodic_learning.burn_in_steps,
             "learn_steps": config.episodic_learning.learn_steps,
             "macro_sample_fraction": (config.episodic_learning.macro_sample_fraction),
-            "primary_policy_weight": (config.episodic_learning.primary_policy_weight),
             "task_value_weight": config.episodic_learning.task_value_weight,
             "revival_value_weight": (config.episodic_learning.revival_value_weight),
-            "revival_policy_weight": (config.episodic_learning.revival_policy_weight),
-            "secondary_advantage_fraction": (config.episodic_learning.secondary_advantage_fraction),
-            "primary_success_tie_tolerance": (config.episodic_learning.primary_success_tie_tolerance),
-            "act_segment_imitation_enabled": (
-                config.episodic_learning.act_segment_imitation_enabled
-            ),
-            "act_segment_policy_weight": (
-                config.episodic_learning.act_segment_policy_weight
-            ),
-            "act_segment_min_exit_hp_ratio": (
-                config.episodic_learning.act_segment_min_exit_hp_ratio
-            ),
-            "act_segment_max_revival_fraction": (
-                config.episodic_learning.act_segment_max_revival_fraction
-            ),
             "combat_hp_loss_value_weight": (
                 config.episodic_learning.combat_hp_loss_value_weight
             ),
             "combat_hp_loss_reference": (
                 config.episodic_learning.combat_hp_loss_reference
             ),
-            "policy_gradient_max_lag": (config.episodic_learning.policy_gradient_max_lag),
         },
         "encoding_contract": grounding_encoding_identity(),
         "reward_contract": {
@@ -1677,7 +1637,6 @@ def run_training(
         outcome_pair_matcher = (
             OutcomePairMatcher(
                 maximum_pairs_per_publication=(config.failure_credit.maximum_matched_pairs_per_publication),
-                contrast_margin=config.failure_credit.liveness_contrast_margin,
             )
             if resources.failure_credit_replay is not None
             else None
@@ -1738,13 +1697,6 @@ def run_training(
                         "records_stored": stored,
                         "records_replaced": replaced,
                         "matched_pairs_derived": (publication.matched_pair_count),
-                        "actor_labels": sum(
-                            record.plan.actor_label_count
-                            for record in (
-                                *publication.records,
-                                *publication.replacements,
-                            )
-                        ),
                         "behavior_policy_versions": sorted(
                             {
                                 record.incident.provenance.policy_version
@@ -1886,16 +1838,8 @@ def run_training(
             failure_credit_sample = (
                 resources.failure_credit_replay.sample(
                     config.failure_credit.sample_records,
-                    quotas=_failure_credit_quotas(
-                        config,
-                        learner_updates=liveness_learner_update,
-                    ),
+                    quotas=_failure_credit_quotas(config),
                     current_policy_version=policy_version_before_update,
-                    policy_gradient_max_lag=(config.failure_credit.policy_gradient_max_lag),
-                    risk_actor_enabled=(
-                        liveness_learner_update
-                        >= config.failure_credit.liveness_risk_actor_start_update
-                    ),
                 )
                 if resources.failure_credit_replay is not None
                 else None
@@ -1919,41 +1863,26 @@ def run_training(
                 resources.failure_credit_replay.metrics() if resources.failure_credit_replay is not None else None
             )
             episodic_sampling_started_ns = time.perf_counter_ns()
-            episodic_sample = (
-                resources.episodic_replay.sample_for_learning(
+            episodic_sequences = (
+                resources.episodic_replay.sample(
                     config.episodic_learning.sample_sequences,
                     learn_steps=config.episodic_learning.learn_steps,
                     burn_in_steps=config.episodic_learning.burn_in_steps,
                     macro_sample_fraction=(config.episodic_learning.macro_sample_fraction),
-                    current_policy_version=policy_version_before_update,
-                    policy_gradient_max_lag=(config.episodic_learning.policy_gradient_max_lag),
-                    fresh_policy_sequences=(config.episodic_learning.fresh_policy_sequences),
-                    success_imitation_exempt_surfaces=(
-                        config.episodic_learning.success_imitation_exempt_surfaces
-                    ),
-                    act_segment_imitation_enabled=(
-                        config.episodic_learning.act_segment_imitation_enabled
-                    ),
-                    act_segment_min_exit_hp_ratio=(
-                        config.episodic_learning.act_segment_min_exit_hp_ratio
-                    ),
-                    act_segment_max_revival_fraction=(
-                        config.episodic_learning.act_segment_max_revival_fraction
-                    ),
                 )
                 if resources.episodic_replay is not None
-                else None
+                else ()
             )
             episodic_sampling_ms = (
                 (time.perf_counter_ns() - episodic_sampling_started_ns) / 1_000_000.0
                 if resources.episodic_replay is not None
                 else None
             )
-            episodic_sequences = episodic_sample.sequences if episodic_sample is not None else ()
-            episodic_sampling = None
-            if episodic_sample is not None:
-                episodic_sampling = episodic_sample.diagnostics.to_mapping()
-                episodic_sampling["sampling_ms"] = episodic_sampling_ms
+            episodic_sampling = (
+                {"sampling_ms": episodic_sampling_ms}
+                if resources.episodic_replay is not None
+                else None
+            )
             metrics.write(
                 "learner_update_start",
                 {
@@ -1965,10 +1894,6 @@ def run_training(
                     "liveness_head_calibration_active": int(
                         liveness_learner_update
                         < config.failure_credit.liveness_head_calibration_updates
-                    ),
-                    "liveness_risk_actor_enabled": int(
-                        liveness_learner_update
-                        >= config.failure_credit.liveness_risk_actor_start_update
                     ),
                     "liveness_schedule_learner_update": liveness_learner_update,
                     "unrolls": len(batch),
@@ -2272,9 +2197,6 @@ def run_training(
                             failure_credit_publication.matched_pair_count
                             if failure_credit_publication is not None
                             else 0
-                        ),
-                        "failure_credit_actor_labels": sum(
-                            record.plan.actor_label_count for record in episode.failure_credit_records
                         ),
                         "failure_credit_strata": {
                             stratum.value: sum(

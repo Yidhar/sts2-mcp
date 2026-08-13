@@ -25,8 +25,6 @@ from sts2_rl.training import (
     summarize_evaluation,
 )
 from sts2_rl.training.collector import (
-    CollectionProtocolError,
-    _act_exit_hp_ratio,
     _episodic_decision_surface,
     _extended_transaction_option_endpoint,
     _macro_decision_surface,
@@ -60,39 +58,6 @@ def test_macro_return_diagnostics_group_factual_returns_without_learning_labels(
         decisions=((0, "map", "choose_map_node", "high_75_100", 1),),
         authoritative=False,
     ) == ()
-
-
-def test_final_act_health_uses_last_player_receipt_when_victory_terminal_is_sparse() -> None:
-    before = _observation(act=3, floor=46, combat=False)
-    before["player"]["hp"] = 28
-    terminal = {
-        "phase": "terminal",
-        "run": {"active": False, "act": 3, "floor": 46},
-    }
-
-    assert _act_exit_hp_ratio(
-        before_observation=before,
-        after_observation=terminal,
-        authoritative_run_result="victory",
-    ) == pytest.approx(28.0 / 80.0)
-
-
-def test_missing_player_receipt_on_nonterminal_act_boundary_remains_fail_closed() -> None:
-    before = _observation(act=1, floor=17, combat=False)
-    malformed_after = {
-        "phase": "map",
-        "run": {"active": True, "act": 2, "floor": 18},
-    }
-
-    with pytest.raises(
-        CollectionProtocolError,
-        match="no positive player max HP",
-    ):
-        _act_exit_hp_ratio(
-            before_observation=before,
-            after_observation=malformed_after,
-            authoritative_run_result=None,
-        )
 
 
 def test_extended_transaction_endpoint_stops_before_same_resource_opportunity_or_act_boundary() -> None:

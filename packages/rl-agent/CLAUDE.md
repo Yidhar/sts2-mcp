@@ -99,10 +99,11 @@ sts2_rl.train
   training-partition-only sidecars are maintained. Transaction replay stores
   factual select/deselect/confirm/cancel transitions plus authoritative
   upgrade/removal entry-to-exit lifecycle evidence. Complete-episode replay
-  stores immutable CPU snapshots and authoritative combat/Act/run outcomes;
-  failure-credit replay stores versioned liveness evidence and matched factual
-  outcomes;
-  it never retains GPU tensors, hidden states, autograd graphs, held-out
+  stores immutable CPU snapshots and authoritative combat/Act/run outcomes as
+  value labels only; failure-credit replay stores versioned factual liveness
+  evidence and matched factual outcomes for its value/cost critics and owns
+  no policy replay obligation;
+  no sidecar retains GPU tensors, hidden states, autograd graphs, held-out
   diagnostics, or fabricated counterfactual actions.
 - With complete-episode replay enabled, runtime may retain exactly one fetched
   FIFO batch so the episode is committed before its tail batch learns. The
@@ -115,15 +116,12 @@ sts2_rl.train
   mode must always be restored. Source episode length therefore cannot grow
   accelerator activation memory. Replay is bounded by episode count, total
   bytes, per-episode bytes and per-episode sampling quota.
-- Run completion/progress is the primary long-horizon objective. Revival cost
-  may train value/policy only on a factually successful horizon. Before the
-  task value classifies success and enters the explicit primary-tie tolerance,
-  its already-weighted policy signal is capped below the absolute primary
-  residual. Only inside that narrow learned-success stratum may a small
-  nominal-primary floor preserve the revival tie-break at zero task advantage;
-  failed/censored horizons still receive no cost label and early failure must
-  never become the cheap option. Forced singleton actions receive value labels
-  but no replay policy gradient.
+- Run completion/progress is the primary long-horizon objective. Complete-
+  episode replay supervises only the candidate-independent task/revival-cost
+  value heads (plus the optional bounded combat HP-loss head); it owns no
+  selected-action imitation or replay policy gradient. Revival cost may train
+  value only on a factually successful horizon; failed/censored horizons
+  receive no cost label and early failure must never become the cheap option.
 - The recurrent model keeps one legal-candidate policy, the legacy online
   V-trace scalar value, and candidate-independent combat/Act/run task and
   revival-cost value heads. Optional transaction effect/delta/Q heads train the shared factual

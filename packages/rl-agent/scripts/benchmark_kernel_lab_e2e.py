@@ -160,10 +160,8 @@ def _prepare_failure(checkpoint: Path, fixture_dir: Path) -> dict[str, Any]:
     sample = corpus.sample(
         batch_size=config.failure_credit.sample_records,
         rng=rng,
-        quotas=_failure_credit_quotas(config, learner_updates=learner_updates),
+        quotas=_failure_credit_quotas(config),
         current_policy_version=policy_version,
-        policy_gradient_max_lag=config.failure_credit.policy_gradient_max_lag,
-        risk_actor_enabled=(learner_updates >= config.failure_credit.liveness_risk_actor_start_update),
     )
     plans = tuple(record.plan for record in sample.records)
     fixture = {
@@ -253,14 +251,11 @@ def _prepare_episode(checkpoint: Path, fixture_dir: Path) -> dict[str, Any]:
     )
     replay.load_state_dict(payload)
     policy_version = int(state["policy_version"])
-    sample = replay.sample_for_learning(
+    sequences = replay.sample(
         config.episodic_learning.sample_sequences,
         learn_steps=config.episodic_learning.learn_steps,
         burn_in_steps=config.episodic_learning.burn_in_steps,
         macro_sample_fraction=config.episodic_learning.macro_sample_fraction,
-        current_policy_version=policy_version,
-        policy_gradient_max_lag=config.episodic_learning.policy_gradient_max_lag,
-        fresh_policy_sequences=config.episodic_learning.fresh_policy_sequences,
     )
     unrolls = _build_primary_unrolls(
         replay.snapshot(),
@@ -275,16 +270,16 @@ def _prepare_episode(checkpoint: Path, fixture_dir: Path) -> dict[str, Any]:
         "policy_version": policy_version,
         "learner_updates": int(state["learner_updates"]),
         "unrolls": unrolls,
-        "episodic_sequences": sample.sequences,
-        "episodic_burn_in_steps": tuple(sequence.burn_in_steps for sequence in sample.sequences),
-        "episodic_learn_steps": tuple(len(sequence.learn_steps) for sequence in sample.sequences),
+        "episodic_sequences": sequences,
+        "episodic_burn_in_steps": tuple(sequence.burn_in_steps for sequence in sequences),
+        "episodic_learn_steps": tuple(len(sequence.learn_steps) for sequence in sequences),
     }
     output = fixture_dir / _EPISODE_FIXTURE
     _write_pickle(output, fixture)
     return {
         "output": str(output.resolve()),
         "unrolls": len(unrolls),
-        "episodic_sequences": len(sample.sequences),
+        "episodic_sequences": len(sequences),
         "episodic_burn_in_steps": fixture["episodic_burn_in_steps"],
         "episodic_learn_steps": fixture["episodic_learn_steps"],
         "bytes": output.stat().st_size,

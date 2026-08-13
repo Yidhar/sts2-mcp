@@ -15,7 +15,6 @@ from sts2_rl.training.failure_credit import (
     CreditCompilationError,
     CreditCompiler,
     CreditProvenance,
-    DirectPolicyTarget,
     EvidenceRecord,
     EvidenceStratum,
     FailureIncident,
@@ -283,6 +282,15 @@ def _completion_record(
     )
 
 
+def _matched_pair(incident: FailureIncident) -> MatchedOutcomePair:
+    """Read the atomic pair from the enriched incident's stored witnesses."""
+
+    witness = next(item for item in incident.witnesses if item.kind is WitnessKind.MATCHED_OUTCOME_PAIR)
+    pair = witness.outcome_pair
+    assert pair is not None
+    return pair
+
+
 def test_span_40_witness_survives_a_32_step_learning_tail() -> None:
     context = _context(context_id="span40", start_step=9, count=32)
     witness = PolicyWitness(
@@ -312,10 +320,11 @@ def test_span_40_witness_survives_a_32_step_learning_tail() -> None:
         )
     )
 
-    assert plan.direct_policy_targets == (plan.direct_policy_targets[0],)
-    assert plan.direct_policy_targets[0].step_index == 31
-    assert plan.direct_policy_targets[0].target is DirectPolicyTarget.AVOID
     assert EvidenceStratum.DIRECT_WITNESS in plan.strata
+    assert EvidenceStratum.RISK_SEQUENCE in plan.strata
+    assert EvidenceStratum.UNRESOLVED_STALL not in plan.strata
+    assert len(plan.liveness_q_targets) == 32
+    assert len(plan.task_q_targets) == 32
 
 
 def test_failure_credit_rejects_corrupt_semantic_identity_payload_binding() -> None:
@@ -372,41 +381,6 @@ def test_compiler_rejects_witness_edge_not_observed_for_attributed_step() -> Non
         )
 
 
-def test_forced_cycle_witness_never_produces_an_actor_label() -> None:
-    context = _context(
-        context_id="forced",
-        candidate_count=1,
-    )
-    witness = PolicyWitness(
-        witness_id="forced-witness",
-        kind=WitnessKind.DIRECT_WITNESS,
-        attributed_step_indices=(0,),
-        supporting_episode_steps=(0, 4),
-        occurrences=2,
-        cycle_span=4,
-        successor_confirmed=True,
-        loop_edges=(
-            _loop_edge(
-                context,
-                step_index=0,
-                supporting_episode_steps=(0, 4),
-            ),
-        ),
-    )
-    plan = CreditCompiler().compile(
-        _failed_incident(
-            context,
-            incident_id="forced-incident",
-            witnesses=(witness,),
-        )
-    )
-
-    assert plan.direct_policy_targets == ()
-    assert plan.cycle_policy_targets == ()
-    assert EvidenceStratum.DIRECT_WITNESS not in plan.strata
-    assert len(plan.liveness_q_targets) == 1
-
-
 def test_unique_stall_has_risk_and_q_credit_without_last_step_blame() -> None:
     context = _context(context_id="unique-stall", count=6)
     incident = _failed_incident(
@@ -421,15 +395,16 @@ def test_unique_stall_has_risk_and_q_credit_without_last_step_blame() -> None:
     assert len(plan.task_q_targets) == 6
     assert len(plan.liveness_value_targets) == 6
     assert len(plan.liveness_q_targets) == 6
-    assert len(plan.risk_sequences) == 1
-    assert plan.risk_sequences[0].step_indices == tuple(range(6))
-    assert plan.direct_policy_targets == ()
-    assert plan.cycle_policy_targets == ()
-    assert plan.contrast_policy_targets == ()
+    assert tuple(target.step_index for target in plan.liveness_q_targets) == tuple(range(6))
+    assert tuple(target.horizon for target in plan.liveness_q_targets) == tuple(range(6, 0, -1))
+    assert plan.liveness_q_targets[-1].target == 1.0
+    assert EvidenceStratum.RISK_SEQUENCE in plan.strata
     assert EvidenceStratum.UNRESOLVED_STALL in plan.strata
+    assert EvidenceStratum.DIRECT_WITNESS not in plan.strata
+    assert EvidenceStratum.MULTI_EDGE_CYCLE not in plan.strata
 
 
-def test_completed_and_multi_edge_cycle_compile_scope_specific_actor_credit() -> None:
+def test_completed_and_multi_edge_cycle_compile_scope_specific_strata() -> None:
     completed_context = _context(context_id="completed", count=2)
     completion = PolicyWitness(
         witness_id="completion-control",
@@ -447,11 +422,10 @@ def test_completed_and_multi_edge_cycle_compile_scope_specific_actor_credit() ->
             witnesses=(completion,),
         )
     )
-    assert completed_plan.direct_policy_targets[0].target is DirectPolicyTarget.PREFER
-    assert completed_plan.direct_policy_targets[0].step_index == 1
-    assert completed_plan.risk_sequences == ()
     assert EvidenceStratum.RISK_SEQUENCE not in completed_plan.strata
     assert EvidenceStratum.COMPLETION_CONTROL in completed_plan.strata
+    assert completed_plan.liveness_value_targets
+    assert all(target.target == 0.0 for target in completed_plan.liveness_value_targets)
 
     cycle_context = _context(
         context_id="cycle",
@@ -487,12 +461,13 @@ def test_completed_and_multi_edge_cycle_compile_scope_specific_actor_credit() ->
             witnesses=(cycle,),
         )
     )
-    assert cycle_plan.cycle_policy_targets[0].step_indices == (0, 2)
-    assert cycle_plan.direct_policy_targets == ()
     assert EvidenceStratum.MULTI_EDGE_CYCLE in cycle_plan.strata
+    assert EvidenceStratum.DIRECT_WITNESS not in cycle_plan.strata
+    assert EvidenceStratum.RISK_SEQUENCE in cycle_plan.strata
+    assert len(cycle_plan.liveness_q_targets) == 3
 
 
-def test_atomic_outcome_pair_compiles_contrast_and_indexes_as_one_record() -> None:
+def test_atomic_outcome_pair_is_stratified_and_indexed_as_one_record() -> None:
     better_context = _context(
         context_id="better",
         action_index=0,
@@ -534,7 +509,8 @@ def test_atomic_outcome_pair_compiles_contrast_and_indexes_as_one_record() -> No
     plan = CreditCompiler().compile(incident)
     corpus = ImmutableEvidenceCorpus(records=(EvidenceRecord(incident=incident, plan=plan),))
 
-    assert plan.contrast_policy_targets[0].pair is pair
+    assert EvidenceStratum.MATCHED_OUTCOME_PAIR in plan.strata
+    assert _matched_pair(incident) is pair
     assert corpus.incident_ids(EvidenceStratum.MATCHED_OUTCOME_PAIR) == ("worse-incident",)
     assert tuple(corpus.outcome_pairs) == ("pair-1",)
     assert corpus.outcome_pairs["pair-1"].better.step.selected_action.comparison.payload == {"identity": "action-0"}
@@ -568,7 +544,7 @@ def test_outcome_matcher_enriches_an_incoming_attributed_failure() -> None:
     }
     assert EvidenceStratum.DIRECT_WITNESS in enriched.plan.strata
     assert EvidenceStratum.MATCHED_OUTCOME_PAIR in enriched.plan.strata
-    pair = enriched.plan.contrast_policy_targets[0].pair
+    pair = _matched_pair(enriched.incident)
     assert pair.better.incident_id == completion.incident.incident_id
     assert pair.worse.incident_id == failure.incident.incident_id
     assert pair.better.step.selected_action.comparison != (pair.worse.step.selected_action.comparison)
@@ -643,7 +619,6 @@ def test_outcome_matcher_uses_unresolved_stall_only_with_exact_completion_contra
     )
 
     assert EvidenceStratum.UNRESOLVED_STALL in failure.plan.strata
-    assert failure.plan.direct_policy_targets == ()
     publication = OutcomePairMatcher(maximum_pairs_per_publication=1).match(
         (failure,),
         retained_records=(completion,),
@@ -652,12 +627,12 @@ def test_outcome_matcher_uses_unresolved_stall_only_with_exact_completion_contra
     assert publication.matched_pair_count == 1
     enriched = publication.records[0]
     # Once an exact completion contrast is attached the formerly unresolved
-    # local stall becomes resolved contrast evidence; the risk sequence remains
+    # local stall becomes resolved matched evidence; the risk sequence remains
     # as its encounter-level provenance.
     assert EvidenceStratum.RISK_SEQUENCE in enriched.plan.strata
     assert EvidenceStratum.UNRESOLVED_STALL not in enriched.plan.strata
     assert EvidenceStratum.MATCHED_OUTCOME_PAIR in enriched.plan.strata
-    pair = enriched.plan.contrast_policy_targets[0].pair
+    pair = _matched_pair(enriched.incident)
     assert pair.worse.incident_id == failure.incident.incident_id
     assert pair.better.incident_id == completion.incident.incident_id
     assert pair.worse.step.node.comparison == pair.better.step.node.comparison
@@ -807,7 +782,6 @@ def test_v4_corpus_roundtrip_preserves_provenance_and_quota_diagnostics() -> Non
     sample = restored.sample(
         batch_size=1,
         rng=np.random.default_rng(123),
-        risk_actor_enabled=False,
         quotas=(StratumQuota(EvidenceStratum.UNRESOLVED_STALL, 1),),
     )
     assert tuple(record.incident.incident_id for record in sample.records) == ("roundtrip-incident",)
@@ -817,12 +791,10 @@ def test_v4_corpus_roundtrip_preserves_provenance_and_quota_diagnostics() -> Non
             StratumQuota(EvidenceStratum.UNRESOLVED_STALL, 1),
             StratumQuota(EvidenceStratum.DIRECT_WITNESS, 1),
         ),
-        risk_actor_enabled=False,
         selected_incident_ids=("roundtrip-incident",),
     ).satisfied
     diagnostics = restored.quota_diagnostics(
         (StratumQuota(EvidenceStratum.UNRESOLVED_STALL, 1),),
-        risk_actor_enabled=False,
         selected_incident_ids=("roundtrip-incident",),
     )
     assert diagnostics.satisfied
@@ -857,7 +829,7 @@ def test_censored_incident_is_indexed_but_has_no_learning_target() -> None:
     plan = CreditCompiler().compile(incident)
     corpus = ImmutableEvidenceCorpus(records=(EvidenceRecord(incident=incident, plan=plan),))
 
-    assert plan.actor_label_count == 0
+    assert plan.target_count == 0
     assert plan.task_q_targets == ()
     assert plan.liveness_q_targets == ()
     assert plan.strata == (EvidenceStratum.CENSORED,)

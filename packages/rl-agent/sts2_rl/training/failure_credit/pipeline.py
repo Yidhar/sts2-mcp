@@ -12,10 +12,10 @@ The important causality rule is structural rather than heuristic:
   repeated macro-edge cycle is observed;
 * replay context is used only to reproduce model activations, never to
   rediscover a loop;
-* a unique no-progress stall produces sequence-risk/value targets but never a
-  fallback AVOID label for the last action;
-* forced suffixes belong to their initiating policy macro-edge, so direct
-  actor credit remains on the factual policy choice.
+* a unique no-progress stall produces sequence value/cost targets but never a
+  fallback blame label for the last action;
+* forced suffixes belong to their initiating policy macro-edge, so detector
+  attribution remains on the factual policy choice.
 """
 
 from __future__ import annotations
@@ -59,63 +59,6 @@ from .corpus import EvidenceRecord, evidence_record_storage_nbytes
 
 FAILURE_CREDIT_DETECTOR_VERSION: Final = "sts2-semantic-macro-cycle-detector-v4"
 FAILURE_CREDIT_COLLECTOR_VERSION: Final = "sts2-failure-credit-collector-v6"
-
-# Completion is not generic strategic approval. Only the reviewed transaction
-# surface whose local objective is to finish a multi-step selection receives
-# direct PREFER credit when the semantic kernel verifies their clean exit.
-# Event, map, shop and combat progress remain critic-only unless an atomic
-# matched-outcome witness supplies stronger evidence.
-_COMPLETION_PREFER_SURFACE_IDS: Final[frozenset[str]] = frozenset({"selection"})
-
-
-def _normalized_action_operation(step: LearningStep) -> str:
-    """Decode the reviewed operation from a semantic action identity.
-
-    The semantic key retains the canonical payload and is therefore the
-    authority here; no raw dispatch handle or candidate ordinal is consulted.
-    Selection completion credit is intentionally fail-closed when an older or
-    unknown adapter does not expose a reviewed operation.
-    """
-
-    payload = step.selected_action.loop.payload
-    if not isinstance(payload, Mapping):
-        return ""
-    action = payload.get("action")
-    if not isinstance(action, Mapping):
-        return ""
-    raw = action.get("operation")
-    return "_".join(str(raw or "").strip().lower().replace("-", " ").split())
-
-
-def _completion_actor_prefer_allowed(
-    macro: _ClosedMacro,
-    *,
-    receipt: ProgressReceipt,
-    learn_step: LearningStep,
-) -> bool:
-    """Return whether a local completion is factual positive actor evidence.
-
-    Closing a page is not the same as committing its transaction.  In
-    particular ``cancel_selection`` may return from a forge grid with no deck
-    mutation.  It remains a useful zero-cost critic control, but it must never
-    become a direct PREFER label.  Manual Confirm and an auto-committing Select
-    are the only reviewed selection operations that may receive positive local
-    policy credit, and they still require independently verified flow/durable
-    progress from the semantic kernel.
-    """
-
-    if (
-        not macro.direct_credit_allowed
-        or macro.source_spec_id not in _COMPLETION_PREFER_SURFACE_IDS
-        or not learn_step.actor_eligible
-        or receipt.kind
-        not in {
-            ProgressKind.FLOW_ADVANCE,
-            ProgressKind.DURABLE_COMMIT,
-        }
-    ):
-        return False
-    return _normalized_action_operation(learn_step) in {"confirm", "select"}
 
 
 def _positive_integer(value: object, *, label: str) -> int:
@@ -234,10 +177,8 @@ class FailureCreditShadowMetrics:
     completion_controls_dropped: int
     completion_storage_nbytes: int
     records: int
-    actor_actionable_records: int
     censored_semantic_transitions: int
     streamed_records: int = 0
-    streamed_actor_actionable_records: int = 0
     # Distinguish "no one-edge self-loop was observed" from downstream direct
     # witness rejection. These detector-side facts survive into episode metrics.
     detected_direct_cycles: int = 0
@@ -299,7 +240,6 @@ class _DetectedCycle:
 @dataclass(frozen=True, slots=True)
 class _PendingCompletion:
     context: LearningContext
-    witness: PolicyWitness | None
     scope_key: str
     failure_kind: str
     progress_epoch: int
@@ -362,7 +302,6 @@ class FailureCreditEpisodePipeline:
         self._completion_records: list[_StagedCompletion] = []
         self._ready_records: list[EvidenceRecord] = []
         self._streamed_records = 0
-        self._streamed_actor_actionable_records = 0
         self._emitted_cycle_keys: set[str] = set()
         self._emitted_cycle_supports: set[tuple[int, ...]] = set()
         self._completion_controls_observed = 0
@@ -701,7 +640,6 @@ class FailureCreditEpisodePipeline:
         records = tuple(self._ready_records)
         self._ready_records.clear()
         self._streamed_records += len(records)
-        self._streamed_actor_actionable_records += sum(int(record.plan.actor_label_count > 0) for record in records)
         return records
 
     def _captured_step(self, episode_step: int) -> _CapturedDecision:
@@ -811,44 +749,11 @@ class FailureCreditEpisodePipeline:
             # reproducible cannot provide a factual candidate-Q control.
             self._completion_controls_observed += 1
             return
-        # A completed transition is always a factual zero-liveness-cost
-        # control.  It becomes positive actor evidence only when both the
-        # progress receipt and the reviewed action operation prove a commit.
-        # Page teardown alone is not success: Cancel is critic-only even when a
-        # transport/view bug would otherwise make the exit look progressive.
-        learn_step_index = context.learn_step_indices[-1]
-        learn_step = context.steps[learn_step_index]
-        completion_witness: PolicyWitness | None = None
-        if _completion_actor_prefer_allowed(
-            macro,
-            receipt=receipt,
-            learn_step=learn_step,
-        ):
-            supporting_steps = tuple(
-                sorted(
-                    {
-                        learn_step.episode_step,
-                        macro.edge.closing_step_id,
-                    }
-                )
-            )
-            completion_witness = PolicyWitness(
-                witness_id=_stable_id(
-                    "completion-witness",
-                    context.context_id,
-                    macro.source_spec_id,
-                    receipt.kind.value,
-                ),
-                kind=WitnessKind.COMPLETION_CONTROL,
-                attributed_step_indices=(learn_step_index,),
-                supporting_episode_steps=supporting_steps,
-                occurrences=1,
-                cycle_span=None,
-                successor_confirmed=True,
-            )
+        # A completed transition is a factual zero-liveness-cost critic
+        # control.  Since v20 it never becomes a PREFER actor label; page
+        # teardown, Cancel and Confirm alike remain critic-only evidence.
         pending = _PendingCompletion(
             context=context,
-            witness=completion_witness,
             scope_key=self._scope_key(macro.edge.anchor),
             failure_kind=(
                 "verified_flow_completion" if receipt.kind is ProgressKind.FLOW_ADVANCE else "verified_durable_commit"
@@ -958,7 +863,7 @@ class FailureCreditEpisodePipeline:
             task_return=None,
             local_failure_cost=0.0,
             context=completion.context,
-            witnesses=() if completion.witness is None else (completion.witness,),
+            witnesses=(),
             detector_window_steps=self.config.detector_window_steps,
             progress_epoch=completion.progress_epoch,
             provenance=provenance,
@@ -1189,10 +1094,8 @@ class FailureCreditEpisodePipeline:
                 completion_controls_dropped=(self._completion_controls_observed - len(self._completion_records)),
                 completion_storage_nbytes=sum(item.storage_nbytes for item in self._completion_records),
                 records=len(result),
-                actor_actionable_records=sum(int(record.plan.actor_label_count > 0) for record in result),
                 censored_semantic_transitions=self._semantic_censored_transitions,
                 streamed_records=self._streamed_records,
-                streamed_actor_actionable_records=(self._streamed_actor_actionable_records),
                 detected_direct_cycles=self._detected_direct_cycles,
                 detected_multi_edge_cycles=self._detected_multi_edge_cycles,
             ),

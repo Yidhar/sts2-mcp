@@ -615,7 +615,7 @@ def test_replay_v5_runtime_retires_the_historical_v29_launcher_fail_closed() -> 
     actual = checkpointing._failure_credit_abi()
     assert actual["collector"] == "sts2-failure-credit-collector-v6"
     assert actual["detector"] == "sts2-semantic-macro-cycle-detector-v4"
-    assert actual["replay"] == "sts2-failure-evidence-replay-v5"
+    assert actual["replay"] == "sts2-failure-evidence-replay-v6"
     with pytest.raises(launcher.LaunchError, match="failure-credit-v4 ABI changed"):
         launcher._abi_contract()
 

@@ -1,4 +1,4 @@
-"""Strict cross-episode outcome matching for failure-credit replay v5.
+"""Strict cross-episode outcome matching for failure-credit replay v6.
 
 The detector can prove that an action participates in a semantic cycle, but it
 cannot invent the action that would have escaped it.  This module joins that
@@ -20,7 +20,7 @@ import hashlib
 from dataclasses import dataclass, replace
 from typing import Final
 
-from .compiler import CreditCompiler, CreditCompilerConfig
+from .compiler import CreditCompiler
 from .contracts import (
     CreditProvenance,
     EvidenceStratum,
@@ -117,8 +117,8 @@ def _attributed_failure_step_indices(record: EvidenceRecord) -> tuple[int, ...]:
     """Return failure-arm decisions eligible for an exact outcome contrast.
 
     Direct and cycle witnesses remain the strongest local attribution. A
-    detector-confirmed unresolved stall has no defensible single-step AVOID
-    target, but its immutable risk sequence may still be used as the *worse*
+    detector-confirmed unresolved stall has no defensible single-step blame
+    target, but its immutable learning tail may still be used as the *worse*
     arm when another episode demonstrates a different action from the exact
     same comparison node and candidate multiset completing the scope. The
     matcher therefore adds information rather than inventing escape credit.
@@ -134,18 +134,16 @@ def _attributed_failure_step_indices(record: EvidenceRecord) -> tuple[int, ...]:
         or EvidenceStratum.MATCHED_OUTCOME_PAIR in record.plan.strata
     ):
         return ()
-    candidates = {target.step_index for target in record.plan.direct_policy_targets}
-    candidates.update(
+    burn_in = incident.context.burn_in_steps
+    candidates = {
         step_index
-        for target in record.plan.cycle_policy_targets
-        for step_index in target.step_indices
-    )
+        for witness in incident.witnesses
+        if witness.kind in {WitnessKind.DIRECT_WITNESS, WitnessKind.MULTI_EDGE_CYCLE}
+        for step_index in witness.attributed_step_indices
+        if step_index >= burn_in
+    }
     if not candidates and EvidenceStratum.UNRESOLVED_STALL in record.plan.strata:
-        candidates.update(
-            step_index
-            for sequence in record.plan.risk_sequences
-            for step_index in sequence.step_indices
-        )
+        candidates.update(incident.context.learn_step_indices)
     return tuple(
         index
         for index in sorted(candidates)
@@ -195,14 +193,13 @@ class OutcomePairMatcher:
         self,
         *,
         maximum_pairs_per_publication: int,
-        contrast_margin: float = 0.10,
     ) -> None:
         if isinstance(maximum_pairs_per_publication, bool) or not isinstance(maximum_pairs_per_publication, int):
             raise TypeError("maximum_pairs_per_publication must be an integer")
         if maximum_pairs_per_publication < 0:
             raise ValueError("maximum_pairs_per_publication must be non-negative")
         self.maximum_pairs_per_publication = maximum_pairs_per_publication
-        self.compiler = CreditCompiler(CreditCompilerConfig(contrast_margin=contrast_margin))
+        self.compiler = CreditCompiler()
 
     def match(
         self,

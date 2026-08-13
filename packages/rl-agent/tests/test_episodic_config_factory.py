@@ -86,10 +86,9 @@ def test_factory_wires_bounded_episodic_replay_and_learner_config(monkeypatch: A
     try:
         assert isinstance(resources.episodic_replay, BoundedEpisodicReplay)
         assert resources.learner.episodic_config is config.episodic_learning  # type: ignore[attr-defined]
-        assert resources.learner.episodic_config.fresh_policy_sequences == 0  # type: ignore[attr-defined]
         assert resources.collector.episodic_learning_enabled
         assert resources.episodic_replay.metrics() == {
-            "version": "sts2-episodic-replay-v4",
+            "version": "sts2-episodic-replay-v5",
             "size": 0,
             "capacity": 3,
             "storage_nbytes": 0,

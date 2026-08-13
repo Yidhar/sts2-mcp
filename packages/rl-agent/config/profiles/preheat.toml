@@ -78,18 +78,8 @@ multi_edge_cycle_quota = 1
 risk_sequence_quota = 1
 unresolved_stall_quota = 1
 completion_control_quota = 1
-matched_outcome_pair_quota = 0
-policy_gradient_max_lag = 128
 liveness_value_critic_weight = 0.10
 liveness_cost_critic_weight = 0.25
-liveness_cost_actor_weight = 0.10
-liveness_direct_policy_weight = 0.25
-liveness_cycle_policy_weight = 0.10
-liveness_contrast_policy_weight = 0.10
-# Generic completion records are zero-cost critic controls, not PREFER labels.
-liveness_completion_policy_weight = 0.0
-liveness_risk_advantage_clip = 0.25
-liveness_contrast_margin = 0.10
 
 [episodic_learning]
 # Complete episodes provide long-horizon labels while GPU autograd remains
@@ -100,21 +90,14 @@ replay_capacity_bytes = 2147483648
 per_episode_capacity_bytes = 536870912
 max_segments_per_episode = 8
 sample_sequences = 2
-fresh_policy_sequences = 0
 burn_in_steps = 32
 learn_steps = 32
 # Reserve half of detached complete-episode replay suffixes for factual
 # non-combat policy decisions. The remaining suffixes retain outcome-stratified
 # whole-run coverage; FIFO V-trace collection remains unchanged.
 macro_sample_fraction = 0.5
-primary_policy_weight = 0.25
 task_value_weight = 0.25
 revival_value_weight = 0.02
-revival_policy_weight = 0.05
-secondary_advantage_fraction = 0.25
-primary_success_tie_tolerance = 0.05
-importance_ratio_clip = 1.0
-policy_gradient_max_lag = 128
 
 [environment]
 backend = "headless"

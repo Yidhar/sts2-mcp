@@ -27,14 +27,10 @@ from sts2_rl.training.config import (
 from sts2_rl.training.failure_credit import (
     CreditPlan,
     CreditProvenance,
-    CyclePolicyCredit,
-    DirectPolicyCredit,
-    DirectPolicyTarget,
     EvidenceStratum,
     IdentityTriple,
     LearningContext,
     LearningStep,
-    RiskSequenceCredit,
     ScalarCredit,
     SemanticKey,
 )
@@ -62,12 +58,7 @@ def _work_manifest(
     return LivenessLabelManifest(
         learner_update=0,
         calibration_active=False,
-        risk_actor_enabled=True,
         rows=(),
-        cycle_groups=(),
-        contrast_groups=(),
-        policy_lag_suppressed_labels=0,
-        risk_actor_phase_suppressed_labels=0,
         work=LivenessReplayWork(
             contexts=1,
             steps=steps,
@@ -180,10 +171,7 @@ def _one_step_credit_plan(
     *,
     suffix: str,
     candidate_count: int = 3,
-    forced: bool = False,
     policy_version: int = 3,
-    include_direct: bool = True,
-    include_risk: bool = True,
 ) -> CreditPlan:
     step = LearningStep(
         decision_id=f"decision-{suffix}",
@@ -195,7 +183,7 @@ def _one_step_credit_plan(
         node=_identity(f"node-{suffix}"),
         anchor=_semantic_key("anchor", f"anchor-{suffix}"),
         candidate_actions=tuple(_identity(f"action-{suffix}-{index}") for index in range(candidate_count)),
-        forced=forced,
+        forced=False,
     )
     context = LearningContext(
         context_id=f"context-{suffix}",
@@ -226,32 +214,7 @@ def _one_step_credit_plan(
         task_q_targets=(),
         liveness_value_targets=(scalar,),
         liveness_q_targets=(scalar,),
-        direct_policy_targets=(
-            (
-                DirectPolicyCredit(
-                    step_index=0,
-                    target=DirectPolicyTarget.AVOID,
-                    witness_id=f"direct-{suffix}",
-                ),
-            )
-            if include_direct
-            else ()
-        ),
-        cycle_policy_targets=(),
-        contrast_policy_targets=(),
-        risk_sequences=(
-            (
-                RiskSequenceCredit(
-                    step_indices=(0,),
-                    terminal_cost=1.0,
-                    discount=0.99,
-                    witness_id=f"risk-{suffix}",
-                ),
-            )
-            if include_risk
-            else ()
-        ),
-        strata=(EvidenceStratum.DIRECT_WITNESS if include_direct else EvidenceStratum.RISK_SEQUENCE,),
+        strata=(EvidenceStratum.RISK_SEQUENCE,),
         provenance=provenance,
     )
 
@@ -290,9 +253,9 @@ def test_candidate_liveness_cost_head_is_bounded_masked_and_active_shape() -> No
 def test_heterogeneous_failure_records_share_replay_without_changing_equal_record_gradients() -> None:
     """Packed execution preserves equal-record reduction across label shapes.
 
-    Candidate counts and actor-label topology deliberately differ. A global
-    label mean would make the direct/risk-bearing records overweighted; the
-    packed implementation must first reduce each record and only then average.
+    Candidate counts deliberately differ across records. A global label mean
+    would weight records by their tensor shapes; the packed implementation
+    must first reduce each record and only then average.
     """
 
     torch.manual_seed(7)
@@ -311,15 +274,7 @@ def test_heterogeneous_failure_records_share_replay_without_changing_equal_recor
         risk_sequence_quota=0,
         unresolved_stall_quota=0,
         completion_control_quota=0,
-        matched_outcome_pair_quota=0,
         liveness_head_calibration_updates=0,
-        liveness_risk_actor_start_update=0,
-    )
-    plan_specs = (
-        (3, True, True),
-        (7, False, True),
-        (5, True, False),
-        (111, False, False),
     )
     plans = tuple(
         _one_step_credit_plan(
@@ -327,10 +282,8 @@ def test_heterogeneous_failure_records_share_replay_without_changing_equal_recor
             model_config,
             suffix=f"packed-{index}",
             candidate_count=candidate_count,
-            include_direct=include_direct,
-            include_risk=include_risk,
         )
-        for index, (candidate_count, include_direct, include_risk) in enumerate(plan_specs)
+        for index, candidate_count in enumerate((3, 7, 5, 111))
     )
 
     sequential_model = RecurrentCandidateModel(
@@ -361,11 +314,6 @@ def test_heterogeneous_failure_records_share_replay_without_changing_equal_recor
         return (
             failure_config.liveness_value_critic_weight * losses.value_critic_loss
             + failure_config.liveness_cost_critic_weight * losses.critic_loss
-            + failure_config.liveness_cost_actor_weight * losses.risk_actor_loss
-            + failure_config.liveness_direct_policy_weight * losses.direct_avoid_loss
-            + failure_config.liveness_cycle_policy_weight * losses.cycle_likelihood_loss
-            + failure_config.liveness_contrast_policy_weight * losses.contrast_loss
-            + failure_config.liveness_completion_policy_weight * losses.completion_loss
         )
 
     sequential_forward_calls = 0
@@ -485,13 +433,6 @@ def test_long_and_short_failure_records_share_recurrent_replay_across_tbptt_wind
             context=context,
             liveness_value_targets=(scalar,),
             liveness_q_targets=(scalar,),
-            direct_policy_targets=(replace(base.direct_policy_targets[0], step_index=final_index),),
-            risk_sequences=(
-                replace(
-                    base.risk_sequences[0],
-                    step_indices=tuple(range(burn_in, steps)),
-                ),
-            ),
         )
 
     plans = (
@@ -506,9 +447,7 @@ def test_long_and_short_failure_records_share_recurrent_replay_across_tbptt_wind
         risk_sequence_quota=0,
         unresolved_stall_quota=0,
         completion_control_quota=0,
-        matched_outcome_pair_quota=0,
         liveness_head_calibration_updates=0,
-        liveness_risk_actor_start_update=0,
         liveness_records_per_autograd_batch=2,
         liveness_tbptt_window_steps=2,
     )
@@ -531,8 +470,6 @@ def test_long_and_short_failure_records_share_recurrent_replay_across_tbptt_wind
         return (
             config.liveness_value_critic_weight * losses.value_critic_loss
             + config.liveness_cost_critic_weight * losses.critic_loss
-            + config.liveness_cost_actor_weight * losses.risk_actor_loss
-            + config.liveness_direct_policy_weight * losses.direct_avoid_loss
         )
 
     sequential_learner = learner(sequential_model)
@@ -626,158 +563,6 @@ def test_candidate_liveness_cost_head_is_candidate_equivariant() -> None:
     )
 
 
-def test_centered_liveness_actor_survives_saturated_task_value() -> None:
-    policy_logits = torch.nn.Parameter(
-        torch.tensor(
-            [
-                [0.0, 0.0],
-                [0.0, 0.0],
-                [0.0, 0.0],
-            ]
-        )
-    )
-    cost_logits = torch.nn.Parameter(
-        torch.tensor(
-            [
-                [2.0, -2.0],
-                [2.0, -2.0],
-                [2.0, -2.0],
-            ]
-        )
-    )
-    saturated_task_value = torch.nn.Parameter(torch.full((3,), -1.0))
-    log_probabilities = torch.log_softmax(policy_logits, dim=1)
-    costs = torch.sigmoid(cost_logits)
-    losses = liveness_credit_losses(
-        policy_log_probabilities=log_probabilities,
-        candidate_liveness_cost_values=costs,
-        action_mask=torch.ones((3, 2), dtype=torch.bool),
-        selected_action_indices=torch.zeros(3, dtype=torch.long),
-        risk_targets=torch.ones(3),
-        risk_critic_mask=torch.tensor([True, True, True]),
-        risk_actor_mask=torch.tensor([True, True, True]),
-        forced_mask=torch.tensor([False, True, False]),
-        censored_mask=torch.tensor([False, False, True]),
-        direct_avoid_mask=torch.tensor([True, True, True]),
-        risk_advantage_clip=0.25,
-    )
-    actor_objective = losses.risk_actor_loss + losses.direct_avoid_loss
-    policy_gradient, task_value_gradient = torch.autograd.grad(
-        actor_objective,
-        (policy_logits, saturated_task_value),
-        allow_unused=True,
-    )
-
-    assert policy_gradient is not None
-    assert torch.count_nonzero(policy_gradient)
-    assert task_value_gradient is None
-    assert losses.risk_actor_labels == 1
-    assert losses.direct_avoid_labels == 1
-    assert losses.forced_actor_suppressed_labels == 2
-    assert losses.censored_suppressed_labels == 3
-    assert 0.0 < losses.centered_risk_max_abs <= 0.25
-
-
-def test_cost_actor_policy_baseline_is_detached_from_policy_gradient() -> None:
-    policy_logits = torch.nn.Parameter(torch.tensor([[0.4, -0.2, 0.1]]))
-    costs = torch.tensor([[0.9, 0.1, 0.4]])
-    selected = torch.tensor([0], dtype=torch.long)
-    log_probabilities = torch.log_softmax(policy_logits, dim=1)
-    losses = liveness_credit_losses(
-        policy_log_probabilities=log_probabilities,
-        candidate_liveness_cost_values=costs,
-        action_mask=torch.ones((1, 3), dtype=torch.bool),
-        selected_action_indices=selected,
-        risk_actor_mask=torch.ones(1, dtype=torch.bool),
-        risk_advantage_clip=1.0,
-    )
-    actual = torch.autograd.grad(
-        losses.risk_actor_loss,
-        policy_logits,
-        retain_graph=True,
-    )[0]
-
-    detached_probabilities = torch.softmax(policy_logits, dim=1).detach()
-    detached_centered_risk = (costs[0, 0] - (detached_probabilities[0] * costs[0]).sum()).detach()
-    selected_only_objective = torch.log_softmax(policy_logits, dim=1)[0, 0] * detached_centered_risk
-    expected = torch.autograd.grad(selected_only_objective, policy_logits)[0]
-
-    torch.testing.assert_close(actual, expected)
-    assert torch.count_nonzero(actual) == 3
-
-
-def test_cost_actor_suppresses_only_already_satisfied_low_probability_risk() -> None:
-    policy_logits = torch.nn.Parameter(
-        torch.tensor(
-            [
-                [-12.0, 0.0],  # risky selected action already below the floor
-                [-12.0, 0.0],  # low-probability selected action is predicted safer
-                [-2.0, 0.0],   # risky selected action still has behavioural mass
-            ]
-        )
-    )
-    costs = torch.tensor(
-        [
-            [0.9, 0.1],
-            [0.1, 0.9],
-            [0.9, 0.1],
-        ]
-    )
-    losses = liveness_credit_losses(
-        policy_log_probabilities=torch.log_softmax(policy_logits, dim=1),
-        candidate_liveness_cost_values=costs,
-        action_mask=torch.ones((3, 2), dtype=torch.bool),
-        selected_action_indices=torch.zeros(3, dtype=torch.long),
-        risk_actor_mask=torch.ones(3, dtype=torch.bool),
-        risk_advantage_clip=0.25,
-        risk_actor_min_selected_probability=0.01,
-    )
-    gradient = torch.autograd.grad(losses.risk_actor_loss, policy_logits)[0]
-
-    assert losses.risk_actor_saturation_suppressed_labels == 1
-    assert losses.risk_actor_labels == 2
-    torch.testing.assert_close(gradient[0], torch.zeros(2))
-    # Gradient descent raises the rare but safer factual action.
-    assert gradient[1, 0] < 0.0 < gradient[1, 1]
-    # It still lowers a risky action whose probability remains material.
-    assert gradient[2, 0] > 0.0 > gradient[2, 1]
-
-
-def test_direct_avoid_softening_is_finite_and_bounded_near_one_hot_policy() -> None:
-    saturated_logits = torch.nn.Parameter(torch.tensor([[8.0, -8.0]]))
-    saturated = liveness_credit_losses(
-        policy_log_probabilities=torch.log_softmax(saturated_logits, dim=1),
-        candidate_liveness_cost_values=torch.full((1, 2), 0.5),
-        action_mask=torch.ones((1, 2), dtype=torch.bool),
-        selected_action_indices=torch.zeros(1, dtype=torch.long),
-        direct_avoid_mask=torch.ones(1, dtype=torch.bool),
-    )
-    saturated_gradient = torch.autograd.grad(
-        saturated.direct_avoid_loss,
-        saturated_logits,
-    )[0]
-    assert torch.isfinite(saturated.direct_avoid_loss)
-    assert torch.isfinite(saturated_gradient).all()
-    assert float(saturated_gradient.norm()) < 1.0e-4
-
-    moderate_logits = torch.nn.Parameter(torch.tensor([[2.0, -2.0]]))
-    moderate = liveness_credit_losses(
-        policy_log_probabilities=torch.log_softmax(moderate_logits, dim=1),
-        candidate_liveness_cost_values=torch.full((1, 2), 0.5),
-        action_mask=torch.ones((1, 2), dtype=torch.bool),
-        selected_action_indices=torch.zeros(1, dtype=torch.long),
-        direct_avoid_mask=torch.ones(1, dtype=torch.bool),
-    )
-    moderate_gradient = torch.autograd.grad(
-        moderate.direct_avoid_loss,
-        moderate_logits,
-    )[0]
-    # Gradient descent must still lower the failed selected action and raise
-    # its factual alternative after the saturation guard is applied.
-    assert moderate_gradient[0, 0] > 0.0
-    assert moderate_gradient[0, 1] < 0.0
-
-
 def test_liveness_gradient_delta_clip_preserves_the_primary_gradient() -> None:
     parameter = torch.nn.Parameter(torch.tensor([0.0, 0.0]))
     (parameter * torch.tensor([3.0, 4.0])).sum().backward()
@@ -805,17 +590,7 @@ def test_liveness_gradient_delta_clip_preserves_the_primary_gradient() -> None:
     )
 
 
-def test_liveness_critic_and_all_factual_policy_objectives_have_gradients() -> None:
-    policy_logits = torch.nn.Parameter(
-        torch.tensor(
-            [
-                [0.3, -0.3],
-                [0.1, -0.1],
-                [-0.2, 0.2],
-                [0.0, 0.0],
-            ]
-        )
-    )
+def test_liveness_critic_objectives_have_gradients_and_censoring_suppresses_labels() -> None:
     cost_logits = torch.nn.Parameter(
         torch.tensor(
             [
@@ -828,7 +603,6 @@ def test_liveness_critic_and_all_factual_policy_objectives_have_gradients() -> N
     )
     state_cost_logits = torch.nn.Parameter(torch.tensor([-1.0, 1.0, 0.5, -0.5]))
     losses = liveness_credit_losses(
-        policy_log_probabilities=torch.log_softmax(policy_logits, dim=1),
         candidate_liveness_cost_values=torch.sigmoid(cost_logits),
         liveness_cost_values=torch.sigmoid(state_cost_logits),
         action_mask=torch.ones((4, 2), dtype=torch.bool),
@@ -837,38 +611,22 @@ def test_liveness_critic_and_all_factual_policy_objectives_have_gradients() -> N
         value_critic_mask=torch.ones(4, dtype=torch.bool),
         risk_targets=torch.tensor([1.0, 1.0, 0.0, 0.0]),
         risk_critic_mask=torch.ones(4, dtype=torch.bool),
-        risk_actor_mask=torch.ones(4, dtype=torch.bool),
-        direct_avoid_mask=torch.tensor([True, False, False, False]),
-        completion_mask=torch.tensor([False, False, False, True]),
-        cycle_groups=((0, 1),),
-        contrast_pairs=((3, 1),),
-        contrast_margin=0.1,
+        censored_mask=torch.tensor([False, False, False, True]),
     )
 
     critic_gradient = torch.autograd.grad(
         losses.value_critic_loss + losses.critic_loss,
         (state_cost_logits, cost_logits),
-        retain_graph=True,
     )
-    policy_loss = (
-        losses.risk_actor_loss
-        + losses.direct_avoid_loss
-        + losses.cycle_likelihood_loss
-        + losses.contrast_loss
-        + losses.completion_loss
-    )
-    policy_gradient = torch.autograd.grad(policy_loss, policy_logits)[0]
 
     assert torch.count_nonzero(critic_gradient[0])
     assert torch.count_nonzero(critic_gradient[1])
-    assert torch.count_nonzero(policy_gradient)
-    assert losses.value_labels == 4
-    assert losses.critic_labels == 4
-    assert losses.risk_actor_labels == 4
-    assert losses.direct_avoid_labels == 1
-    assert losses.cycle_labels == 1
-    assert losses.contrast_labels == 1
-    assert losses.completion_labels == 1
+    # The censored row contributes no gradient to either critic.
+    torch.testing.assert_close(critic_gradient[0][3], torch.tensor(0.0))
+    torch.testing.assert_close(critic_gradient[1][3], torch.zeros(2))
+    assert losses.value_labels == 3
+    assert losses.critic_labels == 3
+    assert losses.censored_suppressed_labels == 2
 
 
 def test_liveness_credit_configuration_is_bounded() -> None:
@@ -877,22 +635,14 @@ def test_liveness_credit_configuration_is_bounded() -> None:
     assert config.learning_enabled
     assert config.liveness_value_critic_weight > 0.0
     assert config.liveness_cost_critic_weight > 0.0
-    assert config.liveness_cost_actor_weight > 0.0
-    assert 0.0 < config.liveness_risk_advantage_clip <= 1.0
+    assert config.liveness_gradient_clip_norm > 0.0
 
-    with pytest.raises(ValueError, match="liveness_risk_advantage_clip"):
-        FailureCreditConfig(liveness_risk_advantage_clip=1.01)
     with pytest.raises(ValueError, match="quotas"):
         FailureCreditConfig(sample_records=3)
     with pytest.raises(ValueError, match="smaller"):
         FailureCreditConfig(
             burn_in_steps=32,
             maximum_context_steps=32,
-        )
-    with pytest.raises(ValueError, match="cannot precede"):
-        FailureCreditConfig(
-            liveness_head_calibration_updates=10,
-            liveness_risk_actor_start_update=9,
         )
     packed = FailureCreditConfig(liveness_records_per_autograd_batch=2)
     assert packed.liveness_records_per_autograd_batch == 2
@@ -907,7 +657,7 @@ def test_liveness_credit_configuration_is_bounded() -> None:
     assert not shadow.learning_enabled
 
 
-def test_liveness_label_manifest_uses_learner_update_phase_and_exact_masks() -> None:
+def test_liveness_label_manifest_reports_calibration_phase_and_exact_work() -> None:
     model_config = _model_config()
     encoding_config = GroundedEncodingConfig.from_model_config(
         model_config,
@@ -918,7 +668,6 @@ def test_liveness_label_manifest_uses_learner_update_phase_and_exact_masks() -> 
     config = FailureCreditConfig(
         mode="learning",
         liveness_head_calibration_updates=2,
-        liveness_risk_actor_start_update=4,
     )
     plan = _one_step_credit_plan(
         encoding_config,
@@ -932,57 +681,31 @@ def test_liveness_label_manifest_uses_learner_update_phase_and_exact_masks() -> 
         current_policy_version=3,
         current_learner_update=0,
     )
+    assert calibration.learner_update == 0
     assert calibration.calibration_active
-    assert not calibration.risk_actor_enabled
-    assert calibration.risk_actor_phase_suppressed_labels == 1
-    assert calibration.policy_lag_suppressed_labels == 0
     assert calibration.work.contexts == 1
     assert calibration.work.steps == 1
     assert calibration.work.candidates == 3
     assert calibration.work.autograd_segments == 1
-    assert calibration.rows[0].direct_actor_mask
-    assert calibration.rows[0].effective_direct_actor
-    assert calibration.rows[0].risk_actor_requested
-    assert not calibration.rows[0].risk_actor_mask
+    assert len(calibration.rows) == 1
+    row = calibration.rows[0]
+    assert row.context_id == "context-phase"
+    assert row.step_index == 0
+    assert row.decision_id == "decision-phase"
+    assert not row.censored
+    assert row.legal_candidates == 2
+    assert row.value_critic_requested
+    assert row.q_critic_requested
 
     calibrated = compile_liveness_label_manifest(
         (plan,),
         config=config,
         current_policy_version=3,
-        current_learner_update=4,
+        current_learner_update=2,
     )
+    assert calibrated.learner_update == 2
     assert not calibrated.calibration_active
-    assert calibrated.risk_actor_enabled
-    assert calibrated.risk_actor_phase_suppressed_labels == 0
-    assert calibrated.rows[0].effective_risk_actor
-
-    stale = compile_liveness_label_manifest(
-        (plan,),
-        config=config,
-        current_policy_version=3 + config.policy_gradient_max_lag + 1,
-        current_learner_update=4,
-    )
-    assert stale.policy_lag_suppressed_labels == 2
-    assert not stale.rows[0].risk_actor_mask
-    assert not stale.rows[0].direct_actor_mask
-
-    forced = _one_step_credit_plan(
-        encoding_config,
-        model_config,
-        suffix="forced",
-        candidate_count=1,
-        forced=True,
-    )
-    forced_manifest = compile_liveness_label_manifest(
-        (forced,),
-        config=config,
-        current_policy_version=3,
-        current_learner_update=4,
-    )
-    assert not forced_manifest.rows[0].risk_actor_mask
-    assert not forced_manifest.rows[0].direct_actor_mask
-    assert not forced_manifest.rows[0].effective_risk_actor
-    assert not forced_manifest.rows[0].effective_direct_actor
+    assert calibrated.rows == calibration.rows
 
 
 def test_calibration_trains_fresh_heads_without_shared_trunk_gradient() -> None:
@@ -996,7 +719,6 @@ def test_calibration_trains_fresh_heads_without_shared_trunk_gradient() -> None:
     config = FailureCreditConfig(
         mode="learning",
         liveness_head_calibration_updates=2,
-        liveness_risk_actor_start_update=4,
     )
     model = RecurrentCandidateModel(
         model_config,
@@ -1015,8 +737,6 @@ def test_calibration_trains_fresh_heads_without_shared_trunk_gradient() -> None:
         encoding_config,
         model_config,
         suffix="critic-only",
-        include_direct=False,
-        include_risk=False,
     )
 
     model.zero_grad(set_to_none=True)
@@ -1142,161 +862,6 @@ def test_future_context_step_fails_closed_before_any_model_forward() -> None:
     assert forward_calls == 0
 
 
-def test_forced_only_cycle_is_excluded_by_manifest_and_tensor_loss() -> None:
-    model_config = _model_config()
-    encoding_config = GroundedEncodingConfig.from_model_config(
-        model_config,
-        max_world_tokens=32,
-        max_candidates=256,
-        max_candidate_local_tokens=4,
-    )
-    config = FailureCreditConfig(
-        mode="learning",
-        liveness_head_calibration_updates=0,
-        liveness_risk_actor_start_update=0,
-    )
-    base = _one_step_credit_plan(
-        encoding_config,
-        model_config,
-        suffix="forced-cycle",
-        candidate_count=1,
-        forced=True,
-        include_direct=False,
-        include_risk=False,
-    )
-    plan = replace(
-        base,
-        cycle_policy_targets=(
-            CyclePolicyCredit(
-                step_indices=(0,),
-                behavior_mean_log_probability=-0.5,
-                margin=0.1,
-                witness_id="forced-cycle",
-            ),
-        ),
-        strata=(EvidenceStratum.MULTI_EDGE_CYCLE,),
-    )
-    manifest = compile_liveness_label_manifest(
-        (plan,),
-        config=config,
-        current_policy_version=3,
-        current_learner_update=0,
-    )
-    assert len(manifest.cycle_groups) == 1
-    assert manifest.cycle_groups[0].fresh
-    assert not manifest.cycle_groups[0].effective
-
-    model = RecurrentCandidateModel(
-        model_config,
-        enable_liveness_head=True,
-    )
-    learner = VTraceLearner(
-        model=model,
-        encoder=GroundedObservationEncoder(encoding_config),
-        optimizer=torch.optim.Adam(model.parameters(), lr=1e-3),
-        config=OptimizationConfig(),
-        maximum_unroll_length=16,
-        maximum_policy_lag=64,
-        failure_credit_config=config,
-    )
-    losses = learner.credit_plan_liveness_losses(
-        (plan,),
-        current_policy_version=3,
-        current_learner_update=0,
-    )
-    assert losses.cycle_labels == 0
-    assert losses.cycle_likelihood_loss.detach().item() == 0.0
-
-
-def test_manifest_matches_rowwise_direct_risk_and_atomic_cycle_freshness() -> None:
-    model_config = _model_config()
-    encoding_config = GroundedEncodingConfig.from_model_config(
-        model_config,
-        max_world_tokens=32,
-        max_candidates=256,
-        max_candidate_local_tokens=4,
-    )
-    base = _one_step_credit_plan(
-        encoding_config,
-        model_config,
-        suffix="mixed-age",
-        policy_version=0,
-    )
-    first = base.context.steps[0]
-    second = replace(
-        first,
-        decision_id="decision-mixed-age-fresh",
-        episode_step=first.episode_step + 1,
-        policy_version=3,
-        node=_identity("node-mixed-age-fresh"),
-        anchor=_semantic_key("anchor", "anchor-mixed-age-fresh"),
-        candidate_actions=tuple(
-            _identity(f"action-mixed-age-fresh-{index}") for index in range(first.snapshot.candidate_count)
-        ),
-    )
-    context = replace(base.context, steps=(first, second))
-    plan = replace(
-        base,
-        context=context,
-        direct_policy_targets=(
-            DirectPolicyCredit(
-                step_index=0,
-                target=DirectPolicyTarget.AVOID,
-                witness_id="direct-mixed-age-stale",
-            ),
-            DirectPolicyCredit(
-                step_index=1,
-                target=DirectPolicyTarget.AVOID,
-                witness_id="direct-mixed-age-fresh",
-            ),
-        ),
-        cycle_policy_targets=(
-            CyclePolicyCredit(
-                step_indices=(0, 1),
-                behavior_mean_log_probability=-0.5,
-                margin=0.1,
-                witness_id="cycle-mixed-age",
-            ),
-        ),
-        risk_sequences=(
-            RiskSequenceCredit(
-                step_indices=(0, 1),
-                terminal_cost=1.0,
-                discount=0.99,
-                witness_id="risk-mixed-age",
-            ),
-        ),
-        strata=(
-            EvidenceStratum.DIRECT_WITNESS,
-            EvidenceStratum.MULTI_EDGE_CYCLE,
-            EvidenceStratum.RISK_SEQUENCE,
-        ),
-    )
-    manifest = compile_liveness_label_manifest(
-        (plan,),
-        config=FailureCreditConfig(
-            mode="learning",
-            policy_gradient_max_lag=1,
-            liveness_head_calibration_updates=0,
-            liveness_risk_actor_start_update=0,
-        ),
-        current_policy_version=3,
-        current_learner_update=0,
-    )
-    rows = {row.decision_id: row for row in manifest.rows}
-    stale = rows[first.decision_id]
-    fresh = rows[second.decision_id]
-    assert not stale.fresh
-    assert not stale.direct_actor_mask
-    assert not stale.risk_actor_mask
-    assert fresh.fresh
-    assert fresh.direct_actor_mask
-    assert fresh.risk_actor_mask
-    assert len(manifest.cycle_groups) == 1
-    assert not manifest.cycle_groups[0].fresh
-    assert not manifest.cycle_groups[0].effective
-
-
 def test_liveness_recurrent_replay_detaches_each_tbptt_window() -> None:
     model_config = _model_config()
     encoding_config = GroundedEncodingConfig.from_model_config(
@@ -1308,15 +873,12 @@ def test_liveness_recurrent_replay_detaches_each_tbptt_window() -> None:
     config = FailureCreditConfig(
         mode="learning",
         liveness_head_calibration_updates=0,
-        liveness_risk_actor_start_update=0,
         liveness_tbptt_window_steps=2,
     )
     base = _one_step_credit_plan(
         encoding_config,
         model_config,
         suffix="tbptt",
-        include_direct=False,
-        include_risk=False,
     )
     base_step = base.context.steps[0]
     steps = tuple(
@@ -1443,9 +1005,7 @@ def test_update_backpropagates_failure_credit_in_configured_record_packs(
         risk_sequence_quota=0,
         unresolved_stall_quota=0,
         completion_control_quota=0,
-        matched_outcome_pair_quota=0,
         liveness_head_calibration_updates=0,
-        liveness_risk_actor_start_update=0,
         liveness_records_per_autograd_batch=2,
     )
     model = RecurrentCandidateModel(
@@ -1541,7 +1101,6 @@ def test_update_backpropagates_failure_credit_in_configured_record_packs(
     assert all(payload["liveness_record_candidates"] == 3 for payload in record_starts)
     assert metrics.liveness_autograd_microbatches == 1
     assert metrics.liveness_head_calibration_active == 0
-    assert metrics.liveness_risk_actor_enabled == 1
     assert metrics.liveness_credit_plans == 2
     assert metrics.liveness_replayed_contexts == 2
 
@@ -1563,17 +1122,8 @@ def test_non_divisible_record_packs_match_record_at_a_time_optimizer_update() ->
             model_config,
             suffix=f"remainder-{index}",
             candidate_count=candidate_count,
-            include_direct=include_direct,
-            include_risk=include_risk,
         )
-        for index, (candidate_count, include_direct, include_risk) in enumerate(
-            (
-                (3, True, True),
-                (7, False, True),
-                (5, True, False),
-                (11, False, False),
-            )
-        )
+        for index, candidate_count in enumerate((3, 7, 5, 11))
     )
     snapshot = plans[0].context.steps[0].snapshot
     unroll = SequenceUnroll(
@@ -1603,9 +1153,7 @@ def test_non_divisible_record_packs_match_record_at_a_time_optimizer_update() ->
             risk_sequence_quota=0,
             unresolved_stall_quota=0,
             completion_control_quota=0,
-            matched_outcome_pair_quota=0,
             liveness_head_calibration_updates=0,
-            liveness_risk_actor_start_update=0,
             liveness_records_per_autograd_batch=pack_size,
         )
 
@@ -1648,10 +1196,9 @@ def test_non_divisible_record_packs_match_record_at_a_time_optimizer_update() ->
     assert packed_metrics.liveness_autograd_microbatches == 2
     for field in (
         "liveness_credit_loss",
+        "liveness_cost_critic_loss",
         "liveness_value_critic_loss",
         "liveness_q_critic_loss",
-        "liveness_cost_actor_loss",
-        "liveness_direct_policy_loss",
     ):
         assert getattr(packed_metrics, field) == pytest.approx(
             getattr(sequential_metrics, field),
@@ -1743,23 +1290,6 @@ def test_typed_credit_plan_replays_state_and_candidate_liveness_targets() -> Non
         task_q_targets=(),
         liveness_value_targets=(value_target,),
         liveness_q_targets=(q_target,),
-        direct_policy_targets=(
-            DirectPolicyCredit(
-                step_index=0,
-                target=DirectPolicyTarget.AVOID,
-                witness_id="witness-1",
-            ),
-        ),
-        cycle_policy_targets=(),
-        contrast_policy_targets=(),
-        risk_sequences=(
-            RiskSequenceCredit(
-                step_indices=(0,),
-                terminal_cost=1.0,
-                discount=0.99,
-                witness_id="witness-risk",
-            ),
-        ),
         strata=(
             EvidenceStratum.DIRECT_WITNESS,
             EvidenceStratum.RISK_SEQUENCE,
@@ -1772,13 +1302,12 @@ def test_typed_credit_plan_replays_state_and_candidate_liveness_targets() -> Non
         current_policy_version=3,
         current_learner_update=512,
     )
-    total = losses.value_critic_loss + losses.critic_loss + losses.risk_actor_loss + losses.direct_avoid_loss
+    total = losses.value_critic_loss + losses.critic_loss
     total.backward()  # type: ignore[no-untyped-call]
 
     assert losses.value_labels == 1
     assert losses.critic_labels == 1
-    assert losses.risk_actor_labels == 1
-    assert losses.direct_avoid_labels == 1
+    assert losses.censored_suppressed_labels == 0
     assert model.liveness_cost_value_head is not None
     assert model.candidate_liveness_cost_head is not None
     assert any(
@@ -1789,17 +1318,6 @@ def test_typed_credit_plan_replays_state_and_candidate_liveness_targets() -> Non
         parameter.grad is not None and bool(torch.count_nonzero(parameter.grad).item())
         for parameter in model.candidate_liveness_cost_head.parameters()
     )
-
-    stale = learner.credit_plan_liveness_losses(
-        (plan,),
-        current_policy_version=200,
-        current_learner_update=512,
-    )
-    assert stale.value_labels == 1
-    assert stale.critic_labels == 1
-    assert stale.risk_actor_labels == 0
-    assert stale.direct_avoid_labels == 0
-    assert stale.policy_lag_suppressed_labels == 2
 
 
 def test_credit_plan_replay_batches_contexts_by_referenced_timestep() -> None:
@@ -1922,23 +1440,6 @@ def test_credit_plan_replay_batches_contexts_by_referenced_timestep() -> None:
             task_q_targets=(),
             liveness_value_targets=(scalar,),
             liveness_q_targets=(scalar,),
-            direct_policy_targets=(
-                DirectPolicyCredit(
-                    step_index=target_step,
-                    target=DirectPolicyTarget.AVOID,
-                    witness_id=f"batched-witness-{suffix}",
-                ),
-            ),
-            cycle_policy_targets=(),
-            contrast_policy_targets=(),
-            risk_sequences=(
-                RiskSequenceCredit(
-                    step_indices=(target_step,),
-                    terminal_cost=1.0,
-                    discount=0.99,
-                    witness_id=f"batched-risk-{suffix}",
-                ),
-            ),
             strata=(
                 EvidenceStratum.DIRECT_WITNESS,
                 EvidenceStratum.RISK_SEQUENCE,
@@ -1998,8 +1499,6 @@ def test_credit_plan_replay_batches_contexts_by_referenced_timestep() -> None:
     for field in (
         "value_critic_loss",
         "critic_loss",
-        "risk_actor_loss",
-        "direct_avoid_loss",
     ):
         expected = torch.stack(tuple(getattr(losses, field) for losses in serial)).mean()
         torch.testing.assert_close(
@@ -2011,9 +1510,7 @@ def test_credit_plan_replay_batches_contexts_by_referenced_timestep() -> None:
 
     assert batched.value_labels == 2
     assert batched.critic_labels == 2
-    assert batched.risk_actor_labels == 2
-    assert batched.direct_avoid_labels == 2
-    (batched.value_critic_loss + batched.critic_loss + batched.risk_actor_loss + batched.direct_avoid_loss).backward()  # type: ignore[no-untyped-call]
+    (batched.value_critic_loss + batched.critic_loss).backward()  # type: ignore[no-untyped-call]
     assert model.liveness_cost_value_head is not None
     assert model.candidate_liveness_cost_head is not None
     assert any(

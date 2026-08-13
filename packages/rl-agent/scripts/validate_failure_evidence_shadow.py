@@ -40,14 +40,13 @@ from sts2_rl.training.failure_credit import (
     FAILURE_CREDIT_DETECTOR_VERSION,
     FAILURE_CREDIT_SCHEMA_VERSION,
     FAILURE_EVIDENCE_REPLAY_VERSION,
-    DirectPolicyTarget,
     EvidenceRecord,
     EvidenceStratum,
     ImmutableEvidenceCorpus,
 )
 from sts2_rl.training.launch_contract import current_formal_report_generation_source
 
-_REPORT_VERSION = "sts2-failure-evidence-shadow-report-v2"
+_REPORT_VERSION = "sts2-failure-evidence-shadow-report-v3"
 _CHECKOUT_ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -271,9 +270,6 @@ def main() -> int:
                     "episode": asdict(episode.metrics),
                     "shadow": asdict(shadow),
                     "record_count": len(episode.failure_credit_records),
-                    "actor_label_count": sum(
-                        record.plan.actor_label_count for record in episode.failure_credit_records
-                    ),
                 }
             )
         training_state_unchanged = {
@@ -302,7 +298,6 @@ def main() -> int:
         resources.close()
 
     corpus = ImmutableEvidenceCorpus(records=tuple(records))
-    direct_targets = Counter(target.target.value for record in records for target in record.plan.direct_policy_targets)
     receipt_counts: Counter[str] = Counter()
     semantic_censored = 0
     decisions = 0
@@ -324,7 +319,6 @@ def main() -> int:
     gates = {
         "minimum_decisions": decisions >= args.minimum_decisions,
         "zero_semantic_censored_transitions": semantic_censored == 0,
-        "no_unjustified_completion_prefer": (direct_targets[DirectPolicyTarget.PREFER.value] == 0),
         "source_manifest_unchanged": (_sha256(manifest_path) == manifest_hash_before),
         "source_metadata_unchanged": (_sha256(metadata_path) == metadata_hash_before),
         "no_replay_or_learner_updates": all(training_state_unchanged.values()),
@@ -368,7 +362,6 @@ def main() -> int:
         "counts": {
             "decisions": decisions,
             "records": len(records),
-            "actor_actionable_records": (corpus.metrics().actor_actionable_records),
             "semantic_censored_transitions": semantic_censored,
             "storage_nbytes": corpus.storage_nbytes,
             "completion_controls_observed": completion_audit["observed"],
@@ -376,7 +369,6 @@ def main() -> int:
             "maximum_episode_completion_storage_nbytes": (completion_audit["maximum_episode_storage_nbytes"]),
         },
         "progress_receipts": dict(sorted(receipt_counts.items())),
-        "direct_policy_targets": dict(sorted(direct_targets.items())),
         "strata": strata,
         "training_state_unchanged": training_state_unchanged,
         "gates": gates,

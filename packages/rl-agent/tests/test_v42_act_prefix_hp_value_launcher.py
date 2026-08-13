@@ -84,25 +84,11 @@ def test_v42_enables_act_prefix_hp_value_and_extended_smdp_without_scaffolding()
         v40.transaction_learning.lifecycle_smdp_q_weight
     )
     assert config.failure_credit == v40.failure_credit
-    assert config.episodic_learning.act_segment_imitation_enabled is True
-    assert config.episodic_learning.act_segment_policy_weight == pytest.approx(
-        0.30
-    )
-    assert config.episodic_learning.act_segment_min_exit_hp_ratio == pytest.approx(
-        0.35
-    )
-    assert config.episodic_learning.act_segment_max_revival_fraction == pytest.approx(
-        0.34
-    )
     assert config.episodic_learning.combat_hp_loss_value_weight == pytest.approx(
         0.05
     )
     assert config.episodic_learning.combat_hp_loss_reference == pytest.approx(
         80.0
-    )
-    assert config.episodic_learning.success_imitation_exempt_surfaces == (
-        "rest_site",
-        "shop",
     )
     assert config.model == v40.model
     assert config.environment == v40.environment

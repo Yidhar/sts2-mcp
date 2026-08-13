@@ -37,18 +37,9 @@ from .config import (
 from .episode_replay import (
     HorizonTargets,
     ReplaySequence,
-    healthy_act_segment_for_step,
-)
-from .failure_credit.actor_eligibility import (
-    actor_step_is_fresh,
-    contrast_actor_unit_effective,
-    cycle_actor_unit_effective,
-    direct_actor_unit_effective,
-    risk_actor_row_effective,
 )
 from .failure_credit.contracts import (
     CreditPlan,
-    DirectPolicyTarget,
     EvidenceStratum,
     LearningContext,
 )
@@ -159,67 +150,31 @@ class LearnerMetrics:
     liveness_cost_critic_loss: float
     liveness_value_critic_loss: float
     liveness_q_critic_loss: float
-    liveness_cost_actor_loss: float
-    liveness_direct_policy_loss: float
-    liveness_cycle_policy_loss: float
-    liveness_contrast_policy_loss: float
-    liveness_completion_policy_loss: float
     liveness_credit_plans: int
     liveness_cost_labels: int
     liveness_value_labels: int
     liveness_q_labels: int
-    liveness_cost_actor_labels: int
-    liveness_direct_policy_labels: int
-    liveness_cycle_policy_labels: int
-    liveness_contrast_policy_labels: int
-    liveness_completion_policy_labels: int
-    liveness_forced_actor_suppressed_labels: int
     liveness_censored_suppressed_labels: int
-    liveness_policy_lag_suppressed_labels: int
-    liveness_risk_actor_phase_suppressed_labels: int
-    liveness_risk_actor_saturation_suppressed_labels: int
-    liveness_centered_risk_mean: float
-    liveness_centered_risk_max_abs: float
-    liveness_policy_gradient_norm: float
     liveness_critic_gradient_norm: float
     liveness_gradient_norm_before_clip: float
     liveness_gradient_norm_after_clip: float
     liveness_gradient_clip_scale: float
     liveness_head_calibration_active: int
-    liveness_risk_actor_enabled: int
     liveness_replayed_contexts: int
     liveness_replayed_steps: int
     liveness_replayed_candidates: int
     liveness_autograd_microbatches: int
     liveness_autograd_segments: int
     episodic_loss: float
-    episodic_primary_policy_loss: float
     episodic_task_value_loss: float
     episodic_revival_value_loss: float
-    episodic_revival_policy_loss: float
-    episodic_act_segment_policy_loss: float
     episodic_combat_hp_loss_value_loss: float
     episodic_sequences: int
     episodic_burn_in_steps: int
     episodic_learn_steps: int
-    episodic_success_policy_candidate_labels: int
-    episodic_policy_labels: int
-    episodic_policy_active_sequences: int
-    episodic_failure_policy_suppressed_labels: int
-    episodic_policy_lag_suppressed_labels: int
-    episodic_success_trust_region_suppressed_labels: int
-    episodic_success_surface_exempted_labels: int
-    episodic_act_segment_policy_labels: int
-    episodic_act_segment_health_gate_suppressed_labels: int
-    episodic_act_segment_healthy_acts: int
     episodic_task_value_labels: int
     episodic_combat_hp_loss_value_labels: int
     episodic_revival_value_labels: int
-    episodic_efficiency_policy_labels: int
-    episodic_importance_ratio_mean: float
-    episodic_importance_ratio_max: float
-    episodic_importance_clip_fraction: float
-    episodic_maximum_policy_lag: int
     timings: LearnerTimings
 
     def to_mapping(
@@ -272,35 +227,21 @@ class _TransactionLossBatch:
 
 @dataclass(frozen=True, slots=True)
 class LivenessCreditLosses:
-    """Independent bounded-risk and factual policy-credit losses.
+    """Independent factual liveness value/cost critic losses.
 
     The helper that produces this bundle deliberately receives model outputs,
     not game-specific failure records.  A versioned credit-plan/replay adapter
     can therefore resolve factual ``decision_id`` references into active-shape
-    snapshots without coupling this learner to collector internals.
+    snapshots without coupling this learner to collector internals.  Since v20
+    the plane trains only the state value and candidate cost critics; every
+    liveness policy-actor channel was retired.
     """
 
     value_critic_loss: Tensor
     critic_loss: Tensor
-    risk_actor_loss: Tensor
-    direct_avoid_loss: Tensor
-    cycle_likelihood_loss: Tensor
-    contrast_loss: Tensor
-    completion_loss: Tensor
     value_labels: int
     critic_labels: int
-    risk_actor_labels: int
-    direct_avoid_labels: int
-    cycle_labels: int
-    contrast_labels: int
-    completion_labels: int
-    forced_actor_suppressed_labels: int
     censored_suppressed_labels: int
-    policy_lag_suppressed_labels: int
-    risk_actor_phase_suppressed_labels: int
-    risk_actor_saturation_suppressed_labels: int
-    centered_risk_mean: float
-    centered_risk_max_abs: float
     replayed_contexts: int = 0
     replayed_steps: int = 0
     replayed_candidates: int = 0
@@ -329,47 +270,19 @@ class LivenessAutogradPack:
 
 @dataclass(frozen=True, slots=True)
 class LivenessLabelRow:
-    """Pure DTO actor/critic-mask decision for one recurrent replay row."""
+    """Pure DTO critic-mask decision for one recurrent replay row."""
 
     context_id: str
     step_index: int
     decision_id: str
-    forced: bool
     censored: bool
     legal_candidates: int
-    fresh: bool
     value_critic_requested: bool
     q_critic_requested: bool
-    risk_actor_requested: bool
-    risk_actor_mask: bool
-    direct_target: str | None
-    direct_actor_mask: bool
 
     @property
     def key(self) -> tuple[str, int]:
         return (self.context_id, self.step_index)
-
-    @property
-    def actor_eligible(self) -> bool:
-        return not self.forced and not self.censored and self.legal_candidates > 1
-
-    @property
-    def effective_risk_actor(self) -> bool:
-        return self.risk_actor_mask and self.actor_eligible
-
-    @property
-    def effective_direct_actor(self) -> bool:
-        return self.direct_actor_mask and self.actor_eligible
-
-
-@dataclass(frozen=True, slots=True)
-class LivenessGroupLabel:
-    """Pure DTO decision for one cycle or matched-outcome actor group."""
-
-    kind: str
-    row_keys: tuple[tuple[str, int], ...]
-    fresh: bool
-    effective: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,12 +291,7 @@ class LivenessLabelManifest:
 
     learner_update: int
     calibration_active: bool
-    risk_actor_enabled: bool
     rows: tuple[LivenessLabelRow, ...]
-    cycle_groups: tuple[LivenessGroupLabel, ...]
-    contrast_groups: tuple[LivenessGroupLabel, ...]
-    policy_lag_suppressed_labels: int
-    risk_actor_phase_suppressed_labels: int
     work: LivenessReplayWork
 
     def row_map(self) -> dict[tuple[str, int], LivenessLabelRow]:
@@ -482,36 +390,20 @@ class _LivenessLabelRowBuilder:
     context_id: str
     step_index: int
     decision_id: str
-    forced: bool
     censored: bool
     legal_candidates: int
-    fresh: bool
     value_critic_requested: bool = False
     q_critic_requested: bool = False
-    risk_actor_requested: bool = False
-    risk_actor_mask: bool = False
-    direct_target: str | None = None
-    direct_actor_mask: bool = False
-
-    @property
-    def actor_eligible(self) -> bool:
-        return not self.forced and not self.censored and self.legal_candidates > 1
 
     def freeze(self) -> LivenessLabelRow:
         return LivenessLabelRow(
             context_id=self.context_id,
             step_index=self.step_index,
             decision_id=self.decision_id,
-            forced=self.forced,
             censored=self.censored,
             legal_candidates=self.legal_candidates,
-            fresh=self.fresh,
             value_critic_requested=self.value_critic_requested,
             q_critic_requested=self.q_critic_requested,
-            risk_actor_requested=self.risk_actor_requested,
-            risk_actor_mask=self.risk_actor_mask,
-            direct_target=self.direct_target,
-            direct_actor_mask=self.direct_actor_mask,
         )
 
 
@@ -547,7 +439,6 @@ def compile_liveness_label_manifest(
         raise ValueError("credit plan batch exceeds failure_credit.sample_records")
 
     calibration_active = current_learner_update < config.liveness_head_calibration_updates
-    risk_actor_enabled = current_learner_update >= config.liveness_risk_actor_start_update
     contexts: dict[str, LearningContext] = {}
     context_order: list[str] = []
     needed_steps: dict[str, set[int]] = {}
@@ -577,24 +468,6 @@ def compile_liveness_label_manifest(
             register_context_step(plan.context, value_target.step_index)
         for q_target in plan.liveness_q_targets:
             register_context_step(plan.context, q_target.step_index)
-        for direct_target in plan.direct_policy_targets:
-            register_context_step(plan.context, direct_target.step_index)
-        for cycle_target in plan.cycle_policy_targets:
-            for step_index in cycle_target.step_indices:
-                register_context_step(plan.context, step_index)
-        for risk_sequence in plan.risk_sequences:
-            for step_index in risk_sequence.step_indices:
-                register_context_step(plan.context, step_index)
-        for contrast_target in plan.contrast_policy_targets:
-            for arm in (
-                contrast_target.pair.better,
-                contrast_target.pair.worse,
-            ):
-                previous = plan_contexts.get(arm.context.context_id)
-                if previous is not None and previous is not arm.context:
-                    raise ValueError("different LearningContext objects reuse one context_id")
-                plan_contexts[arm.context.context_id] = arm.context
-                register_context_step(arm.context, arm.step_index)
         if len(plan_contexts) > config.liveness_maximum_contexts_per_record:
             raise ValueError("credit plan exceeds " "failure_credit.liveness_maximum_contexts_per_record")
 
@@ -609,20 +482,9 @@ def compile_liveness_label_manifest(
                 context_id=context_id,
                 step_index=step_index,
                 decision_id=step.decision_id,
-                forced=step.forced,
                 censored=False,
                 legal_candidates=int(step.snapshot.action_mask.sum()),
-                fresh=actor_step_is_fresh(
-                    step,
-                    current_policy_version=current_policy_version,
-                    policy_gradient_max_lag=config.policy_gradient_max_lag,
-                ),
             )
-
-    cycle_groups: list[LivenessGroupLabel] = []
-    contrast_groups: list[LivenessGroupLabel] = []
-    policy_lag_suppressed_labels = 0
-    risk_actor_phase_suppressed_labels = 0
 
     def builder(
         context: LearningContext,
@@ -630,7 +492,6 @@ def compile_liveness_label_manifest(
     ) -> _LivenessLabelRowBuilder:
         return builders[(context.context_id, step_index)]
 
-    # Mark censoring before actor-group eligibility is derived.
     for plan in credit_plans:
         if EvidenceStratum.CENSORED in plan.strata:
             for item in builders.values():
@@ -651,85 +512,6 @@ def compile_liveness_label_manifest(
                 plan.context,
                 q_target.step_index,
             ).q_critic_requested = True
-        for sequence in plan.risk_sequences:
-            for step_index in sequence.step_indices:
-                item = builder(plan.context, step_index)
-                item.risk_actor_requested = True
-                if not item.fresh:
-                    policy_lag_suppressed_labels += 1
-                elif not item.actor_eligible:
-                    continue
-                elif not risk_actor_enabled:
-                    risk_actor_phase_suppressed_labels += 1
-                else:
-                    item.risk_actor_mask = risk_actor_row_effective(
-                        plan,
-                        step_index,
-                        current_policy_version=current_policy_version,
-                        policy_gradient_max_lag=config.policy_gradient_max_lag,
-                        risk_actor_enabled=risk_actor_enabled,
-                    )
-        for direct_target in plan.direct_policy_targets:
-            item = builder(plan.context, direct_target.step_index)
-            target_name = direct_target.target.value
-            previous_direct_target = item.direct_target
-            if previous_direct_target is not None and previous_direct_target != target_name:
-                raise ValueError("conflicting direct policy targets reference one decision")
-            item.direct_target = target_name
-            if not item.fresh:
-                policy_lag_suppressed_labels += 1
-            else:
-                item.direct_actor_mask = direct_actor_unit_effective(
-                    plan,
-                    direct_target,
-                    current_policy_version=current_policy_version,
-                    policy_gradient_max_lag=config.policy_gradient_max_lag,
-                )
-        for cycle_target in plan.cycle_policy_targets:
-            keys = tuple((plan.context.context_id, step_index) for step_index in cycle_target.step_indices)
-            fresh = all(builders[key].fresh for key in keys)
-            if not fresh:
-                policy_lag_suppressed_labels += 1
-            cycle_groups.append(
-                LivenessGroupLabel(
-                    kind="cycle",
-                    row_keys=keys,
-                    fresh=fresh,
-                    effective=cycle_actor_unit_effective(
-                        plan,
-                        cycle_target,
-                        current_policy_version=current_policy_version,
-                        policy_gradient_max_lag=config.policy_gradient_max_lag,
-                    ),
-                )
-            )
-        for contrast_target in plan.contrast_policy_targets:
-            keys = (
-                (
-                    contrast_target.pair.better.context.context_id,
-                    contrast_target.pair.better.step_index,
-                ),
-                (
-                    contrast_target.pair.worse.context.context_id,
-                    contrast_target.pair.worse.step_index,
-                ),
-            )
-            fresh = all(builders[key].fresh for key in keys)
-            if not fresh:
-                policy_lag_suppressed_labels += 1
-            contrast_groups.append(
-                LivenessGroupLabel(
-                    kind="contrast",
-                    row_keys=keys,
-                    fresh=fresh,
-                    effective=contrast_actor_unit_effective(
-                        plan,
-                        contrast_target,
-                        current_policy_version=current_policy_version,
-                        policy_gradient_max_lag=config.policy_gradient_max_lag,
-                    ),
-                )
-            )
 
     rows = tuple(
         builders[(context_id, step_index)].freeze()
@@ -756,12 +538,7 @@ def compile_liveness_label_manifest(
     return LivenessLabelManifest(
         learner_update=current_learner_update,
         calibration_active=calibration_active,
-        risk_actor_enabled=risk_actor_enabled,
         rows=rows,
-        cycle_groups=tuple(cycle_groups),
-        contrast_groups=tuple(contrast_groups),
-        policy_lag_suppressed_labels=policy_lag_suppressed_labels,
-        risk_actor_phase_suppressed_labels=(risk_actor_phase_suppressed_labels),
         work=LivenessReplayWork(
             contexts=len(context_order),
             steps=replayed_steps,
@@ -790,7 +567,6 @@ def _optional_row_mask(
 
 def liveness_credit_losses(
     *,
-    policy_log_probabilities: Tensor,
     candidate_liveness_cost_values: Tensor,
     liveness_cost_values: Tensor | None = None,
     action_mask: Tensor,
@@ -799,51 +575,28 @@ def liveness_credit_losses(
     value_critic_mask: Tensor | None = None,
     risk_targets: Tensor | None = None,
     risk_critic_mask: Tensor | None = None,
-    risk_actor_mask: Tensor | None = None,
-    forced_mask: Tensor | None = None,
     censored_mask: Tensor | None = None,
-    direct_avoid_mask: Tensor | None = None,
-    completion_mask: Tensor | None = None,
-    cycle_groups: tuple[tuple[int, ...], ...] = (),
-    cycle_behavior_mean_log_probabilities: tuple[float, ...] | None = None,
-    cycle_margins: tuple[float, ...] | None = None,
-    contrast_pairs: tuple[tuple[int, int], ...] = (),
-    contrast_margins: tuple[float, ...] | None = None,
-    risk_advantage_clip: float = 0.25,
-    risk_actor_min_selected_probability: float = 0.0,
-    contrast_margin: float = 0.10,
 ) -> LivenessCreditLosses:
-    """Build factual liveness losses over one active-shape decision batch.
+    """Build factual liveness critic losses over one active-shape batch.
 
-    ``risk_critic_mask`` controls factual cost supervision.  Forced decisions
-    may still train that critic, but they can never train an actor because no
-    alternative action exists.  ``censored_mask`` suppresses every liveness
-    target.  Direct AVOID, cycle likelihood, contrast, completion, and the
-    centered risk actor all operate only on non-forced rows with at least two
-    legal candidates.
-
-    The centered actor objective is independent of the primary task value:
-
-    ``log pi(a|s) * clip(C(s,a) - E_pi[C(s,.)])``.
-
-    Consequently a task baseline fixed at ``V_task=-1`` cannot erase this
-    gradient.  Candidate costs are detached from the actor term so policy
-    optimization cannot lower the objective by corrupting its own critic.
+    ``risk_critic_mask`` controls factual selected-action cost supervision and
+    ``value_critic_mask`` controls the candidate-independent state cost head.
+    Forced decisions may still train both critics because their factual
+    outcome remains authoritative.  ``censored_mask`` suppresses every
+    liveness target.  Since v20 this function owns no policy-actor objective:
+    the risk/direct/cycle/contrast/completion channels were retired.
     """
 
-    if policy_log_probabilities.ndim != 2:
-        raise ValueError("policy_log_probabilities must have shape [N, A]")
-    rows, candidates = policy_log_probabilities.shape
+    if candidate_liveness_cost_values.ndim != 2:
+        raise ValueError("candidate_liveness_cost_values must have shape [N, A]")
+    rows, candidates = candidate_liveness_cost_values.shape
     if rows <= 0 or candidates <= 0:
         raise ValueError("liveness decision batch must be non-empty")
     expected = (rows, candidates)
-    if candidate_liveness_cost_values.shape != expected:
-        raise ValueError("candidate_liveness_cost_values must match policy shape")
     if action_mask.shape != expected or action_mask.dtype != torch.bool:
-        raise ValueError("action_mask must be a bool tensor matching policy shape")
-    device = policy_log_probabilities.device
+        raise ValueError("action_mask must be a bool tensor matching the candidate cost shape")
+    device = candidate_liveness_cost_values.device
     for label, value in (
-        ("candidate_liveness_cost_values", candidate_liveness_cost_values),
         ("action_mask", action_mask),
         ("selected_action_indices", selected_action_indices),
     ):
@@ -858,8 +611,6 @@ def liveness_credit_losses(
             raise ValueError("liveness_cost_values contains NaN or infinity")
         if bool(((liveness_cost_values < 0.0) | (liveness_cost_values > 1.0)).any().item()):
             raise ValueError("liveness_cost_values must be in [0, 1]")
-    if not torch.is_floating_point(policy_log_probabilities):
-        raise TypeError("policy_log_probabilities must be floating point")
     if not torch.is_floating_point(candidate_liveness_cost_values):
         raise TypeError("candidate_liveness_cost_values must be floating point")
     if selected_action_indices.shape != (rows,) or selected_action_indices.dtype != torch.long:
@@ -874,39 +625,7 @@ def liveness_credit_losses(
         raise ValueError("candidate liveness costs contain NaN or infinity")
     if bool(((legal_costs < 0.0) | (legal_costs > 1.0)).any().item()):
         raise ValueError("candidate liveness costs must be in [0, 1]")
-    selected_log_probabilities = policy_log_probabilities.gather(1, selected_action_indices[:, None]).squeeze(1)
-    if not bool(torch.isfinite(selected_log_probabilities).all().item()):
-        raise ValueError("selected policy log probabilities must be finite")
-    if (
-        isinstance(risk_advantage_clip, bool)
-        or not isinstance(risk_advantage_clip, int | float)
-        or not math.isfinite(float(risk_advantage_clip))
-        or not 0.0 <= float(risk_advantage_clip) <= 1.0
-    ):
-        raise ValueError("risk_advantage_clip must be finite and in [0, 1]")
-    if (
-        isinstance(contrast_margin, bool)
-        or not isinstance(contrast_margin, int | float)
-        or not math.isfinite(float(contrast_margin))
-        or float(contrast_margin) < 0.0
-    ):
-        raise ValueError("contrast_margin must be finite and non-negative")
-    if (
-        isinstance(risk_actor_min_selected_probability, bool)
-        or not isinstance(risk_actor_min_selected_probability, int | float)
-        or not math.isfinite(float(risk_actor_min_selected_probability))
-        or not 0.0 <= float(risk_actor_min_selected_probability) < 1.0
-    ):
-        raise ValueError(
-            "risk_actor_min_selected_probability must be finite and in [0, 1)"
-        )
 
-    forced = _optional_row_mask(
-        forced_mask,
-        rows=rows,
-        device=device,
-        label="forced_mask",
-    )
     censored = _optional_row_mask(
         censored_mask,
         rows=rows,
@@ -925,38 +644,15 @@ def liveness_credit_losses(
         device=device,
         label="value_critic_mask",
     )
-    actor_requested = _optional_row_mask(
-        risk_actor_mask,
-        rows=rows,
-        device=device,
-        label="risk_actor_mask",
-    )
-    direct_requested = _optional_row_mask(
-        direct_avoid_mask,
-        rows=rows,
-        device=device,
-        label="direct_avoid_mask",
-    )
-    completion_requested = _optional_row_mask(
-        completion_mask,
-        rows=rows,
-        device=device,
-        label="completion_mask",
-    )
-    legal_counts = action_mask.sum(dim=1)
-    actor_eligible = (~forced) & (~censored) & (legal_counts > 1)
     critic_eligible = critic_requested & (~censored)
     value_eligible = value_requested & (~censored)
-    direct_eligible = direct_requested & actor_eligible
-    completion_eligible = completion_requested & actor_eligible
 
     zero = (
-        selected_log_probabilities.sum() * 0.0
-        + candidate_liveness_cost_values.sum() * 0.0
+        candidate_liveness_cost_values.sum() * 0.0
         + (
             liveness_cost_values.sum() * 0.0
             if liveness_cost_values is not None
-            else selected_log_probabilities.sum() * 0.0
+            else candidate_liveness_cost_values.sum() * 0.0
         )
     )
     selected_costs = candidate_liveness_cost_values.gather(1, selected_action_indices[:, None]).squeeze(1)
@@ -1001,169 +697,15 @@ def liveness_credit_losses(
     else:
         critic_loss = zero
 
-    legal_probabilities = torch.where(
-        action_mask,
-        # The cost actor must use the current policy only as a detached
-        # baseline distribution.  Its policy gradient is owned exclusively by
-        # ``selected_log_probabilities`` below; otherwise the expectation term
-        # leaks a second, critic-shaped gradient through every legal action.
-        policy_log_probabilities.exp().detach(),
-        torch.zeros_like(policy_log_probabilities),
-    )
-    centered_risk = (
-        selected_costs.detach() - (legal_probabilities * candidate_liveness_cost_values.detach()).sum(dim=1)
-    ).clamp(
-        min=-float(risk_advantage_clip),
-        max=float(risk_advantage_clip),
-    )
-    selected_probabilities = selected_log_probabilities.detach().exp()
-    # A positive centered risk asks gradient descent to lower the factual
-    # selected action.  Once that action is already below the reviewed floor,
-    # repeating the same direction changes shared representations far more
-    # than behaviour.  Keep critic labels and all negative-risk recovery
-    # labels; suppress only the already-satisfied actor direction.
-    saturation_suppressed = (
-        actor_requested
-        & actor_eligible
-        & (centered_risk >= 0.0)
-        & (
-            selected_probabilities
-            < float(risk_actor_min_selected_probability)
-        )
-    )
-    risk_actor_eligible = actor_requested & actor_eligible & (~saturation_suppressed)
-    if bool(risk_actor_eligible.any().item()):
-        risk_actor_loss = (selected_log_probabilities[risk_actor_eligible] * centered_risk[risk_actor_eligible]).mean()
-        active_centered = centered_risk[risk_actor_eligible]
-        centered_risk_mean = float(active_centered.mean().item())
-        centered_risk_max_abs = float(active_centered.abs().max().item())
-    else:
-        risk_actor_loss = zero
-        centered_risk_mean = 0.0
-        centered_risk_max_abs = 0.0
-
-    direct_losses: list[Tensor] = []
-    for row in torch.nonzero(direct_eligible, as_tuple=False).flatten().tolist():
-        alternatives = action_mask[row].clone()
-        alternatives[int(selected_action_indices[row].item())] = False
-        alternative_log_mass = torch.logsumexp(
-            policy_log_probabilities[row].masked_select(alternatives),
-            dim=0,
-        )
-        # Raw -log(1-p_selected) has an unbounded derivative as the selected
-        # action approaches probability one.  Weighting by the detached
-        # factual alternative mass preserves the AVOID direction while making
-        # a single sparse witness incapable of hijacking an update.
-        alternative_mass = alternative_log_mass.detach().exp()
-        direct_losses.append(-alternative_mass * alternative_log_mass)
-    direct_avoid_loss = torch.stack(direct_losses).mean() if direct_losses else zero
-    completion_loss = (
-        -selected_log_probabilities[completion_eligible].mean() if bool(completion_eligible.any().item()) else zero
-    )
-
-    if cycle_behavior_mean_log_probabilities is not None and len(cycle_behavior_mean_log_probabilities) != len(
-        cycle_groups
-    ):
-        raise ValueError("cycle behavior log-probabilities must align with cycle groups")
-    if cycle_margins is not None and len(cycle_margins) != len(cycle_groups):
-        raise ValueError("cycle margins must align with cycle groups")
-    cycle_losses: list[Tensor] = []
-    for cycle_index, group in enumerate(cycle_groups):
-        if not isinstance(group, tuple) or not group:
-            raise ValueError("cycle groups must be non-empty index tuples")
-        if any(isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < rows for index in group):
-            raise ValueError("cycle group contains an invalid decision index")
-        eligible_indices = [index for index in group if bool(actor_eligible[index].item())]
-        if not eligible_indices:
-            continue
-        mean_log_probability = selected_log_probabilities[
-            torch.tensor(eligible_indices, device=device, dtype=torch.long)
-        ].mean()
-        if cycle_behavior_mean_log_probabilities is None:
-            cycle_probability = mean_log_probability.exp().clamp(max=1.0 - 1e-6)
-            cycle_losses.append(-torch.log1p(-cycle_probability))
-        else:
-            behavior_mean = cycle_behavior_mean_log_probabilities[cycle_index]
-            margin = cycle_margins[cycle_index] if cycle_margins is not None else float(contrast_margin)
-            if not math.isfinite(behavior_mean) or behavior_mean > 0.0:
-                raise ValueError("cycle behavior mean log-probabilities must be finite and non-positive")
-            if not math.isfinite(margin) or margin < 0.0:
-                raise ValueError("cycle margins must be finite and non-negative")
-            # Reduce the complete cycle's geometric-mean likelihood below the
-            # factual behavior policy by the compiled margin.  This objective
-            # remains well scaled for long cycles and never singles out the
-            # arbitrary action that happened to cross a stall threshold.
-            cycle_losses.append(
-                F.softplus(
-                    mean_log_probability
-                    - mean_log_probability.new_tensor(behavior_mean)
-                    + mean_log_probability.new_tensor(margin)
-                )
-            )
-    cycle_likelihood_loss = torch.stack(cycle_losses).mean() if cycle_losses else zero
-
-    contrast_losses: list[Tensor] = []
-    if contrast_margins is not None and len(contrast_margins) != len(contrast_pairs):
-        raise ValueError("contrast margins must align with contrast pairs")
-    for pair_index, pair in enumerate(contrast_pairs):
-        if (
-            not isinstance(pair, tuple)
-            or len(pair) != 2
-            or any(isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < rows for index in pair)
-        ):
-            raise ValueError("contrast pairs must contain two valid decision indexes")
-        better_index, worse_index = pair
-        if not bool((actor_eligible[better_index] & actor_eligible[worse_index]).item()):
-            continue
-        pair_margin = contrast_margins[pair_index] if contrast_margins is not None else float(contrast_margin)
-        if not math.isfinite(pair_margin) or pair_margin < 0.0:
-            raise ValueError("contrast margins must be finite and non-negative")
-        contrast_losses.append(
-            F.softplus(
-                selected_log_probabilities.new_tensor(float(pair_margin))
-                - (selected_log_probabilities[better_index] - selected_log_probabilities[worse_index])
-            )
-        )
-    contrast_loss = torch.stack(contrast_losses).mean() if contrast_losses else zero
-
-    forced_suppressed = int(
-        (
-            (actor_requested & forced).sum() + (direct_requested & forced).sum() + (completion_requested & forced).sum()
-        ).item()
-    )
     censored_suppressed = int(
-        (
-            (value_requested & censored).sum()
-            + (critic_requested & censored).sum()
-            + (actor_requested & censored).sum()
-            + (direct_requested & censored).sum()
-            + (completion_requested & censored).sum()
-        ).item()
+        ((value_requested & censored).sum() + (critic_requested & censored).sum()).item()
     )
     return LivenessCreditLosses(
         value_critic_loss=value_critic_loss,
         critic_loss=critic_loss,
-        risk_actor_loss=risk_actor_loss,
-        direct_avoid_loss=direct_avoid_loss,
-        cycle_likelihood_loss=cycle_likelihood_loss,
-        contrast_loss=contrast_loss,
-        completion_loss=completion_loss,
         value_labels=int(value_eligible.sum().item()),
         critic_labels=int(critic_eligible.sum().item()),
-        risk_actor_labels=int(risk_actor_eligible.sum().item()),
-        direct_avoid_labels=len(direct_losses),
-        cycle_labels=len(cycle_losses),
-        contrast_labels=len(contrast_losses),
-        completion_labels=int(completion_eligible.sum().item()),
-        forced_actor_suppressed_labels=forced_suppressed,
         censored_suppressed_labels=censored_suppressed,
-        policy_lag_suppressed_labels=0,
-        risk_actor_phase_suppressed_labels=0,
-        risk_actor_saturation_suppressed_labels=int(
-            saturation_suppressed.sum().item()
-        ),
-        centered_risk_mean=centered_risk_mean,
-        centered_risk_max_abs=centered_risk_max_abs,
     )
 
 
@@ -1194,40 +736,22 @@ def _annealed_entropy_weight(
 @dataclass(frozen=True, slots=True)
 class _EpisodicLossBatch:
     total_loss: Tensor
-    primary_policy_loss: Tensor
     task_value_loss: Tensor
     revival_value_loss: Tensor
-    revival_policy_loss: Tensor
-    act_segment_policy_loss: Tensor
     combat_hp_loss_value_loss: Tensor
     burn_in_steps: int
     learn_steps: int
-    success_policy_candidate_labels: int
-    policy_labels: int
-    policy_active_sequences: int
-    failure_policy_suppressed_labels: int
-    policy_lag_suppressed_labels: int
-    success_trust_region_suppressed_labels: int
-    success_surface_exempted_labels: int
-    act_segment_policy_labels: int
-    act_segment_health_gate_suppressed_labels: int
-    act_segment_healthy_acts: int
     task_value_labels: int
     combat_hp_loss_value_labels: int
     revival_value_labels: int
-    efficiency_policy_labels: int
-    importance_ratios: Tensor
-    maximum_policy_lag: int
 
 
 @dataclass(frozen=True, slots=True)
 class _LivenessReplayDecision:
-    policy_log_probabilities: Tensor
     candidate_cost_values: Tensor
     state_cost_value: Tensor
     action_mask: Tensor
     selected_action_index: int
-    forced: bool
 
 
 def _empty_liveness_credit_losses(reference: Tensor) -> LivenessCreditLosses:
@@ -1235,25 +759,9 @@ def _empty_liveness_credit_losses(reference: Tensor) -> LivenessCreditLosses:
     return LivenessCreditLosses(
         value_critic_loss=zero,
         critic_loss=zero,
-        risk_actor_loss=zero,
-        direct_avoid_loss=zero,
-        cycle_likelihood_loss=zero,
-        contrast_loss=zero,
-        completion_loss=zero,
         value_labels=0,
         critic_labels=0,
-        risk_actor_labels=0,
-        direct_avoid_labels=0,
-        cycle_labels=0,
-        contrast_labels=0,
-        completion_labels=0,
-        forced_actor_suppressed_labels=0,
         censored_suppressed_labels=0,
-        policy_lag_suppressed_labels=0,
-        risk_actor_phase_suppressed_labels=0,
-        risk_actor_saturation_suppressed_labels=0,
-        centered_risk_mean=0.0,
-        centered_risk_max_abs=0.0,
     )
 
 
@@ -1293,36 +801,12 @@ def _mean_liveness_credit_losses(
             / total_weight
         )
 
-    risk_labels = sum(batch.risk_actor_labels for batch in batches)
-    centered_risk_mean = (
-        sum(batch.centered_risk_mean * batch.risk_actor_labels for batch in batches) / risk_labels
-        if risk_labels
-        else 0.0
-    )
     return LivenessCreditLosses(
         value_critic_loss=mean_tensor("value_critic_loss"),
         critic_loss=mean_tensor("critic_loss"),
-        risk_actor_loss=mean_tensor("risk_actor_loss"),
-        direct_avoid_loss=mean_tensor("direct_avoid_loss"),
-        cycle_likelihood_loss=mean_tensor("cycle_likelihood_loss"),
-        contrast_loss=mean_tensor("contrast_loss"),
-        completion_loss=mean_tensor("completion_loss"),
         value_labels=sum(batch.value_labels for batch in batches),
         critic_labels=sum(batch.critic_labels for batch in batches),
-        risk_actor_labels=risk_labels,
-        direct_avoid_labels=sum(batch.direct_avoid_labels for batch in batches),
-        cycle_labels=sum(batch.cycle_labels for batch in batches),
-        contrast_labels=sum(batch.contrast_labels for batch in batches),
-        completion_labels=sum(batch.completion_labels for batch in batches),
-        forced_actor_suppressed_labels=sum(batch.forced_actor_suppressed_labels for batch in batches),
         censored_suppressed_labels=sum(batch.censored_suppressed_labels for batch in batches),
-        policy_lag_suppressed_labels=sum(batch.policy_lag_suppressed_labels for batch in batches),
-        risk_actor_phase_suppressed_labels=sum(batch.risk_actor_phase_suppressed_labels for batch in batches),
-        risk_actor_saturation_suppressed_labels=sum(
-            batch.risk_actor_saturation_suppressed_labels for batch in batches
-        ),
-        centered_risk_mean=centered_risk_mean,
-        centered_risk_max_abs=max(batch.centered_risk_max_abs for batch in batches),
         replayed_contexts=sum(batch.replayed_contexts for batch in batches),
         replayed_steps=sum(batch.replayed_steps for batch in batches),
         replayed_candidates=sum(batch.replayed_candidates for batch in batches),
@@ -1592,23 +1076,6 @@ class VTraceLearner:
                 register_context_step(plan.context, value_target.step_index)
             for q_target in plan.liveness_q_targets:
                 register_context_step(plan.context, q_target.step_index)
-            for direct_target in plan.direct_policy_targets:
-                register_context_step(plan.context, direct_target.step_index)
-            for cycle_target in plan.cycle_policy_targets:
-                for step_index in cycle_target.step_indices:
-                    register_context_step(plan.context, step_index)
-            for risk_sequence in plan.risk_sequences:
-                for step_index in risk_sequence.step_indices:
-                    register_context_step(plan.context, step_index)
-            for contrast_target in plan.contrast_policy_targets:
-                register_context_step(
-                    contrast_target.pair.better.context,
-                    contrast_target.pair.better.step_index,
-                )
-                register_context_step(
-                    contrast_target.pair.worse.context,
-                    contrast_target.pair.worse.step_index,
-                )
 
         if not needed_steps:
             return _empty_liveness_credit_losses(reference)
@@ -1678,7 +1145,6 @@ class VTraceLearner:
                     self.model.config.recurrent_hidden_dim,
                 ):
                     raise RuntimeError("liveness recurrent replay returned an invalid hidden shape")
-                policy_log_probabilities: Tensor | None = None
                 costs = output.candidate_liveness_cost_values
                 state_cost = output.liveness_cost_value
                 for row, (identity, step) in enumerate(zip(identities, steps, strict=True)):
@@ -1687,16 +1153,12 @@ class VTraceLearner:
                         continue
                     if costs is None or state_cost is None:
                         raise RuntimeError("liveness model output omitted value/Q costs")
-                    if policy_log_probabilities is None:
-                        policy_log_probabilities = output.policy_log_probabilities()
                     candidate_count = step.snapshot.candidate_count
                     replayed[(identity, step_index)] = _LivenessReplayDecision(
-                        policy_log_probabilities=(policy_log_probabilities[row, :candidate_count]),
                         candidate_cost_values=costs[row, :candidate_count],
                         state_cost_value=state_cost[row],
                         action_mask=encoded.candidates.action_mask[row, :candidate_count],
                         selected_action_index=step.action_index,
-                        forced=step.forced,
                     )
 
             longest_replayed_prefix = max(maximum_replayed_step.values())
@@ -1739,8 +1201,6 @@ class VTraceLearner:
             if not manifest.rows:
                 return replace(
                     _empty_liveness_credit_losses(reference),
-                    policy_lag_suppressed_labels=manifest.policy_lag_suppressed_labels,
-                    risk_actor_phase_suppressed_labels=(manifest.risk_actor_phase_suppressed_labels),
                     replayed_contexts=manifest.work.contexts,
                     replayed_steps=manifest.work.steps,
                     replayed_candidates=manifest.work.candidates,
@@ -1753,15 +1213,12 @@ class VTraceLearner:
                     raise RuntimeError("compiled liveness context was not registered for replay")
                 record_keys.append((identity, manifest_row.step_index))
             decisions = tuple(replayed[key] for key in record_keys)
-            maximum_candidates = max(decision.policy_log_probabilities.shape[0] for decision in decisions)
+            maximum_candidates = max(decision.candidate_cost_values.shape[0] for decision in decisions)
 
             def padded(value: Tensor, *, fill: float) -> Tensor:
                 missing = maximum_candidates - value.shape[0]
                 return F.pad(value, (0, missing), value=fill) if missing else value
 
-            policy_log_probabilities = torch.stack(
-                tuple(padded(decision.policy_log_probabilities, fill=-torch.inf) for decision in decisions)
-            )
             candidate_cost_values = torch.stack(
                 tuple(padded(decision.candidate_cost_values, fill=0.0) for decision in decisions)
             )
@@ -1781,11 +1238,6 @@ class VTraceLearner:
                 device=self.device,
                 dtype=torch.long,
             )
-            forced_mask = torch.tensor(
-                tuple(decision.forced for decision in decisions),
-                device=self.device,
-                dtype=torch.bool,
-            )
             rows = len(decisions)
             # Targets and masks are immutable compiler facts. Assemble them on
             # the host and transfer each vector once; probing GPU tensors with
@@ -1795,16 +1247,6 @@ class VTraceLearner:
             value_target_values = [0.0] * rows
             value_critic_values = [False] * rows
             risk_critic_values = [False] * rows
-            risk_actor_values = [False] * rows
-            direct_avoid_values = [False] * rows
-            completion_values = [False] * rows
-            direct_targets: dict[int, DirectPolicyTarget] = {}
-            cycle_groups: list[tuple[int, ...]] = []
-            cycle_behavior: list[float] = []
-            cycle_margins: list[float] = []
-            contrast_pairs: list[tuple[int, int]] = []
-            contrast_margins: list[float] = []
-            manifest_rows = manifest.row_map()
             row_index = {row.key: index for index, row in enumerate(manifest.rows)}
 
             def decision_row(context: LearningContext, step_index: int) -> int:
@@ -1848,67 +1290,11 @@ class VTraceLearner:
                 merge_risk_target(row, q_target.target)
                 if plan_censored:
                     censored_values[row] = True
-            for sequence in plan.risk_sequences:
-                sequence_length = len(sequence.step_indices)
-                for ordinal, step_index in enumerate(sequence.step_indices):
-                    row = decision_row(plan.context, step_index)
-                    horizon = sequence_length - ordinal
-                    merge_risk_target(
-                        row,
-                        sequence.terminal_cost * sequence.discount ** (horizon - 1),
-                    )
-                    manifest_row = manifest_rows[(plan.context.context_id, step_index)]
-                    if manifest_row.risk_actor_mask:
-                        risk_actor_values[row] = True
-                    if plan_censored:
-                        censored_values[row] = True
-            for direct_target in plan.direct_policy_targets:
-                row = decision_row(plan.context, direct_target.step_index)
-                manifest_row = manifest_rows[(plan.context.context_id, direct_target.step_index)]
-                if not manifest_row.direct_actor_mask:
-                    continue
-                previous = direct_targets.get(row)
-                if previous is not None and previous is not direct_target.target:
-                    raise ValueError("conflicting direct policy targets reference one decision")
-                direct_targets[row] = direct_target.target
-                if direct_target.target is DirectPolicyTarget.AVOID:
-                    direct_avoid_values[row] = True
-                elif direct_target.target is DirectPolicyTarget.PREFER:
-                    completion_values[row] = True
-                else:  # pragma: no cover - enum exhaustiveness
-                    raise RuntimeError("unsupported direct liveness target")
-                if plan_censored:
-                    censored_values[row] = True
-            for group_index, cycle_target in enumerate(plan.cycle_policy_targets):
-                if not manifest.cycle_groups[group_index].effective:
-                    continue
-                cycle_groups.append(
-                    tuple(decision_row(plan.context, step_index) for step_index in cycle_target.step_indices)
-                )
-                cycle_behavior.append(cycle_target.behavior_mean_log_probability)
-                cycle_margins.append(cycle_target.margin)
-            for group_index, contrast_target in enumerate(plan.contrast_policy_targets):
-                if not manifest.contrast_groups[group_index].effective:
-                    continue
-                contrast_pairs.append(
-                    (
-                        decision_row(
-                            contrast_target.pair.better.context,
-                            contrast_target.pair.better.step_index,
-                        ),
-                        decision_row(
-                            contrast_target.pair.worse.context,
-                            contrast_target.pair.worse.step_index,
-                        ),
-                    )
-                )
-                contrast_margins.append(contrast_target.margin)
 
             def bool_tensor(values: list[bool]) -> Tensor:
                 return torch.tensor(values, device=self.device, dtype=torch.bool)
 
             losses = liveness_credit_losses(
-                policy_log_probabilities=policy_log_probabilities,
                 candidate_liveness_cost_values=candidate_cost_values,
                 liveness_cost_values=state_cost_values,
                 action_mask=action_mask,
@@ -1925,26 +1311,10 @@ class VTraceLearner:
                     dtype=candidate_cost_values.dtype,
                 ),
                 risk_critic_mask=bool_tensor(risk_critic_values),
-                risk_actor_mask=bool_tensor(risk_actor_values),
-                forced_mask=forced_mask,
                 censored_mask=bool_tensor(censored_values),
-                direct_avoid_mask=bool_tensor(direct_avoid_values),
-                completion_mask=bool_tensor(completion_values),
-                cycle_groups=tuple(cycle_groups),
-                cycle_behavior_mean_log_probabilities=tuple(cycle_behavior),
-                cycle_margins=tuple(cycle_margins),
-                contrast_pairs=tuple(contrast_pairs),
-                contrast_margins=tuple(contrast_margins),
-                risk_advantage_clip=(self.failure_credit_config.liveness_risk_advantage_clip),
-                risk_actor_min_selected_probability=(
-                    self.failure_credit_config.liveness_risk_actor_min_selected_probability
-                ),
-                contrast_margin=self.failure_credit_config.liveness_contrast_margin,
             )
             return replace(
                 losses,
-                policy_lag_suppressed_labels=manifest.policy_lag_suppressed_labels,
-                risk_actor_phase_suppressed_labels=(manifest.risk_actor_phase_suppressed_labels),
                 replayed_contexts=manifest.work.contexts,
                 replayed_steps=manifest.work.steps,
                 replayed_candidates=manifest.work.candidates,
@@ -2353,14 +1723,12 @@ class VTraceLearner:
         total_loss.backward()
         all_model_parameters = tuple(self.model.parameters())
         gradients_before_liveness = _parameter_gradient_snapshot(all_model_parameters)
-        policy_head_parameters = tuple(self.model.policy_head.parameters())
         liveness_head_parameters = (
             tuple(self.model.candidate_liveness_cost_head.parameters())
             + tuple(self.model.liveness_cost_value_head.parameters())
             if (self.model.candidate_liveness_cost_head is not None and self.model.liveness_cost_value_head is not None)
             else ()
         )
-        policy_gradients_before_liveness = _parameter_gradient_snapshot(policy_head_parameters)
         critic_gradients_before_liveness = _parameter_gradient_snapshot(liveness_head_parameters)
         liveness_started_ns = time.perf_counter_ns()
         packed_liveness_losses: list[LivenessCreditLosses] = []
@@ -2417,18 +1785,10 @@ class VTraceLearner:
                 current_policy_version=current_policy_version,
                 current_learner_update=schedule_learner_update,
             )
-            pack_critic_objective = (
+            pack_objective = (
                 self.failure_credit_config.liveness_value_critic_weight * pack_losses.value_critic_loss
                 + self.failure_credit_config.liveness_cost_critic_weight * pack_losses.critic_loss
             )
-            pack_policy_objective = (
-                self.failure_credit_config.liveness_cost_actor_weight * pack_losses.risk_actor_loss
-                + self.failure_credit_config.liveness_direct_policy_weight * pack_losses.direct_avoid_loss
-                + self.failure_credit_config.liveness_cycle_policy_weight * pack_losses.cycle_likelihood_loss
-                + self.failure_credit_config.liveness_contrast_policy_weight * pack_losses.contrast_loss
-                + self.failure_credit_config.liveness_completion_policy_weight * pack_losses.completion_loss
-            )
-            pack_objective = pack_critic_objective + pack_policy_objective
             _require_finite(
                 "liveness targets/loss",
                 (
@@ -2437,26 +1797,6 @@ class VTraceLearner:
                         pack_losses.value_critic_loss,
                     ),
                     ("liveness_q_critic_loss", pack_losses.critic_loss),
-                    (
-                        "liveness_cost_actor_loss",
-                        pack_losses.risk_actor_loss,
-                    ),
-                    (
-                        "liveness_direct_policy_loss",
-                        pack_losses.direct_avoid_loss,
-                    ),
-                    (
-                        "liveness_cycle_policy_loss",
-                        pack_losses.cycle_likelihood_loss,
-                    ),
-                    (
-                        "liveness_contrast_policy_loss",
-                        pack_losses.contrast_loss,
-                    ),
-                    (
-                        "liveness_completion_policy_loss",
-                        pack_losses.completion_loss,
-                    ),
                     ("liveness_autograd_batch_objective", pack_objective),
                 ),
             )
@@ -2476,18 +1816,10 @@ class VTraceLearner:
             reference=next(self.model.parameters()),
             weights=tuple(packed_record_counts),
         )
-        liveness_critic_objective = (
+        liveness_credit_loss = (
             self.failure_credit_config.liveness_value_critic_weight * liveness_losses.value_critic_loss
             + self.failure_credit_config.liveness_cost_critic_weight * liveness_losses.critic_loss
         )
-        liveness_policy_objective = (
-            self.failure_credit_config.liveness_cost_actor_weight * liveness_losses.risk_actor_loss
-            + self.failure_credit_config.liveness_direct_policy_weight * liveness_losses.direct_avoid_loss
-            + self.failure_credit_config.liveness_cycle_policy_weight * liveness_losses.cycle_likelihood_loss
-            + self.failure_credit_config.liveness_contrast_policy_weight * liveness_losses.contrast_loss
-            + self.failure_credit_config.liveness_completion_policy_weight * liveness_losses.completion_loss
-        )
-        liveness_credit_loss = liveness_critic_objective + liveness_policy_objective
         (
             liveness_gradient_norm_before_clip,
             liveness_gradient_norm_after_clip,
@@ -2500,10 +1832,6 @@ class VTraceLearner:
         liveness_gradient_delta = _parameter_gradient_delta_snapshot(
             all_model_parameters,
             gradients_before_liveness,
-        )
-        liveness_policy_gradient_norm = _parameter_gradient_delta_norm(
-            policy_head_parameters,
-            policy_gradients_before_liveness,
         )
         liveness_critic_gradient_norm = _parameter_gradient_delta_norm(
             liveness_head_parameters,
@@ -2523,36 +1851,18 @@ class VTraceLearner:
             liveness_head_calibration_active=int(
                 schedule_learner_update < self.failure_credit_config.liveness_head_calibration_updates
             ),
-            liveness_risk_actor_enabled=int(
-                schedule_learner_update >= self.failure_credit_config.liveness_risk_actor_start_update
-            ),
         )
         episodic_started_ns = time.perf_counter_ns()
-        episodic_losses = self._episodic_losses(
-            episodic_sequences,
-            current_policy_version=current_policy_version,
-        )
+        episodic_losses = self._episodic_losses(episodic_sequences)
         if episodic_sequences:
             _require_finite(
                 "episodic targets/loss",
                 (
                     ("episodic_loss", episodic_losses.total_loss),
-                    (
-                        "episodic_primary_policy_loss",
-                        episodic_losses.primary_policy_loss,
-                    ),
                     ("episodic_task_value_loss", episodic_losses.task_value_loss),
                     (
                         "episodic_revival_value_loss",
                         episodic_losses.revival_value_loss,
-                    ),
-                    (
-                        "episodic_revival_policy_loss",
-                        episodic_losses.revival_policy_loss,
-                    ),
-                    (
-                        "episodic_act_segment_policy_loss",
-                        episodic_losses.act_segment_policy_loss,
                     ),
                     (
                         "episodic_combat_hp_loss_value_loss",
@@ -2756,30 +2066,11 @@ class VTraceLearner:
             ),
             liveness_value_critic_loss=float(liveness_losses.value_critic_loss.detach().item()),
             liveness_q_critic_loss=float(liveness_losses.critic_loss.detach().item()),
-            liveness_cost_actor_loss=float(liveness_losses.risk_actor_loss.detach().item()),
-            liveness_direct_policy_loss=float(liveness_losses.direct_avoid_loss.detach().item()),
-            liveness_cycle_policy_loss=float(liveness_losses.cycle_likelihood_loss.detach().item()),
-            liveness_contrast_policy_loss=float(liveness_losses.contrast_loss.detach().item()),
-            liveness_completion_policy_loss=float(liveness_losses.completion_loss.detach().item()),
             liveness_credit_plans=len(credit_plans),
             liveness_cost_labels=liveness_critic_labels,
             liveness_value_labels=liveness_losses.value_labels,
             liveness_q_labels=liveness_losses.critic_labels,
-            liveness_cost_actor_labels=liveness_losses.risk_actor_labels,
-            liveness_direct_policy_labels=liveness_losses.direct_avoid_labels,
-            liveness_cycle_policy_labels=liveness_losses.cycle_labels,
-            liveness_contrast_policy_labels=liveness_losses.contrast_labels,
-            liveness_completion_policy_labels=(liveness_losses.completion_labels),
-            liveness_forced_actor_suppressed_labels=(liveness_losses.forced_actor_suppressed_labels),
             liveness_censored_suppressed_labels=(liveness_losses.censored_suppressed_labels),
-            liveness_policy_lag_suppressed_labels=(liveness_losses.policy_lag_suppressed_labels),
-            liveness_risk_actor_phase_suppressed_labels=(liveness_losses.risk_actor_phase_suppressed_labels),
-            liveness_risk_actor_saturation_suppressed_labels=(
-                liveness_losses.risk_actor_saturation_suppressed_labels
-            ),
-            liveness_centered_risk_mean=liveness_losses.centered_risk_mean,
-            liveness_centered_risk_max_abs=(liveness_losses.centered_risk_max_abs),
-            liveness_policy_gradient_norm=liveness_policy_gradient_norm,
             liveness_critic_gradient_norm=liveness_critic_gradient_norm,
             liveness_gradient_norm_before_clip=(liveness_gradient_norm_before_clip),
             liveness_gradient_norm_after_clip=(liveness_gradient_norm_after_clip),
@@ -2787,73 +2078,25 @@ class VTraceLearner:
             liveness_head_calibration_active=int(
                 schedule_learner_update < self.failure_credit_config.liveness_head_calibration_updates
             ),
-            liveness_risk_actor_enabled=int(
-                schedule_learner_update >= self.failure_credit_config.liveness_risk_actor_start_update
-            ),
             liveness_replayed_contexts=liveness_losses.replayed_contexts,
             liveness_replayed_steps=liveness_losses.replayed_steps,
             liveness_replayed_candidates=(liveness_losses.replayed_candidates),
             liveness_autograd_microbatches=liveness_autograd_microbatches,
             liveness_autograd_segments=liveness_losses.autograd_segments,
             episodic_loss=float(episodic_losses.total_loss.detach().item()),
-            episodic_primary_policy_loss=float(episodic_losses.primary_policy_loss.detach().item()),
             episodic_task_value_loss=float(episodic_losses.task_value_loss.detach().item()),
             episodic_revival_value_loss=float(episodic_losses.revival_value_loss.detach().item()),
-            episodic_revival_policy_loss=float(episodic_losses.revival_policy_loss.detach().item()),
-            episodic_act_segment_policy_loss=float(
-                episodic_losses.act_segment_policy_loss.detach().item()
-            ),
             episodic_combat_hp_loss_value_loss=float(
                 episodic_losses.combat_hp_loss_value_loss.detach().item()
             ),
             episodic_sequences=len(episodic_sequences),
             episodic_burn_in_steps=episodic_losses.burn_in_steps,
             episodic_learn_steps=episodic_losses.learn_steps,
-            episodic_success_policy_candidate_labels=(episodic_losses.success_policy_candidate_labels),
-            episodic_policy_labels=episodic_losses.policy_labels,
-            episodic_policy_active_sequences=(episodic_losses.policy_active_sequences),
-            episodic_failure_policy_suppressed_labels=(episodic_losses.failure_policy_suppressed_labels),
-            episodic_policy_lag_suppressed_labels=(episodic_losses.policy_lag_suppressed_labels),
-            episodic_success_trust_region_suppressed_labels=(episodic_losses.success_trust_region_suppressed_labels),
-            episodic_success_surface_exempted_labels=(
-                episodic_losses.success_surface_exempted_labels
-            ),
-            episodic_act_segment_policy_labels=(
-                episodic_losses.act_segment_policy_labels
-            ),
-            episodic_act_segment_health_gate_suppressed_labels=(
-                episodic_losses.act_segment_health_gate_suppressed_labels
-            ),
-            episodic_act_segment_healthy_acts=(
-                episodic_losses.act_segment_healthy_acts
-            ),
             episodic_task_value_labels=episodic_losses.task_value_labels,
             episodic_combat_hp_loss_value_labels=(
                 episodic_losses.combat_hp_loss_value_labels
             ),
             episodic_revival_value_labels=(episodic_losses.revival_value_labels),
-            episodic_efficiency_policy_labels=(episodic_losses.efficiency_policy_labels),
-            episodic_importance_ratio_mean=(
-                float(episodic_losses.importance_ratios.detach().mean().item())
-                if episodic_losses.importance_ratios.numel()
-                else 0.0
-            ),
-            episodic_importance_ratio_max=(
-                float(episodic_losses.importance_ratios.detach().max().item())
-                if episodic_losses.importance_ratios.numel()
-                else 0.0
-            ),
-            episodic_importance_clip_fraction=(
-                float(
-                    (episodic_losses.importance_ratios > self.episodic_config.importance_ratio_clip)
-                    .float()
-                    .mean()
-                    .item()
-                )
-                if episodic_losses.importance_ratios.numel()
-                else 0.0
-            ),
-            episodic_maximum_policy_lag=episodic_losses.maximum_policy_lag,
             timings=timings,
         )
 
@@ -2923,8 +2166,6 @@ class VTraceLearner:
     def _episodic_losses(
         self,
         sequences: tuple[ReplaySequence, ...],
-        *,
-        current_policy_version: int,
     ) -> _EpisodicLossBatch:
         """Compute episodic losses with deterministic recurrent reconstruction.
 
@@ -2944,20 +2185,15 @@ class VTraceLearner:
         was_training = self.model.training
         self.model.eval()
         try:
-            return self._episodic_losses_deterministic(
-                sequences,
-                current_policy_version=current_policy_version,
-            )
+            return self._episodic_losses_deterministic(sequences)
         finally:
             self.model.train(was_training)
 
     def _episodic_losses_deterministic(
         self,
         sequences: tuple[ReplaySequence, ...],
-        *,
-        current_policy_version: int,
     ) -> _EpisodicLossBatch:
-        """Replay complete-episode labels through one bounded GPU graph.
+        """Replay complete-episode value labels through one bounded GPU graph.
 
         The caller holds the model in evaluation mode.  Every sequence first
         reconstructs the current model's split recurrent
@@ -2967,55 +2203,31 @@ class VTraceLearner:
         cannot increase activation memory beyond
         ``len(sequences) * episodic_config.learn_steps``.
 
-        Successful-horizon selected-action replay is clipped by the factual
-        behavior probability. Failed horizons remain authoritative value
-        targets but never become blanket anti-imitation policy labels. Revival
-        cost can affect policy only for a successfully completed horizon.
-        Outside a configured, success-classified primary
-        tie band, the already-weighted cost signal is capped below the absolute
-        primary residual.  Inside that narrow band, a small nominal-primary
-        floor keeps the cost tie-break alive even when the task advantage is
-        calibrated to zero.  This implements the staged ordering ``complete
-        first, then reduce revivals`` instead of silently deleting the
-        secondary objective at primary convergence.
+        Since v20 this plane owns no policy objective: every observed horizon
+        supervises only the candidate-independent task/revival-cost value
+        heads (and the optional bounded combat HP-loss head).  Failed and
+        stale trajectories therefore remain full-strength factual value
+        targets without ever becoming imitation labels.
         """
 
         zero = next(self.model.parameters()).sum() * 0.0
-        empty_ratios = torch.empty(0, device=self.device, dtype=torch.float32)
         if not sequences:
             return _EpisodicLossBatch(
                 total_loss=zero,
-                primary_policy_loss=zero,
                 task_value_loss=zero,
                 revival_value_loss=zero,
-                revival_policy_loss=zero,
-                act_segment_policy_loss=zero,
                 combat_hp_loss_value_loss=zero,
                 burn_in_steps=0,
                 learn_steps=0,
-                success_policy_candidate_labels=0,
-                policy_labels=0,
-                policy_active_sequences=0,
-                failure_policy_suppressed_labels=0,
-                policy_lag_suppressed_labels=0,
-                success_trust_region_suppressed_labels=0,
-                success_surface_exempted_labels=0,
-                act_segment_policy_labels=0,
-                act_segment_health_gate_suppressed_labels=0,
-                act_segment_healthy_acts=0,
                 task_value_labels=0,
                 combat_hp_loss_value_labels=0,
                 revival_value_labels=0,
-                efficiency_policy_labels=0,
-                importance_ratios=empty_ratios,
-                maximum_policy_lag=0,
             )
 
         fingerprint = grounding_encoding_identity()["fingerprint_sha256"]
         hidden_rows: list[Tensor] = []
         total_burn_in_steps = 0
         total_learn_steps = 0
-        maximum_policy_lag = 0
         for sequence in sequences:
             if not sequence.exact_recurrent_reconstruction:
                 raise ValueError("episodic replay sequence is not an exact reconstruction")
@@ -3040,11 +2252,6 @@ class VTraceLearner:
             hidden_rows.append(hidden[0].detach())
             total_burn_in_steps += len(sequence.burn_in)
             total_learn_steps += len(sequence.learn_steps)
-            for step in sequence.learn_steps:
-                lag = current_policy_version - step.decision.policy_version
-                if lag < 0:
-                    raise ValueError("episodic behavior policy version is newer than the learner")
-                maximum_policy_lag = max(maximum_policy_lag, lag)
 
         hidden = torch.stack(hidden_rows, dim=0)
         maximum_time = max(len(sequence.learn_steps) for sequence in sequences)
@@ -3054,21 +2261,6 @@ class VTraceLearner:
         revival_targets: list[float] = []
         combat_hp_loss_predictions: list[Tensor] = []
         combat_hp_loss_targets: list[float] = []
-        primary_policy_terms: list[Tensor] = []
-        act_segment_policy_terms: list[Tensor] = []
-        revival_policy_terms: list[Tensor] = []
-        combined_policy_terms: list[Tensor] = []
-        importance_ratios: list[Tensor] = []
-        success_policy_candidate_labels = 0
-        policy_active_sequence_indexes: set[int] = set()
-        efficiency_policy_labels = 0
-        failure_policy_suppressed_labels = 0
-        policy_lag_suppressed_labels = 0
-        success_trust_region_suppressed_labels = 0
-        success_surface_exempted_labels = 0
-        act_segment_policy_labels = 0
-        act_segment_health_gate_suppressed_labels = 0
-        healthy_act_keys: set[tuple[str, int]] = set()
 
         for time_index in range(maximum_time):
             active = [index for index, sequence in enumerate(sequences) if time_index < len(sequence.learn_steps)]
@@ -3087,12 +2279,8 @@ class VTraceLearner:
                 validate=False,
             )
             hidden = hidden.index_copy(0, active_tensor, output.recurrent_state)
-            log_policy = output.policy_log_probabilities()
 
             for row, step in enumerate(active_steps):
-                decision = step.decision
-                action_index = decision.action_index
-                selected_log_probability = log_policy[row, action_index]
                 horizons = self._horizon_outputs(
                     output,
                     row,
@@ -3134,194 +2322,6 @@ class VTraceLearner:
                             )
                         )
 
-                if not decision.policy_decision:
-                    continue
-                primary = next(
-                    (item for item in reversed(horizons) if item[1].observed),
-                    None,
-                )
-                if primary is None:
-                    continue
-                primary_horizon, primary_target, primary_prediction, _ = primary
-                act_segment_imitation = False
-                policy_weight = self.episodic_config.primary_policy_weight
-                if (
-                    primary_target.success is not True
-                    and self.episodic_config.act_segment_imitation_enabled
-                    and step.run.observed
-                    and step.run.success is False
-                    and step.act.observed
-                    and step.act.success is True
-                ):
-                    act_health = healthy_act_segment_for_step(
-                        step,
-                        sequences[active[row]].act_segment_health,
-                        minimum_exit_hp_ratio=(
-                            self.episodic_config.act_segment_min_exit_hp_ratio
-                        ),
-                        maximum_revival_fraction=(
-                            self.episodic_config.act_segment_max_revival_fraction
-                        ),
-                    )
-                    if act_health is True:
-                        act_item = next(
-                            item for item in horizons if item[0] == "act"
-                        )
-                        primary_horizon, primary_target, primary_prediction, _ = (
-                            act_item
-                        )
-                        act_segment_imitation = True
-                        policy_weight = (
-                            self.episodic_config.primary_policy_weight
-                            * self.episodic_config.act_segment_policy_weight
-                        )
-                        healthy_act_keys.add(
-                            (sequences[active[row]].episode_id, decision.act)
-                        )
-                    else:
-                        act_segment_health_gate_suppressed_labels += 1
-                if primary_target.success is not True:
-                    # A failed long horizon is authoritative evidence for the
-                    # task-value heads, but it is not a counterfactual action
-                    # label. Applying a negative selected-action likelihood
-                    # update to every decision in a long failed run performs
-                    # anti-imitation of the entire factual trajectory. With a
-                    # hierarchical policy this systematically suppresses the
-                    # frequently sampled, many-candidate branches and leaks
-                    # probability into unsampled singleton branches (for
-                    # example END_TURN). FIFO V-trace and bounded factual
-                    # transaction failures still provide local policy
-                    # gradients; complete-episode replay reinforces policy
-                    # only after an observed successful horizon.
-                    failure_policy_suppressed_labels += 1
-                    continue
-                success_policy_candidate_labels += 1
-                if (
-                    decision.decision_surface
-                    in self.episodic_config.success_imitation_exempt_surfaces
-                ):
-                    # The complete successful trajectory still supervises all
-                    # horizon value heads above.  Only repeated selected-action
-                    # imitation is disabled on explicitly reviewed sparse
-                    # strategic surfaces; online V-trace and factual SMDP-Q
-                    # retain contextual preference learning there.
-                    success_surface_exempted_labels += 1
-                    continue
-                policy_lag = current_policy_version - decision.policy_version
-                if policy_lag > self.episodic_config.policy_gradient_max_lag:
-                    # Complete episodes remain authoritative long-horizon value
-                    # supervision after their successful behavior policy becomes
-                    # stale. They must not, however, keep applying selected-action
-                    # likelihood gradients to a policy hundreds of updates newer
-                    # than the one that generated those decisions. Failed primary
-                    # horizons are classified above and never pollute this counter.
-                    policy_lag_suppressed_labels += 1
-                    continue
-                raw_ratio = torch.exp(
-                    (selected_log_probability - float(decision.behavior_log_probability)).clamp(-20.0, 20.0)
-                )
-                # Importance sampling corrects the factual behavior/current
-                # distribution mismatch; it is not itself a differentiable
-                # policy objective.  Letting gradients flow through rho would
-                # add a ``rho * log(pi)`` product-rule term and can reverse a
-                # positive-advantage update whenever ``log(pi) < -1``.
-                detached_ratio = raw_ratio.detach()
-                importance_ratios.append(detached_ratio)
-                clipped_ratio = detached_ratio.clamp(max=self.episodic_config.importance_ratio_clip)
-                primary_advantage = (
-                    primary_prediction.new_tensor(
-                        self._episodic_task_target(
-                            primary_horizon,
-                            primary_target,
-                            run_target=step.run,
-                        )
-                    )
-                    - primary_prediction
-                )
-                if bool(
-                    (
-                        (primary_advantage.detach() > 0.0)
-                        & (detached_ratio > 1.0 + self.episodic_config.success_policy_trust_region_epsilon)
-                    ).item()
-                ):
-                    # The selected successful action is already materially
-                    # more likely than under its factual behavior policy.
-                    # Preserve value supervision and importance telemetry, but
-                    # stop the positive imitation gradient instead of applying
-                    # an indefinitely repeated sharpening pressure.
-                    success_trust_region_suppressed_labels += 1
-                    continue
-                policy_active_sequence_indexes.add(active[row])
-                primary_signal = policy_weight * primary_advantage.detach()
-                raw_policy_term = (
-                    -clipped_ratio
-                    * selected_log_probability
-                    * primary_advantage.detach()
-                )
-                primary_policy_terms.append(raw_policy_term)
-                if act_segment_imitation:
-                    act_segment_policy_terms.append(
-                        policy_weight * raw_policy_term
-                    )
-                    act_segment_policy_labels += 1
-
-                secondary_signal = primary_signal.new_zeros(())
-                efficiency = (
-                    None
-                    if act_segment_imitation
-                    else next(
-                        (
-                            item
-                            for item in reversed(horizons)
-                            if item[1].efficiency_eligible
-                        ),
-                        None,
-                    )
-                )
-                if efficiency is not None:
-                    _, efficiency_target, _, cost_prediction = efficiency
-                    if efficiency_target.future_revivals is None:  # pragma: no cover
-                        raise RuntimeError("successful horizon has no revival target")
-                    cost_advantage = (
-                        cost_prediction.new_tensor(float(efficiency_target.future_revivals)) - cost_prediction
-                    )
-                    raw_secondary_signal = self.episodic_config.revival_policy_weight * cost_advantage.detach()
-                    # A pure ``fraction * abs(primary_advantage)`` cap makes
-                    # the revival objective exactly zero once the task value
-                    # is calibrated.  That prevents successful 0-revival and
-                    # 100-revival paths from ever becoming distinguishable at
-                    # the point where primary outcomes tie.
-                    #
-                    # Before the state value is on the successful side of the
-                    # signed task target, or while its residual lies outside
-                    # the explicit tie tolerance, retain the strict
-                    # residual-relative cap.  Only inside that narrow success
-                    # tie stratum admit a fraction of one nominal primary
-                    # policy unit. Failure/censored horizons never enter this
-                    # branch at all.
-                    primary_tie = (
-                        (primary_prediction.detach() > 0.0)
-                        & (primary_advantage.detach().abs() <= self.episodic_config.primary_success_tie_tolerance)
-                    ).to(dtype=primary_signal.dtype)
-                    success_tie_floor = (
-                        primary_signal.new_tensor(self.episodic_config.primary_policy_weight) * primary_tie
-                    )
-                    protected_primary_scale = torch.maximum(
-                        primary_signal.abs(),
-                        success_tie_floor,
-                    )
-                    secondary_limit = self.episodic_config.secondary_advantage_fraction * protected_primary_scale
-                    secondary_signal = torch.maximum(
-                        torch.minimum(raw_secondary_signal, secondary_limit),
-                        -secondary_limit,
-                    )
-                    revival_policy_terms.append(clipped_ratio * selected_log_probability * secondary_signal)
-                    efficiency_policy_labels += 1
-
-                combined_policy_terms.append(
-                    -clipped_ratio * selected_log_probability * (primary_signal - secondary_signal)
-                )
-
         task_value_loss = (
             F.smooth_l1_loss(
                 torch.stack(task_predictions).float(),
@@ -3333,7 +2333,7 @@ class VTraceLearner:
         # Revival counts have an extremely long tail under unlimited native
         # revival.  Regressing raw counts makes this auxiliary value head
         # numerically dominate the complete-episode objective even though its
-        # policy advantage is already secondary.  A log1p observation model
+        # cost signal is secondary.  A log1p observation model
         # keeps zero exact, remains monotone over factual counts, and prevents
         # a 100-revival path from contributing roughly 100x the representation
         # gradient of a one-revival path.
@@ -3363,50 +2363,22 @@ class VTraceLearner:
             if combat_hp_loss_predictions
             else zero
         )
-        primary_policy_loss = torch.stack(primary_policy_terms).mean() if primary_policy_terms else zero
-        revival_policy_loss = torch.stack(revival_policy_terms).mean() if revival_policy_terms else zero
-        act_segment_policy_loss = (
-            torch.stack(act_segment_policy_terms).mean()
-            if act_segment_policy_terms
-            else zero
-        )
-        combined_policy_loss = torch.stack(combined_policy_terms).mean() if combined_policy_terms else zero
         total_loss = (
-            combined_policy_loss
-            + self.episodic_config.task_value_weight * task_value_loss
+            self.episodic_config.task_value_weight * task_value_loss
             + self.episodic_config.revival_value_weight * revival_value_loss
             + self.episodic_config.combat_hp_loss_value_weight
             * combat_hp_loss_value_loss
         )
-        ratio_tensor = torch.stack(importance_ratios).float() if importance_ratios else empty_ratios
         return _EpisodicLossBatch(
             total_loss=total_loss,
-            primary_policy_loss=primary_policy_loss,
             task_value_loss=task_value_loss,
             revival_value_loss=revival_value_loss,
-            revival_policy_loss=revival_policy_loss,
-            act_segment_policy_loss=act_segment_policy_loss,
             combat_hp_loss_value_loss=combat_hp_loss_value_loss,
             burn_in_steps=total_burn_in_steps,
             learn_steps=total_learn_steps,
-            success_policy_candidate_labels=success_policy_candidate_labels,
-            policy_labels=len(primary_policy_terms),
-            policy_active_sequences=len(policy_active_sequence_indexes),
-            failure_policy_suppressed_labels=failure_policy_suppressed_labels,
-            policy_lag_suppressed_labels=policy_lag_suppressed_labels,
-            success_trust_region_suppressed_labels=(success_trust_region_suppressed_labels),
-            success_surface_exempted_labels=success_surface_exempted_labels,
-            act_segment_policy_labels=act_segment_policy_labels,
-            act_segment_health_gate_suppressed_labels=(
-                act_segment_health_gate_suppressed_labels
-            ),
-            act_segment_healthy_acts=len(healthy_act_keys),
             task_value_labels=len(task_predictions),
             combat_hp_loss_value_labels=len(combat_hp_loss_predictions),
             revival_value_labels=len(revival_predictions),
-            efficiency_policy_labels=efficiency_policy_labels,
-            importance_ratios=ratio_tensor,
-            maximum_policy_lag=maximum_policy_lag,
         )
 
     def _transaction_losses(
@@ -4115,7 +3087,6 @@ __all__ = [
     "LearnerMetrics",
     "LearnerTimings",
     "LivenessCreditLosses",
-    "LivenessGroupLabel",
     "LivenessLabelManifest",
     "LivenessLabelRow",
     "LivenessReplayWork",

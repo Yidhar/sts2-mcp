@@ -1,4 +1,9 @@
-"""Immutable, pre-indexed evidence corpus for failure-credit v5."""
+"""Immutable, pre-indexed evidence corpus for failure-credit v6.
+
+v6 retires the actor-freshness sampling layer: every stratum quota is now a
+plain critic evidence-diversity minimum satisfied by any live record in that
+stratum, and the corpus keeps no per-stratum actor-eligibility accounting.
+"""
 
 from __future__ import annotations
 
@@ -9,11 +14,6 @@ from typing import Final
 
 import numpy as np
 
-from .actor_eligibility import (
-    ACTOR_CREDIT_STRATA,
-    actor_policy_versions,
-    plan_has_effective_actor_unit,
-)
 from .contracts import (
     FAILURE_CREDIT_SCHEMA_VERSION,
     CreditPlan,
@@ -25,8 +25,7 @@ from .contracts import (
     SemanticKey,
 )
 
-FAILURE_EVIDENCE_REPLAY_VERSION: Final = "sts2-failure-evidence-replay-v5"
-ACTOR_QUOTA_STRATA: Final = ACTOR_CREDIT_STRATA
+FAILURE_EVIDENCE_REPLAY_VERSION: Final = "sts2-failure-evidence-replay-v6"
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,21 +66,12 @@ class StratumQuota:
 
 @dataclass(frozen=True, slots=True)
 class StratumQuotaStatus:
-    """One quota's total, actor-fresh, and critic-only selection evidence.
-
-    For actor-credit strata, only ``selected_actor_fresh`` satisfies the
-    requested minimum.  ``selected_stale_critic`` remains legal batch content
-    for factual value/Q learning but cannot erase an actor-credit deficit.
-    Non-actor strata mirror their ordinary eligible totals into the
-    ``*_actor_fresh`` fields so the same deficit equation remains explicit.
-    """
+    """One quota's availability, selection and deficit evidence."""
 
     stratum: EvidenceStratum
     requested: int
-    available_total: int
-    available_actor_fresh: int
-    selected_actor_fresh: int
-    selected_stale_critic: int
+    available: int
+    selected: int
     deficit: int
 
     def __post_init__(self) -> None:
@@ -89,39 +79,18 @@ class StratumQuotaStatus:
             raise TypeError("quota status stratum has the wrong type")
         for label, value in (
             ("requested", self.requested),
-            ("available_total", self.available_total),
-            ("available_actor_fresh", self.available_actor_fresh),
-            ("selected_actor_fresh", self.selected_actor_fresh),
-            ("selected_stale_critic", self.selected_stale_critic),
+            ("available", self.available),
+            ("selected", self.selected),
             ("deficit", self.deficit),
         ):
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(f"quota status {label} must be an integer")
             if value < 0:
                 raise ValueError(f"quota status {label} must be non-negative")
-        if self.available_actor_fresh > self.available_total:
-            raise ValueError("fresh quota availability exceeds total availability")
-        if self.selected_actor_fresh > self.available_actor_fresh:
-            raise ValueError("fresh quota selection exceeds fresh availability")
-        if self.selected_actor_fresh + self.selected_stale_critic > self.available_total:
+        if self.selected > self.available:
             raise ValueError("quota selected count exceeds total availability")
-        if self.deficit != max(
-            0,
-            self.requested - self.selected_actor_fresh,
-        ):
+        if self.deficit != max(0, self.requested - self.selected):
             raise ValueError("quota deficit is inconsistent")
-
-    @property
-    def available(self) -> int:
-        """Compatibility spelling for total critic-eligible availability."""
-
-        return self.available_total
-
-    @property
-    def selected(self) -> int:
-        """Compatibility spelling for every selected record in the stratum."""
-
-        return self.selected_actor_fresh + self.selected_stale_critic
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,10 +133,6 @@ class StratumCount:
 class EvidenceCorpusMetrics:
     record_count: int
     storage_nbytes: int
-    actor_actionable_records: int
-    direct_actor_eligible_records: int
-    multi_edge_actor_eligible_records: int
-    risk_actor_eligible_records: int
     outcome_pair_count: int
     stratum_counts: tuple[StratumCount, ...]
 
@@ -175,19 +140,6 @@ class EvidenceCorpusMetrics:
         for label, value in (
             ("record_count", self.record_count),
             ("storage_nbytes", self.storage_nbytes),
-            ("actor_actionable_records", self.actor_actionable_records),
-            (
-                "direct_actor_eligible_records",
-                self.direct_actor_eligible_records,
-            ),
-            (
-                "multi_edge_actor_eligible_records",
-                self.multi_edge_actor_eligible_records,
-            ),
-            (
-                "risk_actor_eligible_records",
-                self.risk_actor_eligible_records,
-            ),
             ("outcome_pair_count", self.outcome_pair_count),
         ):
             if isinstance(value, bool) or not isinstance(value, int):
@@ -278,8 +230,10 @@ def evidence_record_storage_nbytes(record: EvidenceRecord) -> int:
 
     pair_metadata_nbytes = 0
     seen_pair_ids: set[str] = set()
-    for target in record.plan.contrast_policy_targets:
-        pair = target.pair
+    for witness in incident.witnesses:
+        pair = witness.outcome_pair
+        if pair is None:
+            continue
         retain_context(pair.better.context)
         retain_context(pair.worse.context)
         if pair.pair_id not in seen_pair_ids:
@@ -309,10 +263,6 @@ def evidence_record_storage_nbytes(record: EvidenceRecord) -> int:
         + len(record.plan.task_q_targets)
         + len(record.plan.liveness_value_targets)
         + len(record.plan.liveness_q_targets)
-        + len(record.plan.direct_policy_targets)
-        + len(record.plan.cycle_policy_targets)
-        + len(record.plan.contrast_policy_targets)
-        + len(record.plan.risk_sequences)
         + len(incident.witnesses)
     )
     total += sum(
@@ -332,44 +282,6 @@ def evidence_record_storage_nbytes(record: EvidenceRecord) -> int:
         )
     )
     return total
-
-
-def evidence_actor_policy_versions(
-    record: EvidenceRecord,
-    stratum: EvidenceStratum,
-) -> tuple[int, ...]:
-    """Return factual behavior versions for one actor-credit channel.
-
-    This function intentionally follows compiled target indices instead of
-    incident-level provenance.  Contexts may cross an actor publication
-    boundary, and the learner suppresses stale policy labels per factual
-    decision.  Forced steps never make a record actor-eligible.
-    """
-
-    if not isinstance(record, EvidenceRecord):
-        raise TypeError("record must be EvidenceRecord")
-    if not isinstance(stratum, EvidenceStratum):
-        raise TypeError("stratum must be EvidenceStratum")
-    return actor_policy_versions(record.plan, stratum)
-
-
-def evidence_actor_is_fresh(
-    record: EvidenceRecord,
-    stratum: EvidenceStratum,
-    *,
-    current_policy_version: int,
-    policy_gradient_max_lag: int,
-    risk_actor_enabled: bool,
-) -> bool:
-    """Return whether a stratum offers an effective learner-fresh actor unit."""
-
-    return plan_has_effective_actor_unit(
-        record.plan,
-        stratum,
-        current_policy_version=current_policy_version,
-        policy_gradient_max_lag=policy_gradient_max_lag,
-        risk_actor_enabled=risk_actor_enabled,
-    )
 
 
 def _pair_signature(pair: MatchedOutcomePair) -> tuple[object, ...]:
@@ -427,8 +339,10 @@ class ImmutableEvidenceCorpus:
             by_incident[incident_id] = record
             for stratum in record.plan.strata:
                 strata[stratum].append(incident_id)
-            for target in record.plan.contrast_policy_targets:
-                pair = target.pair
+            for witness in record.incident.witnesses:
+                pair = witness.outcome_pair
+                if pair is None:
+                    continue
                 signature = _pair_signature(pair)
                 prior_signature = pair_signatures.get(pair.pair_id)
                 if prior_signature is not None and prior_signature != signature:
@@ -484,31 +398,12 @@ class ImmutableEvidenceCorpus:
         self,
         quotas: tuple[StratumQuota, ...],
         *,
-        risk_actor_enabled: bool,
         selected_incident_ids: tuple[str, ...] = (),
-        current_policy_version: int | None = None,
-        policy_gradient_max_lag: int | None = None,
     ) -> QuotaDiagnostics:
         if not isinstance(quotas, tuple) or not all(isinstance(quota, StratumQuota) for quota in quotas):
             raise TypeError("quotas must be a tuple of StratumQuota")
-        if not isinstance(risk_actor_enabled, bool):
-            raise TypeError("risk_actor_enabled must be a boolean")
         if len({quota.stratum for quota in quotas}) != len(quotas):
             raise ValueError("quotas contain duplicate strata")
-        if current_policy_version is None and policy_gradient_max_lag is None:
-            # Stand-alone diagnostics remain useful before a learner version
-            # is known, but must not claim any actor quota is satisfiable.
-            # ``sample`` performs the stricter check before selection.
-            actor_fresh: Mapping[EvidenceStratum, tuple[str, ...]] = MappingProxyType(
-                {stratum: () for stratum in ACTOR_QUOTA_STRATA}
-            )
-        else:
-            actor_fresh = self._actor_fresh_incident_ids(
-                quotas=quotas,
-                current_policy_version=current_policy_version,
-                policy_gradient_max_lag=policy_gradient_max_lag,
-                risk_actor_enabled=risk_actor_enabled,
-            )
         if not isinstance(selected_incident_ids, tuple) or not all(
             isinstance(incident_id, str) for incident_id in selected_incident_ids
         ):
@@ -521,78 +416,16 @@ class ImmutableEvidenceCorpus:
         for quota in quotas:
             available_ids = set(self._stratum_index[quota.stratum])
             selected_ids = available_ids.intersection(selected_set)
-            if quota.stratum in ACTOR_QUOTA_STRATA:
-                fresh_ids = set(actor_fresh[quota.stratum])
-                selected_fresh = len(selected_ids.intersection(fresh_ids))
-                selected_stale = len(selected_ids.difference(fresh_ids))
-                available_fresh = len(fresh_ids)
-            else:
-                available_fresh = len(available_ids)
-                selected_fresh = len(selected_ids)
-                selected_stale = 0
             statuses.append(
                 StratumQuotaStatus(
                     stratum=quota.stratum,
                     requested=quota.minimum,
-                    available_total=len(available_ids),
-                    available_actor_fresh=available_fresh,
-                    selected_actor_fresh=selected_fresh,
-                    selected_stale_critic=selected_stale,
-                    deficit=max(0, quota.minimum - selected_fresh),
+                    available=len(available_ids),
+                    selected=len(selected_ids),
+                    deficit=max(0, quota.minimum - len(selected_ids)),
                 )
             )
         return QuotaDiagnostics(statuses=tuple(statuses))
-
-    def _actor_fresh_incident_ids(
-        self,
-        *,
-        quotas: tuple[StratumQuota, ...],
-        current_policy_version: int | None,
-        policy_gradient_max_lag: int | None,
-        risk_actor_enabled: bool,
-    ) -> Mapping[EvidenceStratum, tuple[str, ...]]:
-        """Build actor-fresh indexes for one immutable sampling operation."""
-
-        if not isinstance(risk_actor_enabled, bool):
-            raise TypeError("risk_actor_enabled must be a boolean")
-        if (current_policy_version is None) != (policy_gradient_max_lag is None):
-            raise ValueError("current_policy_version and policy_gradient_max_lag must be supplied together")
-        requires_actor_freshness = any(quota.minimum > 0 and quota.stratum in ACTOR_QUOTA_STRATA for quota in quotas)
-        if current_policy_version is None:
-            if requires_actor_freshness:
-                raise ValueError("actor evidence quotas require policy freshness parameters")
-            return MappingProxyType({stratum: () for stratum in ACTOR_QUOTA_STRATA})
-        if (
-            isinstance(current_policy_version, bool)
-            or not isinstance(current_policy_version, int)
-            or current_policy_version < 0
-        ):
-            raise ValueError("current_policy_version must be a non-negative integer")
-        if (
-            isinstance(policy_gradient_max_lag, bool)
-            or not isinstance(policy_gradient_max_lag, int)
-            or policy_gradient_max_lag < 0
-        ):
-            raise ValueError("policy_gradient_max_lag must be a non-negative integer")
-        for record in self.records:
-            if record.plan.provenance.policy_version > current_policy_version:
-                raise ValueError("failure evidence provenance is newer than the learner")
-        return MappingProxyType(
-            {
-                stratum: tuple(
-                    incident_id
-                    for incident_id in self._stratum_index[stratum]
-                    if evidence_actor_is_fresh(
-                        self._record_by_incident[incident_id],
-                        stratum,
-                        current_policy_version=current_policy_version,
-                        policy_gradient_max_lag=policy_gradient_max_lag,
-                        risk_actor_enabled=risk_actor_enabled,
-                    )
-                )
-                for stratum in ACTOR_QUOTA_STRATA
-            }
-        )
 
     @property
     def storage_nbytes(self) -> int:
@@ -601,49 +434,9 @@ class ImmutableEvidenceCorpus:
         return 256 + sum(evidence_record_storage_nbytes(record) for record in self.records)
 
     def metrics(self) -> EvidenceCorpusMetrics:
-        direct_actor_eligible = sum(
-            bool(
-                evidence_actor_policy_versions(
-                    record,
-                    EvidenceStratum.DIRECT_WITNESS,
-                )
-            )
-            for record in self.records
-        )
-        multi_edge_actor_eligible = sum(
-            bool(
-                evidence_actor_policy_versions(
-                    record,
-                    EvidenceStratum.MULTI_EDGE_CYCLE,
-                )
-            )
-            for record in self.records
-        )
-        risk_actor_eligible = sum(
-            bool(
-                evidence_actor_policy_versions(
-                    record,
-                    EvidenceStratum.RISK_SEQUENCE,
-                )
-            )
-            for record in self.records
-        )
         return EvidenceCorpusMetrics(
             record_count=len(self.records),
             storage_nbytes=self.storage_nbytes,
-            actor_actionable_records=sum(
-                record.plan.actor_label_count > 0
-                or bool(
-                    evidence_actor_policy_versions(
-                        record,
-                        EvidenceStratum.RISK_SEQUENCE,
-                    )
-                )
-                for record in self.records
-            ),
-            direct_actor_eligible_records=direct_actor_eligible,
-            multi_edge_actor_eligible_records=multi_edge_actor_eligible,
-            risk_actor_eligible_records=risk_actor_eligible,
             outcome_pair_count=len(self._outcome_pairs),
             stratum_counts=tuple(
                 StratumCount(
@@ -659,10 +452,8 @@ class ImmutableEvidenceCorpus:
         *,
         batch_size: int,
         rng: np.random.Generator,
-        risk_actor_enabled: bool,
         quotas: tuple[StratumQuota, ...] = (),
         current_policy_version: int | None = None,
-        policy_gradient_max_lag: int | None = None,
     ) -> EvidenceSample:
         """Sample without locks or corpus mutation; caller checkpoints ``rng``."""
 
@@ -678,21 +469,21 @@ class ImmutableEvidenceCorpus:
             raise ValueError("quotas contain duplicate strata")
         if sum(quota.minimum for quota in quotas) > batch_size:
             raise ValueError("quota minima exceed the requested batch size")
-        actor_fresh = self._actor_fresh_incident_ids(
-            quotas=quotas,
-            current_policy_version=current_policy_version,
-            policy_gradient_max_lag=policy_gradient_max_lag,
-            risk_actor_enabled=risk_actor_enabled,
-        )
+        if current_policy_version is not None:
+            if (
+                isinstance(current_policy_version, bool)
+                or not isinstance(current_policy_version, int)
+                or current_policy_version < 0
+            ):
+                raise ValueError("current_policy_version must be a non-negative integer")
+            for record in self.records:
+                if record.plan.provenance.policy_version > current_policy_version:
+                    raise ValueError("failure evidence provenance is newer than the learner")
         target_size = min(batch_size, len(self.records))
         selected: list[str] = []
         selected_set: set[str] = set()
         for quota in quotas:
-            eligible_ids = (
-                actor_fresh[quota.stratum]
-                if quota.stratum in ACTOR_QUOTA_STRATA
-                else self._stratum_index[quota.stratum]
-            )
+            eligible_ids = self._stratum_index[quota.stratum]
             already_selected = sum(incident_id in selected_set for incident_id in eligible_ids)
             needed = max(0, quota.minimum - already_selected)
             candidates = [incident_id for incident_id in eligible_ids if incident_id not in selected_set]
@@ -716,9 +507,6 @@ class ImmutableEvidenceCorpus:
             quota_diagnostics=self.quota_diagnostics(
                 quotas,
                 selected_incident_ids=selected_ids,
-                current_policy_version=current_policy_version,
-                policy_gradient_max_lag=policy_gradient_max_lag,
-                risk_actor_enabled=risk_actor_enabled,
             ),
         )
 
@@ -754,7 +542,6 @@ class ImmutableEvidenceCorpus:
 
 
 __all__ = [
-    "ACTOR_QUOTA_STRATA",
     "FAILURE_EVIDENCE_REPLAY_VERSION",
     "EvidenceCorpusMetrics",
     "EvidenceRecord",
@@ -764,7 +551,5 @@ __all__ = [
     "StratumCount",
     "StratumQuota",
     "StratumQuotaStatus",
-    "evidence_actor_is_fresh",
-    "evidence_actor_policy_versions",
     "evidence_record_storage_nbytes",
 ]

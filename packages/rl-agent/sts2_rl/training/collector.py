@@ -45,7 +45,6 @@ from sts2_rl.models import (
 )
 
 from .episode_replay import (
-    ActSegmentHealth,
     BoundaryOutcome,
     CompletedEpisode,
     EpisodeCompletion,
@@ -1028,35 +1027,6 @@ def _player_hp(observation: Mapping[str, object]) -> float:
     raise CollectionProtocolError(
         "authoritative transaction effect receipt has no finite player HP"
     )
-
-
-def _act_exit_hp_ratio(
-    *,
-    before_observation: Mapping[str, object],
-    after_observation: Mapping[str, object],
-    authoritative_run_result: str | None,
-) -> float:
-    """Read the factual HP ratio at an authoritative Act-success boundary.
-
-    Ordinary Act transitions retain a player receipt in the post-action
-    observation, so that receipt remains authoritative.  A typed run victory
-    is different: the simulator is allowed to return a sparse terminal
-    observation after the final proceed action.  In that one case the last
-    pre-terminal observation is the final player receipt for the completed
-    Act.  Do not turn this into a general fallback; a missing or malformed
-    player receipt on a non-terminal Act transition remains a protocol error.
-    """
-
-    raw_after_player = after_observation.get("player")
-    after_player = raw_after_player if isinstance(raw_after_player, Mapping) else {}
-    has_after_player_receipt = bool(
-        {"hp", "current_hp", "max_hp", "maximum_hp"}.intersection(after_player)
-    )
-    if has_after_player_receipt:
-        return _player_hp_ratio(after_observation)
-    if authoritative_run_result == "victory":
-        return _player_hp_ratio(before_observation)
-    return _player_hp_ratio(after_observation)
 
 
 def _hp_band(observation: Mapping[str, object]) -> str:
@@ -4008,7 +3978,6 @@ class GroundedCollector:
             active_combat_id = f"combat:{next_combat_identity}"
             next_combat_identity += 1
         act_boundary_efficiency: dict[int, tuple[int, float]] = {}
-        act_segment_health: dict[int, ActSegmentHealth] = {}
 
         for step_offset in range(episode_limit):
             if state.terminated or state.truncated:
@@ -4637,28 +4606,6 @@ class GroundedCollector:
                             completed_act,
                             (revivals_used, player_hp_lost),
                         )
-                        if completed_act == pre_action_act:
-                            configured_budget = self.training_revival_budget
-                            effective_budget = (
-                                configured_budget
-                                if configured_budget is not None
-                                and configured_budget > 0
-                                else 64
-                            )
-                            act_segment_health.setdefault(
-                                completed_act,
-                                ActSegmentHealth(
-                                    act=completed_act,
-                                    boundary_step_index=len(episodic_steps),
-                                    exit_hp_ratio=_act_exit_hp_ratio(
-                                        before_observation=state.observation,
-                                        after_observation=next_state.observation,
-                                        authoritative_run_result=authoritative_run_result,
-                                    ),
-                                    cumulative_revivals=revivals_used,
-                                    revival_budget=effective_budget,
-                                ),
-                            )
             if (
                 combat_boundary is BoundaryOutcome.SUCCEEDED
                 and pre_action_act >= 1
@@ -5468,9 +5415,6 @@ class GroundedCollector:
                 episode_id=f"seed-{reset_seed}:{state.episode_id}",
                 steps=tuple(episodic_steps),
                 completion=completion,
-                act_segment_health=tuple(
-                    act_segment_health[act] for act in sorted(act_segment_health)
-                ),
                 data_partition="training",
             )
         failure_credit_records: tuple[EvidenceRecord, ...] = ()

@@ -31,17 +31,15 @@ def _v10_payload() -> dict[str, Any]:
         del transaction_learning[key]
     episodic = payload["episodic_learning"]
     assert isinstance(episodic, dict)
-    del episodic["fresh_policy_sequences"]
-    del episodic["success_imitation_exempt_surfaces"]
     for key in (
-        "act_segment_imitation_enabled",
-        "act_segment_policy_weight",
-        "act_segment_min_exit_hp_ratio",
-        "act_segment_max_revival_fraction",
         "combat_hp_loss_value_weight",
         "combat_hp_loss_reference",
     ):
         del episodic[key]
+    # A real v10 payload spelled out the retired imitation weights that
+    # config v20 deleted; the reviewed migration must strip them.
+    episodic["primary_policy_weight"] = 0.25
+    episodic["revival_policy_weight"] = 0.05
     runtime = payload["runtime"]
     assert isinstance(runtime, dict)
     del runtime["evaluation_guard_enforcement_start_steps"]
@@ -63,13 +61,17 @@ def test_checkpoint_evaluation_interprets_v10_as_disabled_model_only_view(
     config = checkpoint_evaluation_module.checkpoint_training_config("source")
 
     assert config.version == CONFIG_VERSION
-    assert config.episodic_learning.fresh_policy_sequences == 0
+    config_episodic = config.to_mapping()["episodic_learning"]
+    assert isinstance(config_episodic, dict)
+    assert "primary_policy_weight" not in config_episodic
+    assert "revival_policy_weight" not in config_episodic
+    assert "fresh_policy_sequences" not in config_episodic
 
 
-def test_checkpoint_evaluation_rejects_impossible_v10_fresh_field(
+def test_checkpoint_evaluation_rejects_retired_field_in_current_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    payload = _v10_payload()
+    payload = TrainingConfig().to_mapping()
     episodic = payload["episodic_learning"]
     assert isinstance(episodic, dict)
     episodic["fresh_policy_sequences"] = 1
@@ -81,5 +83,5 @@ def test_checkpoint_evaluation_rejects_impossible_v10_fresh_field(
         ),
     )
 
-    with pytest.raises(ValueError, match="unexpectedly contains"):
+    with pytest.raises(ValueError, match="unknown episodic_learning config keys"):
         checkpoint_evaluation_module.checkpoint_training_config("source")

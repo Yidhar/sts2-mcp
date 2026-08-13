@@ -1,15 +1,5 @@
 """Evidence-carrying failure/deadlock credit subsystem."""
 
-from .actor_eligibility import (
-    ACTOR_CREDIT_STRATA,
-    actor_policy_versions,
-    actor_step_is_fresh,
-    contrast_actor_unit_effective,
-    cycle_actor_unit_effective,
-    direct_actor_unit_effective,
-    plan_has_effective_actor_unit,
-    risk_actor_row_effective,
-)
 from .compiler import (
     CreditCompilationError,
     CreditCompiler,
@@ -18,12 +8,8 @@ from .compiler import (
 from .contracts import (
     FAILURE_CREDIT_COMPILER_VERSION,
     FAILURE_CREDIT_SCHEMA_VERSION,
-    ContrastPolicyCredit,
     CreditPlan,
     CreditProvenance,
-    CyclePolicyCredit,
-    DirectPolicyCredit,
-    DirectPolicyTarget,
     EvidenceStratum,
     FailureIncident,
     FailureOutcome,
@@ -34,14 +20,12 @@ from .contracts import (
     MatchedOutcomePair,
     OutcomeArm,
     PolicyWitness,
-    RiskSequenceCredit,
     ScalarCredit,
     SemanticKey,
     TargetAuthority,
     WitnessKind,
 )
 from .corpus import (
-    ACTOR_QUOTA_STRATA,
     FAILURE_EVIDENCE_REPLAY_VERSION,
     EvidenceCorpusMetrics,
     EvidenceRecord,
@@ -51,8 +35,6 @@ from .corpus import (
     StratumCount,
     StratumQuota,
     StratumQuotaStatus,
-    evidence_actor_is_fresh,
-    evidence_actor_policy_versions,
     evidence_record_storage_nbytes,
 )
 from .matcher import (
@@ -71,8 +53,6 @@ from .pipeline import (
 from .replay import BoundedFailureCreditReplay
 
 __all__ = [
-    "ACTOR_CREDIT_STRATA",
-    "ACTOR_QUOTA_STRATA",
     "FAILURE_CREDIT_COLLECTOR_VERSION",
     "FAILURE_CREDIT_COMPILER_VERSION",
     "FAILURE_CREDIT_DETECTOR_VERSION",
@@ -80,15 +60,11 @@ __all__ = [
     "FAILURE_CREDIT_SCHEMA_VERSION",
     "FAILURE_EVIDENCE_REPLAY_VERSION",
     "BoundedFailureCreditReplay",
-    "ContrastPolicyCredit",
     "CreditCompilationError",
     "CreditCompiler",
     "CreditCompilerConfig",
     "CreditPlan",
     "CreditProvenance",
-    "CyclePolicyCredit",
-    "DirectPolicyCredit",
-    "DirectPolicyTarget",
     "EvidenceCorpusMetrics",
     "EvidenceRecord",
     "EvidenceSample",
@@ -110,7 +86,6 @@ __all__ = [
     "OutcomePairMatcher",
     "PolicyWitness",
     "QuotaDiagnostics",
-    "RiskSequenceCredit",
     "ScalarCredit",
     "SemanticKey",
     "StratumCount",
@@ -118,14 +93,5 @@ __all__ = [
     "StratumQuotaStatus",
     "TargetAuthority",
     "WitnessKind",
-    "actor_policy_versions",
-    "actor_step_is_fresh",
-    "contrast_actor_unit_effective",
-    "cycle_actor_unit_effective",
-    "direct_actor_unit_effective",
-    "evidence_actor_is_fresh",
-    "evidence_actor_policy_versions",
     "evidence_record_storage_nbytes",
-    "plan_has_effective_actor_unit",
-    "risk_actor_row_effective",
 ]

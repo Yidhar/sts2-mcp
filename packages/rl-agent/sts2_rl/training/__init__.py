@@ -41,14 +41,11 @@ from .config import (
     training_config_from_mapping,
 )
 from .episode_replay import (
-    ActSegmentHealth,
     BoundaryOutcome,
     BoundedEpisodicReplay,
     CompletedEpisode,
     EpisodeCompletion,
     EpisodeDecisionStep,
-    EpisodicReplaySample,
-    EpisodicReplaySampleDiagnostics,
     HorizonTargets,
     ReplaySequence,
     backfill_completed_episode,
@@ -94,7 +91,6 @@ from .transaction import (
 __all__ = [
     "CONFIG_VERSION",
     "ENGINE_REVIVAL_MECHANISM",
-    "ActSegmentHealth",
     "ActorLearnerPipeline",
     "ActorSupervisorState",
     "BoundaryOutcome",
@@ -110,8 +106,6 @@ __all__ = [
     "EpisodeDecisionStep",
     "EpisodeMetrics",
     "EpisodicLearningConfig",
-    "EpisodicReplaySample",
-    "EpisodicReplaySampleDiagnostics",
     "EvaluationGateState",
     "FailureCreditConfig",
     "GroundedCollector",

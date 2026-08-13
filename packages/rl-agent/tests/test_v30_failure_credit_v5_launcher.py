@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from sts2_rl.training import load_training_config
+from tests.archived_experiment_config import load_archived_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = PACKAGE_ROOT / "scripts" / "launch_v30_failure_credit_v5_model_init.py"
@@ -56,14 +56,13 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
 
 
 def test_v30_recipe_enables_replay_v5_matching_as_a_new_lineage() -> None:
-    config = load_training_config(profile="preheat", config_path=CONFIG)
+    config = load_archived_training_config(profile="preheat", config_path=CONFIG)
 
     assert config.runtime.total_environment_steps == 250_000
     assert config.runtime.seed == 5_000_000
     assert config.curriculum.revival_budget == -1
     assert config.transaction_learning.enabled is False
     assert config.failure_credit.mode == "learning"
-    assert config.failure_credit.matched_outcome_pair_quota == 1
     assert config.failure_credit.maximum_matched_pairs_per_publication == 8
 
 

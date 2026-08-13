@@ -67,7 +67,6 @@ def _cpu_config() -> TrainingConfig:
             burn_in_steps=0,
             maximum_context_steps=4,
             liveness_head_calibration_updates=1,
-            liveness_risk_actor_start_update=2,
             liveness_tbptt_window_steps=2,
         ),
     )
@@ -92,50 +91,46 @@ def test_cpu_stress_executes_production_manifest_forward_and_backward(
     )
 
     assert report["status"] == "passed"
-    assert report["version"] == "sts2-liveness-head-active-shape-stress-v3"
+    assert report["version"] == "sts2-liveness-head-active-shape-stress-v4"
     assert report["training_authority"] is False
     assert report["optimizer_steps"] == 0
     assert all(report["gates"].values())
+    assert "matched_outcome_contrast_path" not in report["gates"]
+    assert "risk_actor_start_update" not in report["config"]
     assert report["shape"] == {
-        "contexts": 2,
+        "contexts": 1,
         "steps_per_context": 4,
-        "replayed_steps": 8,
+        "replayed_steps": 4,
         "legal_candidates_per_step": 4,
         "candidate_decisions_per_context": 16,
-        "replayed_candidate_decisions": 32,
+        "replayed_candidate_decisions": 16,
         "ordinary_probe_candidates": 3,
         "tbptt_segments_per_context": 2,
-        "expected_tbptt_segments": 4,
+        "expected_tbptt_segments": 2,
     }
 
     calibration = report["phases"]["calibration"]
     mature = report["phases"]["mature"]
     for phase in (calibration, mature):
         assert phase["work"] == {
-            "contexts": 2,
-            "steps": 8,
-            "candidates": 32,
-            "autograd_segments": 4,
+            "contexts": 1,
+            "steps": 4,
+            "candidates": 16,
+            "autograd_segments": 2,
         }
         assert phase["forward_shapes"]["forward_calls"] == 4
-        assert phase["forward_shapes"]["maximum_batch_rows"] == 2
-        assert phase["forward_shapes"]["minimum_batch_rows"] == 2
+        assert phase["forward_shapes"]["maximum_batch_rows"] == 1
+        assert phase["forward_shapes"]["minimum_batch_rows"] == 1
         assert phase["forward_shapes"]["maximum_candidate_axis"] == 4
         assert phase["gradients"]["finite"] is True
         assert phase["gradients"]["nonzero_gradient_tensors"] > 0
         assert phase["gradients"]["nonzero_liveness_head_tensors"] > 0
+        assert phase["labels"]["value"] == 4
+        assert phase["labels"]["critic"] == 4
+        assert phase["labels"]["censored_suppressed"] == 0
 
     assert calibration["calibration_active"] is True
-    assert calibration["risk_actor_enabled"] is False
-    assert calibration["labels"]["risk_actor"] == 0
-    assert calibration["labels"]["risk_actor_phase_suppressed"] == 4
-    assert calibration["labels"]["direct_avoid"] == 2
-    assert calibration["labels"]["contrast"] == 1
     assert mature["calibration_active"] is False
-    assert mature["risk_actor_enabled"] is True
-    assert mature["labels"]["risk_actor"] == 4
-    assert mature["labels"]["direct_avoid"] == 2
-    assert mature["labels"]["contrast"] == 1
 
     probe = report["active_shape_probe"]
     assert probe["work"]["steps"] == 2
@@ -170,10 +165,13 @@ def test_synthetic_evidence_is_one_atomic_reviewed_record() -> None:
     assert all(int(step.snapshot.action_mask.sum()) == 4 for step in record.plan.context.steps)
     assert len(record.plan.liveness_value_targets) == 4
     assert len(record.plan.liveness_q_targets) == 4
-    assert record.plan.risk_sequences[0].step_indices == (0, 1, 2, 3)
-    assert tuple(target.step_index for target in record.plan.direct_policy_targets) == (2, 3)
-    assert len(record.plan.contrast_policy_targets) == 1
-    pair = record.plan.contrast_policy_targets[0].pair
+    pairs = tuple(
+        witness.outcome_pair
+        for witness in record.incident.witnesses
+        if witness.outcome_pair is not None
+    )
+    assert len(pairs) == 1
+    pair = pairs[0]
     assert len(pair.better.context.steps) == 4
     assert len(pair.worse.context.steps) == 4
     assert all(step.snapshot.candidate_count == 4 for step in pair.better.context.steps)

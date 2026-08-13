@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from sts2_rl.training.config import load_training_config
+from tests.archived_experiment_config import load_archived_training_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENT_ROOT = PACKAGE_ROOT / "config" / "experiments"
@@ -23,7 +23,7 @@ SPEC.loader.exec_module(launcher)
 
 
 def _config() -> Any:
-    return load_training_config(profile="preheat", config_path=V28_CONFIG)
+    return load_archived_training_config(profile="preheat", config_path=V28_CONFIG)
 
 
 def _paths(tmp_path: Path) -> Any:
@@ -62,7 +62,7 @@ def _materialize_layout(paths: Any) -> Path:
 
 
 def test_v28_overlay_is_conservative_model_initialization_lineage() -> None:
-    source = load_training_config(profile="preheat", config_path=V27_CONFIG)
+    source = load_archived_training_config(profile="preheat", config_path=V27_CONFIG)
     refinement = _config()
 
     # Network and world semantics stay load-compatible.  Changed optimizer and
@@ -81,7 +81,6 @@ def test_v28_overlay_is_conservative_model_initialization_lineage() -> None:
     assert refinement.optimization.entropy_weight_end == pytest.approx(0.002)
     assert refinement.optimization.entropy_decay_updates == 3000
     assert refinement.rollout.queue_capacity == 24
-    assert refinement.episodic_learning.fresh_policy_sequences == 1
     assert refinement.curriculum.revival_budget == -1
     assert refinement.curriculum.epsilon_start == pytest.approx(0.15)
     assert refinement.curriculum.epsilon_end == pytest.approx(0.05)

@@ -22,6 +22,7 @@ from sts2_rl.macro_evaluation import (
 )
 from sts2_rl.models import GroundedCandidateConfig, RecurrentCandidateModel
 from sts2_rl.training.config import CONFIG_VERSION, load_training_config
+from tests.archived_experiment_config import load_archived_training_config
 
 
 def _remove_v15_transaction_lifecycle_fields(payload: dict[str, object]) -> None:
@@ -36,25 +37,12 @@ def _remove_v16_guard_field(payload: dict[str, object]) -> None:
     del runtime["evaluation_guard_enforcement_start_steps"]
 
 
-def _remove_v17_stability_fields(payload: dict[str, object]) -> None:
-    failure = payload["failure_credit"]
-    episodic = payload["episodic_learning"]
-    assert isinstance(failure, dict)
-    assert isinstance(episodic, dict)
-    del failure["liveness_risk_actor_min_selected_probability"]
-    del episodic["success_imitation_exempt_surfaces"]
-
-
 def _remove_v18_act_hp_and_option_fields(payload: dict[str, object]) -> None:
     episodic = payload["episodic_learning"]
     transaction = payload["transaction_learning"]
     assert isinstance(episodic, dict)
     assert isinstance(transaction, dict)
     for key in (
-        "act_segment_imitation_enabled",
-        "act_segment_policy_weight",
-        "act_segment_min_exit_hp_ratio",
-        "act_segment_max_revival_fraction",
         "combat_hp_loss_value_weight",
         "combat_hp_loss_reference",
     ):
@@ -390,7 +378,6 @@ def test_checkpoint_probe_has_one_reviewed_v6_config_interpretation() -> None:
     source["version"] = "sts2-relational-curriculum-config-v6"
     _remove_v19_lifecycle_advantage_fields(source)
     _remove_v18_act_hp_and_option_fields(source)
-    _remove_v17_stability_fields(source)
     _remove_v15_transaction_lifecycle_fields(source)
     _remove_v16_guard_field(source)
     del source["failure_credit"]
@@ -399,7 +386,6 @@ def test_checkpoint_probe_has_one_reviewed_v6_config_interpretation() -> None:
     assert isinstance(episodic, dict)
     assert isinstance(rollout, dict)
     del episodic["macro_sample_fraction"]
-    del episodic["fresh_policy_sequences"]
     del rollout["deterministic_probe_environment_steps"]
 
     migrated = _diagnostic_model_initialization_config(source)
@@ -427,7 +413,6 @@ def test_checkpoint_probe_migrates_v7_runtime_defaults_only() -> None:
     source["version"] = "sts2-relational-curriculum-config-v7"
     _remove_v19_lifecycle_advantage_fields(source)
     _remove_v18_act_hp_and_option_fields(source)
-    _remove_v17_stability_fields(source)
     _remove_v15_transaction_lifecycle_fields(source)
     _remove_v16_guard_field(source)
     del source["failure_credit"]
@@ -443,8 +428,6 @@ def test_checkpoint_probe_migrates_v7_runtime_defaults_only() -> None:
         del optimization[key]
     del rollout["deterministic_probe_interval_episodes"]
     del rollout["deterministic_probe_environment_steps"]
-    del episodic["policy_gradient_max_lag"]
-    del episodic["fresh_policy_sequences"]
     for key in (
         "early_evaluation_steps",
         "early_evaluation_episodes",
@@ -466,7 +449,6 @@ def test_checkpoint_probe_migrates_v7_runtime_defaults_only() -> None:
     assert migrated.optimization.entropy_weight_end == 0.01
     assert migrated.optimization.entropy_decay_updates == 2_000
     assert migrated.rollout.deterministic_probe_interval_episodes == 0
-    assert migrated.episodic_learning.policy_gradient_max_lag == 128
     assert migrated.runtime.early_evaluation_steps == ()
     assert migrated.runtime.final_audit_steps == ()
     assert not migrated.runtime.evaluation_liveness_guard_enabled
@@ -478,7 +460,6 @@ def test_checkpoint_probe_migrates_v8_probe_schedule_default_only() -> None:
     source["version"] = "sts2-relational-curriculum-config-v8"
     _remove_v19_lifecycle_advantage_fields(source)
     _remove_v18_act_hp_and_option_fields(source)
-    _remove_v17_stability_fields(source)
     _remove_v15_transaction_lifecycle_fields(source)
     _remove_v16_guard_field(source)
     del source["failure_credit"]
@@ -490,7 +471,6 @@ def test_checkpoint_probe_migrates_v8_probe_schedule_default_only() -> None:
     # preheat profile's recurring-probe policy into a legacy fixture.
     rollout["deterministic_probe_interval_episodes"] = 0
     del rollout["deterministic_probe_environment_steps"]
-    del episodic["fresh_policy_sequences"]
 
     migrated = _diagnostic_model_initialization_config(source)
 
@@ -511,27 +491,27 @@ def test_checkpoint_probe_migrates_v10_fresh_sampling_to_disabled() -> None:
     source["version"] = "sts2-relational-curriculum-config-v10"
     _remove_v19_lifecycle_advantage_fields(source)
     _remove_v18_act_hp_and_option_fields(source)
-    _remove_v17_stability_fields(source)
     _remove_v15_transaction_lifecycle_fields(source)
     _remove_v16_guard_field(source)
     del source["failure_credit"]
-    episodic = source["episodic_learning"]
-    assert isinstance(episodic, dict)
-    del episodic["fresh_policy_sequences"]
-
-    migrated = _diagnostic_model_initialization_config(source)
-
-    assert migrated.version == CONFIG_VERSION
-    assert migrated.model == active.model
-    assert migrated.episodic_learning.fresh_policy_sequences == 0
-
-    unexpected = dict(source)
-    unexpected["episodic_learning"] = {
-        **episodic,
+    # A real v10 payload could not spell out the later fresh-policy
+    # reservation; a v11+ payload that did carries a key config v20 retired.
+    # The reviewed migration strips it either way.
+    stale = dict(source)
+    stale_episodic = stale["episodic_learning"]
+    assert isinstance(stale_episodic, dict)
+    stale["episodic_learning"] = {
+        **stale_episodic,
         "fresh_policy_sequences": 1,
     }
-    with pytest.raises(ValueError, match="unexpectedly contains"):
-        _diagnostic_model_initialization_config(unexpected)
+
+    for payload in (source, stale):
+        migrated = _diagnostic_model_initialization_config(payload)
+        assert migrated.version == CONFIG_VERSION
+        assert migrated.model == active.model
+        migrated_episodic = migrated.to_mapping()["episodic_learning"]
+        assert isinstance(migrated_episodic, dict)
+        assert "fresh_policy_sequences" not in migrated_episodic
 
 
 def test_checkpoint_probe_reconstructs_the_enabled_liveness_head(
@@ -540,7 +520,7 @@ def test_checkpoint_probe_reconstructs_the_enabled_liveness_head(
 ) -> None:
     """A failure-credit checkpoint must be loaded with its complete model ABI."""
 
-    config = load_training_config(
+    config = load_archived_training_config(
         profile="preheat",
         config_path=(
             Path(__file__).parents[1]

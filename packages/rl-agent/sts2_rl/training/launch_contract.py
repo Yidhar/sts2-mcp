@@ -29,7 +29,9 @@ from uuid import UUID
 from sts2_rl.checkpoints import CheckpointIntegrityError, ValidatedResumeCheckpoint
 
 SUPERVISED_LAUNCH_CONTRACT_VERSION: Final = "sts2-supervised-training-launch-contract-v2"
-RUNTIME_READINESS_REPORT_VERSION: Final = "sts2-liveness-head-active-shape-stress-v3"
+# v4 retires the liveness policy actors: the readiness manifest no longer
+# carries a risk-actor phase boundary or a matched-outcome contrast gate.
+RUNTIME_READINESS_REPORT_VERSION: Final = "sts2-liveness-head-active-shape-stress-v4"
 FORMAL_REPORT_GENERATION_SOURCE_VERSION: Final = "sts2-formal-report-generation-source-v1"
 RUNTIME_READINESS_SEAL_VERSION: Final = "sts2-runtime-readiness-evidence-v1"
 SOURCE_AUTHORITY_VERSION: Final = "sts2-two-phase-source-authority-v1"
@@ -79,7 +81,6 @@ _RUNTIME_READINESS_GATES = frozenset(
         "finite_gradients",
         "finite_losses",
         "formal_shape_contract",
-        "matched_outcome_contrast_path",
         "no_optimizer_step",
         "nonzero_expected_gradients",
         "ordinary_rows_not_globally_padded",
@@ -93,7 +94,6 @@ _READINESS_CONFIG_FIELDS = {
     "maximum_candidates",
     "maximum_context_steps",
     "profile",
-    "risk_actor_start_update",
     "source",
     "tbptt_window_steps",
     "version",
@@ -434,11 +434,6 @@ def _runtime_readiness_report_binding(report: Mapping[str, Any]) -> dict[str, An
             minimum=1,
         ),
         "profile": _text(config["profile"], label="runtime readiness config.profile"),
-        "risk_actor_start_update": _integer(
-            config["risk_actor_start_update"],
-            label="runtime readiness config.risk_actor_start_update",
-            minimum=1,
-        ),
         "source": _absolute_path(config["source"], label="runtime readiness config.source"),
         "tbptt_window_steps": _integer(
             config["tbptt_window_steps"],

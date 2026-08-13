@@ -422,8 +422,19 @@ def test_missing_episodic_sidecar_fails_before_live_resource_mutation(
         target.close()
 
 
+@pytest.mark.parametrize(
+    "stale_version",
+    (
+        "unsupported-episodic-replay",
+        # The retired v4 schema carried act-segment health receipts for the
+        # deleted imitation channel.  Exact resume must reject it outright
+        # instead of silently reinterpreting it as a value-only v5 payload.
+        "sts2-episodic-replay-v4",
+    ),
+)
 def test_invalid_hashed_episodic_payload_is_probed_before_any_live_mutation(
     tmp_path: Path,
+    stale_version: str,
 ) -> None:
     config = _episodic_config()
     source = build_training_resources(config, backend=FakeCombatBackend())
@@ -441,7 +452,7 @@ def test_invalid_hashed_episodic_payload_is_probed_before_any_live_mutation(
     sidecar = checkpoint / "episodic_replay.pkl"
     with sidecar.open("rb") as handle:
         payload = pickle.load(handle)
-    payload["version"] = "unsupported-episodic-replay"
+    payload["version"] = stale_version
     with sidecar.open("wb") as handle:
         pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
     # Keep the outer atomic checkpoint internally hash-consistent. The replay
