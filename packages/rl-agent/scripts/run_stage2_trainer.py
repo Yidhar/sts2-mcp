@@ -599,8 +599,10 @@ def main() -> int:
             with torch.no_grad():
                 for model in (macro_online, macro_target):
                     head = model.transaction_q_head
-                    assert head is not None
-                    head[-1].bias.add_(delta)
+                    assert isinstance(head, torch.nn.Sequential)
+                    final_layer = head[-1]
+                    assert isinstance(final_layer, torch.nn.Linear)
+                    final_layer.bias.add_(delta)
             record = {
                 "event": "q_scale_calibration",
                 "unix_s": time.time(),
