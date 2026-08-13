@@ -46,6 +46,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--reload-episodes", type=int, default=2)
+    parser.add_argument("--maximum-pending-runs", type=int, default=2)
     parser.add_argument("--device", default=None)
     parser.add_argument("--sim-exe", default=None)
     return parser.parse_args()
@@ -174,6 +175,8 @@ def main() -> int:
         produced = 0
         with metrics_path.open("a", encoding="utf-8") as metrics:
             for episode_index in range(args.episodes):
+                while len(tuple(spool.glob("*.pkl"))) >= args.maximum_pending_runs:
+                    time.sleep(0.25)
                 if episode_index % max(args.reload_episodes, 1) == 0:
                     reload()
                 authority.load_exploration_state_dict(publication_state)

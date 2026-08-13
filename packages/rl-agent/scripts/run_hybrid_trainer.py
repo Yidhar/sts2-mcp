@@ -24,6 +24,7 @@ from sts2_rl.models import (
     initialize_hybrid_from_grounded,
 )
 from sts2_rl.training import load_training_config
+from sts2_rl.training.sdpa import configure_rocm_sdpa_backend
 
 HYBRID_TRAINING_STATE = "sts2-hybrid-training-state-v1"
 HYBRID_SPOOL_ENVELOPE = "sts2-hybrid-spool-envelope-v1"
@@ -91,6 +92,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--combat-unroll", type=int, default=32)
     parser.add_argument("--maximum-view-reuse", type=int, default=8)
     parser.add_argument("--save-interval-runs", type=int, default=10)
+    parser.add_argument("--publication-interval-runs", type=int, default=1)
     parser.add_argument("--device", default="auto")
     return parser.parse_args()
 
@@ -105,6 +107,14 @@ def main() -> int:
         if device_name == "auto":
             device_name = "cuda" if torch.cuda.is_available() else "cpu"
         device = torch.device(device_name)
+        sdpa_backend = configure_rocm_sdpa_backend(
+            config.runtime.rocm_sdpa_backend,
+            devices=(device,),
+        )
+        print(
+            json.dumps({"event": "sdpa_backend", **sdpa_backend.to_mapping()}),
+            flush=True,
+        )
         encoder_config = config.model.to_encoding_config()
         from sts2_rl.encoding import GroundedObservationEncoder
 
@@ -172,6 +182,22 @@ def main() -> int:
             initialize_hybrid_from_grounded(online, dict(source_state))
             target.load_state_dict(online.state_dict(), strict=True)
 
+        def publish() -> None:
+            publication = Path(args.publication)
+            publication.parent.mkdir(parents=True, exist_ok=True)
+            publication_temporary = publication.with_suffix(publication.suffix + ".tmp")
+            torch.save(
+                {
+                    "format": HYBRID_PUBLICATION,
+                    "model_config": hybrid_config.as_mapping(),
+                    "online": online.state_dict(),
+                    "policy_version": int(learner.metrics.updates),
+                    "domain_decisions": dict(domain_decisions),
+                },
+                publication_temporary,
+            )
+            publication_temporary.replace(publication)
+
         def save() -> None:
             checkpoint = Path(args.checkpoint_out)
             checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -193,20 +219,7 @@ def main() -> int:
                 temporary,
             )
             temporary.replace(checkpoint)
-            publication = Path(args.publication)
-            publication.parent.mkdir(parents=True, exist_ok=True)
-            publication_temporary = publication.with_suffix(publication.suffix + ".tmp")
-            torch.save(
-                {
-                    "format": HYBRID_PUBLICATION,
-                    "model_config": hybrid_config.as_mapping(),
-                    "online": online.state_dict(),
-                    "policy_version": int(learner.metrics.updates),
-                    "domain_decisions": dict(domain_decisions),
-                },
-                publication_temporary,
-            )
-            publication_temporary.replace(publication)
+            publish()
 
         save()
         spool = Path(args.spool)
@@ -214,9 +227,13 @@ def main() -> int:
         metrics_path = Path(args.metrics_out)
         metrics_path.parent.mkdir(parents=True, exist_ok=True)
         last_save = ingested
+        last_publication = ingested
         with metrics_path.open("a", encoding="utf-8") as metrics:
             while ingested < args.stop_after_runs:
-                files = sorted(spool.glob("*.pkl"))
+                files = sorted(
+                    spool.glob("*.pkl"),
+                    key=lambda item: item.stat().st_mtime_ns,
+                )
                 if not files:
                     time.sleep(0.25)
                     continue
@@ -249,9 +266,14 @@ def main() -> int:
                 }
                 metrics.write(json.dumps(row) + "\n")
                 metrics.flush()
-                if ingested - last_save >= args.save_interval_runs:
+                checkpoint_due = ingested - last_save >= args.save_interval_runs
+                if checkpoint_due:
                     save()
                     last_save = ingested
+                    last_publication = ingested
+                elif ingested - last_publication >= args.publication_interval_runs:
+                    publish()
+                    last_publication = ingested
         save()
         _atomic_json(
             status,
