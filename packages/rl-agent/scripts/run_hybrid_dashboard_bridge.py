@@ -255,6 +255,10 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "hybrid_macro_td_abs": item.get("macro_td_abs"),
                 "hybrid_combat_td_abs": item.get("combat_td_abs"),
                 "hybrid_shared_gradient_cosine": item.get("shared_gradient_cosine"),
+                "hybrid_target_syncs": item.get("target_syncs"),
+                "hybrid_last_target_sync_update": item.get(
+                    "last_target_sync_update"
+                ),
                 "rollout_queue": {
                     "size": int(row.get("spool_pending", pending) or 0),
                     "capacity": int(

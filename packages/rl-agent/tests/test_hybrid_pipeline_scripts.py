@@ -256,6 +256,8 @@ def test_dashboard_reads_hybrid_evaluation_summary() -> None:
     )
     assert 'run_root / "metrics" / "evaluation.jsonl"' in source
     assert '"event": "evaluation"' in source
+    assert '"hybrid_target_syncs": item.get("target_syncs")' in source
+    assert '"hybrid_last_target_sync_update": item.get(' in source
 
 
 def test_dashboard_tail_replacement_preserves_non_update_rows() -> None:
