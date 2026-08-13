@@ -136,6 +136,7 @@ python scripts/run_stage2_trainer.py \
   --updates-per-episode "${STS2_STAGE2_UPDATES:-8}" \
   --sample-windows "${STS2_STAGE2_SAMPLE_WINDOWS:-16}" \
   --replay-episodes "${STS2_STAGE2_REPLAY_EPISODES:-128}" \
+  --save-interval-episodes "${STS2_STAGE2_SAVE_INTERVAL:-20}" \
   --idle-timeout-seconds "${STS2_STAGE2_IDLE_TIMEOUT_SECONDS:-1200}" \
   --metrics-out "$RUN_DIR/trainer-metrics.jsonl" \
   --device cuda --sim-exe "$SIM_EXE" \
