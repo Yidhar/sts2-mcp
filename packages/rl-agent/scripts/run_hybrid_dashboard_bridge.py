@@ -101,7 +101,11 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
             "pipeline": "hybrid-double-q-v1",
             "checkpoint_load": {
                 "mode": "model_init",
-                "parent_checkpoint": manifest.get("champion"),
+                "parent_checkpoint": (
+                    manifest.get("source_hybrid_publication")
+                    or manifest.get("champion")
+                ),
+                "source_policy_version": manifest.get("source_policy_version"),
             },
             "config": {
                 "profile": "hybrid-candidate-q-v1",
