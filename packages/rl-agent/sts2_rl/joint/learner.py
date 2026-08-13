@@ -274,16 +274,24 @@ class HybridQLearner:
                 factual, dtype=online_q[index].dtype, device=online_q[index].device
             )
             if successor is not None and discount != 0.0:
-                # Rebuild the slow prefix at the successor with current
-                # online/target weights. This is sparse (macro facts only)
-                # and avoids leaking behavior-network hidden states.
-                online_state, target_state = self._state_before(run, successor)
-                bootstrap = self._bootstrap(
-                    run,
-                    successor,
-                    online_state=online_state,
-                    target_state=target_state,
-                )
+                if successor in online_q:
+                    # The sparse macro view already reconstructed this exact
+                    # successor under current weights. Reuse it instead of
+                    # replaying the whole run prefix once per learned node.
+                    selected = self._masked_argmax(
+                        online_q[successor].detach(), run.steps[successor]
+                    )
+                    bootstrap = target_q[successor][selected].detach()
+                else:
+                    # A successor beyond the sampled suffix still needs one
+                    # exact sparse-prefix reconstruction.
+                    online_state, target_state = self._state_before(run, successor)
+                    bootstrap = self._bootstrap(
+                        run,
+                        successor,
+                        online_state=online_state,
+                        target_state=target_state,
+                    )
                 target = target + discount * bootstrap
             executed = online_q[index][step.action_index]
             errors.append((executed - target).detach().abs())
@@ -322,7 +330,9 @@ class HybridQLearner:
             )
             if successor < len(run.steps) and discount != 0.0:
                 if successor in target_q and successor > index:
-                    selected = self._masked_argmax(online_q[successor].detach(), run.steps[successor])
+                    selected = self._masked_argmax(
+                        online_q[successor].detach(), run.steps[successor]
+                    )
                     bootstrap = target_q[successor][selected].detach()
                 else:
                     # Current encounter prefix + macro prefix has already been
@@ -416,9 +426,19 @@ class HybridQLearner:
                         self.metrics.domain_surface_counts.get(key, 0) + 1
                     )
         if self.metrics.updates % self.config.target_update_interval == 0:
-            self.target_model.load_state_dict(self.online_model.state_dict(), strict=True)
-            self.metrics.target_syncs += 1
+            self.sync_target()
         return self.metrics.as_mapping()
+
+    def sync_target(self) -> None:
+        """Copy online weights to the target and account for the sync.
+
+        The normal clock is learner updates. A runner that deliberately
+        changes the update-to-fresh-run ratio can additionally call this on
+        its factual run clock, preserving the same target-data cadence.
+        """
+
+        self.target_model.load_state_dict(self.online_model.state_dict(), strict=True)
+        self.metrics.target_syncs += 1
 
     def state_dict(self) -> dict[str, Any]:
         return {

@@ -81,11 +81,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--metrics-out", required=True)
     parser.add_argument("--status-out", required=True)
     parser.add_argument("--lineage-id", required=True)
+    parser.add_argument("--pipeline-id", required=True)
+    parser.add_argument("--producer-id", action="append", dest="producer_ids", required=True)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--initialize-from", default=None)
     mode.add_argument("--resume", default=None)
     parser.add_argument("--stop-after-runs", type=int, default=400)
     parser.add_argument("--updates-per-run", type=int, default=2)
+    parser.add_argument("--ingest-batch-runs", type=int, default=1)
     parser.add_argument("--run-batch-size", type=int, default=4)
     parser.add_argument("--replay-runs", type=int, default=128)
     parser.add_argument("--macro-unroll", type=int, default=8)
@@ -93,6 +96,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--maximum-view-reuse", type=int, default=8)
     parser.add_argument("--save-interval-runs", type=int, default=10)
     parser.add_argument("--publication-interval-runs", type=int, default=1)
+    parser.add_argument("--maximum-pending-runs", type=int, default=2)
+    parser.add_argument(
+        "--target-sync-every-runs",
+        type=int,
+        default=0,
+        help="optional factual-run target clock; useful when updates/run changes",
+    )
     parser.add_argument("--device", default="auto")
     return parser.parse_args()
 
@@ -100,7 +110,11 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     status = Path(args.status_out)
-    _atomic_json(status, {"state": "running", "unix_s": time.time()})
+    status_base = {
+        "pipeline_id": args.pipeline_id,
+        "producer_ids": list(args.producer_ids),
+    }
+    _atomic_json(status, {**status_base, "state": "running", "unix_s": time.time()})
     try:
         config = load_training_config(profile="preheat", config_path=Path(args.config))
         device_name = args.device
@@ -237,34 +251,72 @@ def main() -> int:
                 if not files:
                     time.sleep(0.25)
                     continue
-                path = files[0]
-                with path.open("rb") as handle:
-                    envelope = pickle.load(handle)
-                if envelope.get("format") != HYBRID_SPOOL_ENVELOPE:
-                    raise ValueError(f"invalid hybrid spool item: {path}")
-                run = envelope.get("run")
-                if not isinstance(run, HybridRun):
-                    raise ValueError(f"hybrid spool item has no run: {path}")
-                replay.put(run)
-                ingested += 1
-                environment_steps += int(run.environment_steps)
-                for domain in ("macro", "combat"):
-                    domain_decisions[domain] += sum(
-                        step.control_domain == domain for step in run.steps
-                    )
+                accepted: list[tuple[Path, Mapping[str, Any], HybridRun]] = []
+                remaining = args.stop_after_runs - ingested
+                for path in files[: min(args.ingest_batch_runs, remaining)]:
+                    with path.open("rb") as handle:
+                        envelope = pickle.load(handle)
+                    if envelope.get("format") != HYBRID_SPOOL_ENVELOPE:
+                        raise ValueError(f"invalid hybrid spool item: {path}")
+                    if envelope.get("pipeline_id") != args.pipeline_id:
+                        raise ValueError(
+                            f"hybrid spool item belongs to another pipeline: {path}"
+                        )
+                    if envelope.get("producer_id") not in args.producer_ids:
+                        raise ValueError(
+                            f"hybrid spool item has an unknown producer: {path}"
+                        )
+                    run = envelope.get("run")
+                    if not isinstance(run, HybridRun):
+                        raise ValueError(f"hybrid spool item has no run: {path}")
+                    replay.put(run)
+                    ingested += 1
+                    environment_steps += int(run.environment_steps)
+                    for domain in ("macro", "combat"):
+                        domain_decisions[domain] += sum(
+                            step.control_domain == domain for step in run.steps
+                        )
+                    accepted.append((path, envelope, run))
                 update_metrics: Mapping[str, Any] = learner.metrics.as_mapping()
-                for _ in range(args.updates_per_run):
+                update_started = time.monotonic()
+                for _ in range(args.updates_per_run * len(accepted)):
                     update_metrics = learner.update()
-                path.unlink()
-                row = {
-                    "event": "hybrid_update",
-                    "unix_s": time.time(),
-                    "ingested_runs": ingested,
-                    "environment_steps": environment_steps,
-                    "learner": dict(update_metrics),
-                    "replay": replay.metrics(),
-                }
-                metrics.write(json.dumps(row) + "\n")
+                if (
+                    args.target_sync_every_runs > 0
+                    and ingested % args.target_sync_every_runs == 0
+                ):
+                    learner.sync_target()
+                    update_metrics = learner.metrics.as_mapping()
+                update_seconds = time.monotonic() - update_started
+                rows: list[dict[str, Any]] = []
+                first_ingested = ingested - len(accepted) + 1
+                first_environment_steps = environment_steps - sum(
+                    int(run.environment_steps) for _, _, run in accepted
+                )
+                cumulative_environment_steps = first_environment_steps
+                for offset, (path, envelope, run) in enumerate(accepted):
+                    path.unlink()
+                    cumulative_environment_steps += int(run.environment_steps)
+                    episode_summary = envelope.get("episode")
+                    if not isinstance(episode_summary, Mapping):
+                        episode_summary = {}
+                    rows.append(
+                        {
+                            "event": "hybrid_update",
+                            "unix_s": time.time(),
+                            "ingested_runs": first_ingested + offset,
+                            "environment_steps": cumulative_environment_steps,
+                            "producer_id": envelope.get("producer_id"),
+                            "episode": dict(episode_summary),
+                            "spool_pending": len(tuple(spool.glob("*.pkl"))),
+                            "spool_capacity": args.maximum_pending_runs,
+                            "learner_update_seconds": update_seconds,
+                            "learner": dict(update_metrics),
+                            "replay": replay.metrics(),
+                        }
+                    )
+                for row in rows:
+                    metrics.write(json.dumps(row) + "\n")
                 metrics.flush()
                 checkpoint_due = ingested - last_save >= args.save_interval_runs
                 if checkpoint_due:
@@ -278,6 +330,7 @@ def main() -> int:
         _atomic_json(
             status,
             {
+                **status_base,
                 "state": "complete",
                 "ingested_runs": ingested,
                 "environment_steps": environment_steps,
@@ -288,7 +341,12 @@ def main() -> int:
     except BaseException as error:
         _atomic_json(
             status,
-            {"state": "failed", "error": f"{type(error).__name__}: {error}", "unix_s": time.time()},
+            {
+                **status_base,
+                "state": "failed",
+                "error": f"{type(error).__name__}: {error}",
+                "unix_s": time.time(),
+            },
         )
         raise
 

@@ -63,3 +63,50 @@ def test_balanced_update_gives_executed_q_a_direct_gradient() -> None:
     assert metrics["macro_shared_gradient_norm"] > 0.0
     assert metrics["combat_shared_gradient_norm"] > 0.0
     assert -1.0 <= metrics["shared_gradient_cosine"] <= 1.0
+
+
+def test_macro_loss_reuses_successor_already_in_sparse_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    online = _TinyQ()
+    target = copy.deepcopy(online)
+    replay = HybridRunReplay(capacity_runs=4, macro_unroll=8, combat_unroll=2, seed=5)
+    replay.put(_run())
+    learner = HybridQLearner(
+        online_model=online,
+        target_model=target,
+        replay=replay,
+        forward_online=_forward(online),
+        forward_target=_forward(target),
+        initial_state=lambda: torch.zeros((1, 2)),
+        config=HybridQConfig(run_batch_size=1),
+    )
+    pair = replay.sample_pairs(1)[0]
+
+    def unexpected_prefix_replay(*_args, **_kwargs):
+        raise AssertionError("in-view macro successor must not replay the full prefix")
+
+    monkeypatch.setattr(learner, "_state_before", unexpected_prefix_replay)
+    loss, _, count = learner._macro_loss(pair.macro)
+    assert count == len(pair.macro.learn_indices)
+    assert torch.isfinite(loss)
+
+
+def test_explicit_target_sync_updates_weights_and_metric() -> None:
+    online = _TinyQ()
+    target = copy.deepcopy(online)
+    replay = HybridRunReplay(capacity_runs=4, macro_unroll=2, combat_unroll=2)
+    learner = HybridQLearner(
+        online_model=online,
+        target_model=target,
+        replay=replay,
+        forward_online=_forward(online),
+        forward_target=_forward(target),
+        initial_state=lambda: torch.zeros((1, 2)),
+    )
+    with torch.no_grad():
+        online.bias.add_(1.0)
+    assert not torch.equal(online.bias, target.bias)
+    learner.sync_target()
+    assert torch.equal(online.bias, target.bias)
+    assert learner.metrics.target_syncs == 1

@@ -33,6 +33,36 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _episode_summary(
+    episode: Any,
+    *,
+    producer_id: str,
+    run_id: str,
+    episode_index: int,
+    collected_at: float,
+) -> dict[str, Any]:
+    """Return the compact factual result acknowledged by the learner.
+
+    Collector files are diagnostic and multiple producers can finish out of
+    order.  Carrying this summary beside the immutable run lets the trainer
+    publish the actual ingest order without guessing from file timestamps.
+    """
+
+    return {
+        "producer_id": producer_id,
+        "run_id": run_id,
+        "episode_index": int(episode_index),
+        "collected_at": float(collected_at),
+        "episode_id": str(episode.metrics.episode_id),
+        "reset_seed": int(episode.metrics.reset_seed),
+        "steps": int(episode.metrics.steps),
+        "run_won": bool(episode.metrics.run_won),
+        "max_floor": int(episode.metrics.max_floor),
+        "revivals_used": int(episode.metrics.revivals_used),
+        "terminal_reason": episode.metrics.terminal_reason,
+    }
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
@@ -183,6 +213,7 @@ def main() -> int:
                 authority.begin_episode(
                     f"{args.producer_id}:{nonce}:{episode_index}"
                 )
+                episode_started = time.monotonic()
                 episode = resources.collector.collect_episode(
                     epsilon=0.0, deterministic=False, record=False
                 )
@@ -219,11 +250,24 @@ def main() -> int:
                     f"{args.producer_id}:{nonce}:{episode_index}",
                     environment_steps=episode.metrics.steps,
                 )
+                collected_at = time.time()
+                summary = _episode_summary(
+                    episode,
+                    producer_id=args.producer_id,
+                    run_id=(
+                        run.run_id
+                        if run is not None
+                        else f"{args.producer_id}:{nonce}:{episode_index}"
+                    ),
+                    episode_index=episode_index,
+                    collected_at=collected_at,
+                )
                 if run is not None:
                     envelope = {
                         "format": HYBRID_SPOOL_ENVELOPE,
                         "pipeline_id": args.pipeline_id,
                         "producer_id": args.producer_id,
+                        "episode": summary,
                         "run": run,
                     }
                     temporary = spool / f".tmp-{uuid.uuid4().hex}"
@@ -235,12 +279,9 @@ def main() -> int:
                     json.dumps(
                         {
                             "event": "hybrid_collector_episode",
-                            "episode_index": episode_index,
-                            "steps": episode.metrics.steps,
-                            "run_won": episode.metrics.run_won,
-                            "max_floor": episode.metrics.max_floor,
-                            "revivals_used": episode.metrics.revivals_used,
-                            "terminal_reason": episode.metrics.terminal_reason,
+                            "unix_s": collected_at,
+                            **summary,
+                            "episode_seconds": time.monotonic() - episode_started,
                             "hybrid_steps": len(run.steps) if run else 0,
                             "authority": authority.metrics(),
                         }
@@ -256,7 +297,12 @@ def main() -> int:
     except BaseException as error:
         _atomic_json(
             status,
-            {**base, "state": "failed", "error": f"{type(error).__name__}: {error}", "unix_s": time.time()},
+            {
+                **base,
+                "state": "failed",
+                "error": f"{type(error).__name__}: {error}",
+                "unix_s": time.time(),
+            },
         )
         raise
     finally:
