@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import pickle
 import random
 import time
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -199,18 +201,29 @@ def main() -> int:
         def publish() -> None:
             publication = Path(args.publication)
             publication.parent.mkdir(parents=True, exist_ok=True)
-            publication_temporary = publication.with_suffix(publication.suffix + ".tmp")
-            torch.save(
-                {
-                    "format": HYBRID_PUBLICATION,
-                    "model_config": hybrid_config.as_mapping(),
-                    "online": online.state_dict(),
-                    "policy_version": int(learner.metrics.updates),
-                    "domain_decisions": dict(domain_decisions),
-                },
-                publication_temporary,
+            # A fixed ``network.pt.tmp`` is not safe once collectors reload in
+            # parallel.  More importantly, Path.replace() can expose a brief
+            # missing-path window on the Windows-mounted WSL filesystem.  A
+            # unique completed file plus os.replace() keeps the old policy
+            # readable until the new one is ready and atomically swaps the
+            # directory entry.
+            publication_temporary = publication.with_name(
+                f".{publication.name}.{uuid.uuid4().hex}.tmp"
             )
-            publication_temporary.replace(publication)
+            try:
+                torch.save(
+                    {
+                        "format": HYBRID_PUBLICATION,
+                        "model_config": hybrid_config.as_mapping(),
+                        "online": online.state_dict(),
+                        "policy_version": int(learner.metrics.updates),
+                        "domain_decisions": dict(domain_decisions),
+                    },
+                    publication_temporary,
+                )
+                os.replace(publication_temporary, publication)
+            finally:
+                publication_temporary.unlink(missing_ok=True)
 
         def save() -> None:
             checkpoint = Path(args.checkpoint_out)

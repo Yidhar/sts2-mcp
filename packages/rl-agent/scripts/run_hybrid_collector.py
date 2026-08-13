@@ -74,6 +74,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--pipeline-id", required=True)
     parser.add_argument("--producer-id", required=True)
     parser.add_argument("--episodes", type=int, default=100)
+    parser.add_argument("--start-episode-index", type=int, default=0)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--reload-episodes", type=int, default=2)
     parser.add_argument("--maximum-pending-runs", type=int, default=2)
@@ -139,16 +140,24 @@ def main() -> int:
         model_mtime = 0
         publication_state: dict[str, Any] = {}
 
-        def reload() -> None:
+        def reload(*, initial: bool = False) -> bool:
             nonlocal model_mtime, publication_state
-            mtime = model_path.stat().st_mtime_ns
-            if mtime <= model_mtime:
-                return
-            payload = torch.load(
-                model_path,
-                map_location=resources.device,
-                weights_only=True,
-            )
+            # Publication is asynchronous with respect to collectors.  A
+            # reload miss must keep using the already loaded policy, not kill
+            # the producer and strand the learner.  The next episode retries.
+            try:
+                mtime = model_path.stat().st_mtime_ns
+                if mtime <= model_mtime:
+                    return False
+                payload = torch.load(
+                    model_path,
+                    map_location=resources.device,
+                    weights_only=True,
+                )
+            except FileNotFoundError:
+                if initial or model_mtime == 0:
+                    raise
+                return False
             if not isinstance(payload, Mapping) or payload.get("format") != HYBRID_PUBLICATION:
                 raise ValueError("collector publication is not a hybrid publication")
             if payload.get("model_config") != model.hybrid_config.as_mapping():
@@ -160,8 +169,9 @@ def main() -> int:
             model.eval()
             model_mtime = mtime
             publication_state = dict(payload)
+            return True
 
-        reload()
+        reload(initial=True)
 
         def forward(snapshot: Any, hidden: Any) -> tuple[torch.Tensor, torch.Tensor]:
             encoded = collate_encoded_snapshots(
@@ -204,7 +214,8 @@ def main() -> int:
         nonce = uuid.uuid4().hex[:12]
         produced = 0
         with metrics_path.open("a", encoding="utf-8") as metrics:
-            for episode_index in range(args.episodes):
+            for local_episode_index in range(args.episodes):
+                episode_index = args.start_episode_index + local_episode_index
                 while len(tuple(spool.glob("*.pkl"))) >= args.maximum_pending_runs:
                     time.sleep(0.25)
                 if episode_index % max(args.reload_episodes, 1) == 0:

@@ -166,4 +166,56 @@ def test_parallel_launcher_defaults_to_two_collectors_and_one_update() -> None:
     assert '--ingest-batch-runs "${STS2_HYBRID_INGEST_BATCH_RUNS:-2}"' in script
     assert '--target-sync-every-runs "${STS2_HYBRID_TARGET_SYNC_RUNS:-100}"' in script
     assert 'COLLECTOR_DEVICE="${STS2_HYBRID_COLLECTOR_DEVICE:-cuda}"' in script
+    assert 'COLLECTOR_START_EPISODE="${STS2_HYBRID_COLLECTOR_START_EPISODE:-0}"' in script
     assert "--producer-id \"collector-$index\"" in script
+    assert '--start-episode-index "$COLLECTOR_START_EPISODE"' in script
+
+
+def test_parallel_dashboard_surfaces_collector_failure(tmp_path: Path) -> None:
+    bridge = _script("run_hybrid_dashboard_bridge.py")
+    run_root = tmp_path / "failed-collector"
+    (run_root / "launcher").mkdir(parents=True)
+    (run_root / "status").mkdir()
+    (run_root / "launcher" / "launch.json").write_text("{}", encoding="utf-8")
+    (run_root / "status" / "trainer.json").write_text(
+        json.dumps({"state": "running"}), encoding="utf-8"
+    )
+    (run_root / "status" / "collector-0.json").write_text(
+        json.dumps(
+            {
+                "state": "failed",
+                "producer_id": "collector-0",
+                "error": "publication temporarily unavailable",
+                "unix_s": 30.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = SimpleNamespace(
+        run_root=str(run_root),
+        lineage="hybrid-parallel",
+        run_id="run-c",
+        target_runs=128,
+        collector_episode_capacity=200,
+        collector_count=2,
+        collector_device="cuda",
+        maximum_pending_runs=2,
+        revival_budget=64,
+        curriculum_mode="hybrid-completion-preheat",
+    )
+    events = bridge._projection(args)
+    assert events[-1]["event"] == "run_failed"
+    assert "collector-0" in events[-1]["error"]
+
+
+def test_collector_reload_keeps_loaded_policy_during_publication_swap() -> None:
+    source = (SCRIPT_ROOT / "run_hybrid_collector.py").read_text(encoding="utf-8")
+    assert "except FileNotFoundError:" in source
+    assert "if initial or model_mtime == 0:" in source
+    assert "return False" in source
+
+
+def test_trainer_publication_uses_unique_atomic_replacement() -> None:
+    source = (SCRIPT_ROOT / "run_hybrid_trainer.py").read_text(encoding="utf-8")
+    assert "uuid.uuid4().hex" in source
+    assert "os.replace(publication_temporary, publication)" in source

@@ -118,6 +118,9 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
     ]
     collector_rows.sort(key=lambda row: float(row.get("unix_s", 0.0) or 0.0))
     trainer_status = _read_json(run_root / "status" / "trainer.json")
+    collector_statuses = [
+        _read_json(path) for path in sorted((run_root / "status").glob("collector-*.json"))
+    ]
     latest = trainer_rows[-1] if trainer_rows else {}
     learner = latest.get("learner") if isinstance(latest.get("learner"), dict) else {}
     resumed_from = int(manifest.get("resumed_from_ingested_runs", 0) or 0)
@@ -264,6 +267,26 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "error": trainer_status.get("error"),
             }
         )
+    else:
+        failed_collectors = [
+            item for item in collector_statuses if item.get("state") == "failed"
+        ]
+        if failed_collectors:
+            details = "; ".join(
+                f"{item.get('producer_id', 'collector')}: {item.get('error', 'failed')}"
+                for item in failed_collectors
+            )
+            events.append(
+                {
+                    "event": "run_failed",
+                    "unix_s": max(
+                        float(item.get("unix_s", 0.0) or 0.0)
+                        for item in failed_collectors
+                    ),
+                    "environment_steps": environment_steps,
+                    "error": f"collector failure: {details}",
+                }
+            )
     return events
 
 
