@@ -112,12 +112,19 @@ class JoinedCollectionAuthority:
             if isinstance(combat, Mapping) and combat.get("in_progress") is True
             else self.macro
         )
-        return authority.choose(
+        override = authority.choose(
             observation=observation,
             semantic_actions=semantic_actions,
             snapshot=snapshot,
             valid=valid,
         )
+        if authority is self.macro and self.combat.has_pending_bridge:
+            # Cross-domain bootstrap bridge: the first macro surface after an
+            # encounter (owned or declined) is the combat domain's bootstrap
+            # state.  The router stays policy-free — it only forwards the
+            # decision snapshot it was already given.
+            self.combat.close_encounter(snapshot)
+        return override
 
     def observe_step(self, *, reward: float, floor: int | None, terminal: bool) -> None:
         for authority in self.authorities:

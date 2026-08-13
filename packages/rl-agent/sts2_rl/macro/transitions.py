@@ -18,7 +18,7 @@ from typing import Any, Final, Literal
 
 from sts2_rl.encoding import EncodedDecisionSnapshot
 
-MACRO_TRANSITION_CONTRACT_VERSION: Final = "sts2-macro-transition-v4"
+MACRO_TRANSITION_CONTRACT_VERSION: Final = "sts2-macro-transition-v5"
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +42,12 @@ class MacroStep:
     recurrent_reset: bool = False
     target_key: str | None = None
     behavior_epsilon: float = 0.0
+    # Cross-domain bootstrap bridge (design doc §2): the encounter-closing
+    # combat transition carries the next MACRO decision snapshot.  The combat
+    # learner bootstraps this step from the pinned macro publication instead
+    # of its own value function; run-terminal steps keep bootstrap 0 via the
+    # clock and therefore never carry a bridge.
+    bridge_snapshot: EncodedDecisionSnapshot | None = None
     version: str = MACRO_TRANSITION_CONTRACT_VERSION
 
     def __post_init__(self) -> None:
@@ -70,6 +76,15 @@ class MacroStep:
             raise TypeError("macro step recurrent_reset must be a boolean")
         if not math.isfinite(self.behavior_epsilon) or not 0.0 <= self.behavior_epsilon <= 1.0:
             raise ValueError("macro step behavior_epsilon must be in [0, 1]")
+        if self.bridge_snapshot is not None:
+            if not isinstance(self.bridge_snapshot, EncodedDecisionSnapshot):
+                raise TypeError("macro step bridge_snapshot has the wrong type")
+            if self.control_domain != "combat":
+                raise ValueError("only combat-domain closing transitions may carry a bridge snapshot")
+            if self.terminal:
+                raise ValueError(
+                    "a bridged transition is never terminal; run-terminal keeps bootstrap 0 via the clock"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,8 +103,12 @@ class MacroEpisode:
         for step in self.steps[:-1]:
             if step.terminal:
                 raise ValueError("terminal macro step must be the final step")
-        if not self.steps[-1].terminal:
-            raise ValueError("complete macro episode must end with a terminal step")
+        # A combat-domain episode may end at a domain-terminal bridge instead
+        # of a run terminal: the bridged closing transition already owns its
+        # complete bootstrap through the partner value, so nothing after it
+        # belongs to this domain's replay.
+        if not self.steps[-1].terminal and self.steps[-1].bridge_snapshot is None:
+            raise ValueError("complete macro episode must end with a terminal or bridged step")
         domains = {step.control_domain for step in self.steps}
         if len(domains) != 1:
             raise ValueError("one replay episode may contain only one control domain")
@@ -113,15 +132,22 @@ def n_step_targets(
     bootstrap_values: tuple[float, ...],
     *,
     n_step: int,
+    forced_truncations: tuple[bool, ...] | None = None,
 ) -> tuple[float, ...]:
     """Exact n-step returns under the per-transition clock discounts.
 
     ``bootstrap_values[t]`` is the (Double-Q) value of the state reached by
     transition ``t`` — consumed at the truncation point.  A zero discount
-    (terminal) cuts the chain naturally.
+    (terminal) cuts the chain naturally.  A forced truncation marks a
+    domain-terminal bridge step: after adding that step's reward the chain
+    consumes ``weight * bootstrap_values[step]`` (the partner value at the
+    clock discount) and stops — no continuation across the encounter
+    boundary.
     """
 
     if not rewards or len(rewards) != len(discounts) or len(rewards) != len(bootstrap_values):
+        raise ValueError("n-step target inputs are misaligned")
+    if forced_truncations is not None and len(forced_truncations) != len(rewards):
         raise ValueError("n-step target inputs are misaligned")
     if isinstance(n_step, bool) or not isinstance(n_step, int) or n_step <= 0:
         raise ValueError("n_step must be a positive integer")
@@ -135,6 +161,9 @@ def n_step_targets(
             value += weight * rewards[step]
             weight *= discounts[step]
             if weight == 0.0:
+                break
+            if forced_truncations is not None and forced_truncations[step]:
+                value += weight * bootstrap_values[step]
                 break
             if step - start + 1 >= n_step or step + 1 >= horizon:
                 value += weight * bootstrap_values[step]

@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import pickle
 import random
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -26,6 +27,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from sts2_rl.encoding import EncodedDecisionSnapshot
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots
 from sts2_rl.macro import (
     MacroEpisode,
@@ -250,9 +252,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lineage-id", default="stage2-isolated-macro-v1")
     parser.add_argument(
         "--control-domain",
-        choices=("macro",),
+        choices=("macro", "combat"),
         default="macro",
-        help="Stage 2 optimizes macro decisions only",
+        help="control domain this trainer optimizes; combat requires --bridge-partner",
+    )
+    parser.add_argument(
+        "--bridge-partner",
+        default=None,
+        help="frozen macro publication (.pt) pinned as the cross-domain bootstrap "
+        "partner; required for --control-domain combat, forbidden otherwise",
     )
     parser.add_argument("--producer-status-dir", required=True)
     parser.add_argument("--producer-id", action="append", dest="producer_ids", required=True)
@@ -299,11 +307,21 @@ def main() -> int:
     durable_ingested = 0
     durable_environment_steps = 0
     learner: MacroQLearner | None = None
+    bridge_partner_path = Path(args.bridge_partner) if args.bridge_partner is not None else None
     try:
         if init_path is not None and not init_path.is_file():
             raise FileNotFoundError(f"model initialization does not exist: {init_path}")
         if resume_path is not None and not resume_path.is_file():
             raise FileNotFoundError(f"resume training state does not exist: {resume_path}")
+        if args.control_domain == "combat" and bridge_partner_path is None:
+            raise ValueError(
+                "--control-domain combat requires --bridge-partner: the combat "
+                "learner bootstraps encounter boundaries from a pinned macro publication"
+            )
+        if args.control_domain != "combat" and bridge_partner_path is not None:
+            raise ValueError("--bridge-partner applies only to --control-domain combat")
+        if bridge_partner_path is not None and not bridge_partner_path.is_file():
+            raise FileNotFoundError(f"bridge partner publication does not exist: {bridge_partner_path}")
         config = load_training_config(profile="preheat", config_path=Path(args.config))
         if args.device is not None:
             config = replace(config, runtime=replace(config.runtime, device=str(args.device)))
@@ -354,6 +372,44 @@ def main() -> int:
             parameter.requires_grad_(False)
 
         device = resources.device
+
+        # Cross-domain bootstrap bridge: the pinned macro publication is
+        # loaded exactly once at segment start; a segment never mixes partner
+        # versions inside one target computation (bridge doc §2.4).
+        bridge_value: Callable[[EncodedDecisionSnapshot], float] | None = None
+        bridge_partner_record: dict[str, str] | None = None
+        if bridge_partner_path is not None:
+            bridge_partner_record = {
+                "path": str(bridge_partner_path),
+                "sha256": hashlib.sha256(bridge_partner_path.read_bytes()).hexdigest(),
+            }
+            partner_model = copy.deepcopy(resources.model)
+            load_trunk_state(
+                partner_model,
+                dict(torch.load(bridge_partner_path, map_location=device, weights_only=True)),
+            )
+            partner_model.eval()
+            for parameter in partner_model.parameters():
+                parameter.requires_grad_(False)
+            partner_forward = _batched_forward_factory(
+                partner_model, resources.encoder, device, detach_hidden=True
+            )
+
+            def _partner_bridge_value(snapshot: EncodedDecisionSnapshot) -> float:
+                # Masked max over the partner's candidate Q values, no-grad.
+                with torch.no_grad():
+                    q_values, _ = partner_forward((snapshot,), None)
+                    mask = torch.zeros(
+                        q_values.shape[-1], dtype=torch.bool, device=q_values.device
+                    )
+                    count = len(snapshot.action_mask)
+                    mask[:count] = torch.tensor(
+                        snapshot.action_mask, dtype=torch.bool, device=q_values.device
+                    )
+                    return float(q_values[0].masked_fill(~mask, float("-inf")).max().item())
+
+            bridge_value = _partner_bridge_value
+
         replay = MacroSequenceReplay(
             capacity_episodes=args.replay_episodes,
             window_length=16,
@@ -370,6 +426,7 @@ def main() -> int:
             forward_online_batch=_batched_forward_factory(macro_online, resources.encoder, device, detach_hidden=False),
             forward_target_batch=_batched_forward_factory(macro_target, resources.encoder, device, detach_hidden=True),
             target_evaluation_context=lambda: _evaluation_mode(macro_target),
+            bridge_value=bridge_value,
         )
 
         if resume_path is not None:
@@ -431,6 +488,8 @@ def main() -> int:
                         "load_mode": "resume"
                         if resume_path is not None
                         else ("model_init" if init_path is not None else "fresh"),
+                        "control_domain": args.control_domain,
+                        "bridge_partner": bridge_partner_record,
                         "ingested_total": ingested,
                         "environment_steps": environment_steps,
                         "policy_version": learner.metrics.updates,
@@ -451,6 +510,7 @@ def main() -> int:
                     "event": "trainer_ingest",
                     "unix_s": time.time(),
                     "pipeline_id": args.pipeline_id,
+                    "bridge_partner": bridge_partner_record,
                     "ingested_total": ingested,
                     "fresh": len(pending_summaries),
                     "environment_steps": environment_steps,

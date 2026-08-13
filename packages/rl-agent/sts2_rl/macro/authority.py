@@ -163,6 +163,8 @@ class MacroCollectionAuthority:
         self.last_executor_failure: dict[str, Any] | None = None
         self._last_floor = 0
         self._combat_active = False
+        self._awaiting_bridge = False
+        self._bridge_misses = 0
         self.overrides = 0
         self.mechanical_dispatches = 0
         self.declined = 0
@@ -179,6 +181,8 @@ class MacroCollectionAuthority:
         self._executor_failures = 0
         self._last_floor = 0
         self._combat_active = False
+        self._awaiting_bridge = False
+        self._bridge_misses = 0
         self.overrides = 0
         self.mechanical_dispatches = 0
         self.declined = 0
@@ -216,6 +220,35 @@ class MacroCollectionAuthority:
         combat = observation.get("combat")
         if not (isinstance(combat, Mapping) and combat.get("in_progress") is True):
             self._combat_active = False
+            if self._open is not None:
+                # The encounter ended with its closing transition still open.
+                # It stays open across the boundary until the next macro
+                # decision snapshot arrives (:meth:`close_encounter`); a run
+                # terminal instead closes it terminally with bootstrap 0.
+                self._awaiting_bridge = True
+
+    @property
+    def has_pending_bridge(self) -> bool:
+        """True while an encounter-closing transition awaits its bridge."""
+
+        return self._awaiting_bridge and self._open is not None
+
+    def close_encounter(self, bridge_snapshot: EncodedDecisionSnapshot) -> None:
+        """Close the open encounter transition on the post-combat macro surface.
+
+        The closing combat transition receives the boundary rewards accrued
+        since the last combat decision, the clock discount to the current
+        floor, and the macro decision snapshot the combat learner bootstraps
+        from via the pinned partner (bridge doc §2).
+        """
+
+        if self.control_domain != "combat":
+            raise RuntimeError("only the combat authority closes encounters over a bridge")
+        if not isinstance(bridge_snapshot, EncodedDecisionSnapshot):
+            raise TypeError("bridge snapshot has the wrong type")
+        if self._open is None or not self._awaiting_bridge:
+            raise RuntimeError("no open encounter transition awaits a bridge snapshot")
+        self._close_open(terminal=False, bridge_snapshot=bridge_snapshot)
 
     def finish_episode(self, episode_id: str | None = None) -> MacroEpisode | None:
         if self._episode_replay_invalid:
@@ -223,6 +256,7 @@ class MacroCollectionAuthority:
             self._steps = []
             self._open = None
             self._pending_plan = None
+            self._awaiting_bridge = False
             return None
         self._close_open(terminal=True)
         if not self._steps:
@@ -297,6 +331,7 @@ class MacroCollectionAuthority:
             self._pending_plan = None
             self._open = None
             self._steps = []
+            self._awaiting_bridge = False
             self._episode_replay_invalid = True
             self._executor_failures += 1
             self.last_executor_failure = {
@@ -318,6 +353,20 @@ class MacroCollectionAuthority:
             return None
         executable = self._executable_candidates(decision, valid)
         if not executable:
+            self.declined += 1
+            return None
+        if self.control_domain == "combat" and self._awaiting_bridge:
+            # Fail-closed (bridge doc §6): a new encounter is beginning but
+            # the previous encounter's closing transition never captured its
+            # macro bridge snapshot.  Folding the boundary silently would
+            # bake macro behavior into combat values, so the whole episode
+            # leaves combat replay — the existing replay-invalid mechanism.
+            self._pending_plan = None
+            self._open = None
+            self._steps = []
+            self._awaiting_bridge = False
+            self._episode_replay_invalid = True
+            self._bridge_misses += 1
             self.declined += 1
             return None
         recurrent_reset = False
@@ -500,8 +549,15 @@ class MacroCollectionAuthority:
             recurrent_reset=recurrent_reset,
         )
 
-    def _close_open(self, *, terminal: bool, floor: int | None = None) -> None:
+    def _close_open(
+        self,
+        *,
+        terminal: bool,
+        floor: int | None = None,
+        bridge_snapshot: EncodedDecisionSnapshot | None = None,
+    ) -> None:
         if self._open is None:
+            self._awaiting_bridge = False
             return
         closing_floor = self._last_floor if floor is None else floor
         discount = decision_discount(
@@ -522,9 +578,11 @@ class MacroCollectionAuthority:
                 recurrent_reset=self._open.recurrent_reset,
                 target_key=self._open.target_key,
                 behavior_epsilon=self._open.behavior_epsilon,
+                bridge_snapshot=bridge_snapshot,
             )
         )
         self._open = None
+        self._awaiting_bridge = False
 
     def metrics(self) -> dict[str, Any]:
         return {
@@ -535,6 +593,8 @@ class MacroCollectionAuthority:
             "recorded_steps": len(self._steps),
             "episode_replay_invalid": self._episode_replay_invalid,
             "executor_failures": self._executor_failures,
+            "bridge_misses": self._bridge_misses,
+            "pending_bridge": self.has_pending_bridge,
             "epsilon": self.epsilon,
             "control_domain": self.control_domain,
         }

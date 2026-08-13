@@ -25,16 +25,33 @@ SEED_BASE="${STS2_STAGE2_SEED_BASE:-$("$VENV_DIR/bin/python" -c 'import secrets;
 RUN_DIR="${STS2_STAGE2_RUN_DIR:-$ARTIFACT_ROOT/runs/$LINEAGE_ID/run-$PIPELINE_ID}"
 RESUME="${STS2_STAGE2_RESUME:-}"
 INIT_MACRO="${STS2_STAGE2_INIT_MACRO:-}"
+BRIDGE_PARTNER="${STS2_STAGE2_BRIDGE_PARTNER:-}"
 
 [[ -f "$CHAMPION/network.pt" ]] || { echo "[stage2-par] champion missing network.pt" >&2; exit 1; }
 [[ -f "$SIM_EXE" && -f "$SIM_EXE.identity.json" ]] || { echo "[stage2-par] pinned sim or identity missing" >&2; exit 1; }
 [[ -z "$RESUME" || -z "$INIT_MACRO" ]] || { echo "[stage2-par] resume and model-init are mutually exclusive" >&2; exit 2; }
 [[ -z "$RESUME" || -f "$RESUME" ]] || { echo "[stage2-par] resume state missing: $RESUME" >&2; exit 1; }
 [[ -z "$INIT_MACRO" || -f "$INIT_MACRO" ]] || { echo "[stage2-par] model initialization missing: $INIT_MACRO" >&2; exit 1; }
-[[ "$CONTROL_DOMAIN" == "macro" ]] || {
-  echo "[stage2-par] production Stage-2 currently owns macro decisions only; combat training requires an explicit cross-domain bridge" >&2
-  exit 2
-}
+# Combat training requires the explicit cross-domain bootstrap bridge: the
+# guard lifts ONLY when a pinned macro publication exists on disk.
+case "$CONTROL_DOMAIN" in
+  macro)
+    [[ -z "$BRIDGE_PARTNER" ]] || {
+      echo "[stage2-par] STS2_STAGE2_BRIDGE_PARTNER applies only to the combat control domain" >&2
+      exit 2
+    }
+    ;;
+  combat)
+    [[ -n "$BRIDGE_PARTNER" && -f "$BRIDGE_PARTNER" ]] || {
+      echo "[stage2-par] combat training requires an explicit cross-domain bridge: set STS2_STAGE2_BRIDGE_PARTNER to an existing frozen macro publication" >&2
+      exit 2
+    }
+    ;;
+  *)
+    echo "[stage2-par] unsupported control domain: $CONTROL_DOMAIN" >&2
+    exit 2
+    ;;
+esac
 if [[ -e "$RUN_DIR" ]] && [[ -n "$(find "$RUN_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
   echo "[stage2-par] run directory must be new and empty: $RUN_DIR" >&2
   exit 2
@@ -95,6 +112,8 @@ MODE_ARGS=()
 if [[ -n "$RESUME" ]]; then MODE_ARGS=(--resume "$RESUME"); fi
 if [[ -n "$INIT_MACRO" ]]; then MODE_ARGS=(--init-macro "$INIT_MACRO"); fi
 DOMAIN_ARGS=(--control-domain "$CONTROL_DOMAIN")
+BRIDGE_ARGS=()
+if [[ -n "$BRIDGE_PARTNER" ]]; then BRIDGE_ARGS=(--bridge-partner "$BRIDGE_PARTNER"); fi
 PRODUCER_ARGS=()
 for producer_id in "${PRODUCER_IDS[@]}"; do PRODUCER_ARGS+=(--producer-id "$producer_id"); done
 
@@ -112,6 +131,7 @@ python scripts/run_stage2_trainer.py \
   "${PRODUCER_ARGS[@]}" \
   "${MODE_ARGS[@]}" \
   "${DOMAIN_ARGS[@]}" \
+  "${BRIDGE_ARGS[@]}" \
   --stop-after-episodes "${STS2_STAGE2_EPISODES:-1200}" \
   --updates-per-episode "${STS2_STAGE2_UPDATES:-8}" \
   --sample-windows "${STS2_STAGE2_SAMPLE_WINDOWS:-16}" \
@@ -149,6 +169,7 @@ for index in $(seq 1 "$COLLECTORS"); do
     --episodes "${STS2_STAGE2_COLLECTOR_EPISODES:-1000}" \
     --epsilon "${STS2_STAGE2_EPSILON:-0.15}" \
     "${DOMAIN_ARGS[@]}" \
+    "${BRIDGE_ARGS[@]}" \
     --seed $((SEED_BASE + index * 10000)) \
     --metrics-out "$RUN_DIR/$producer_id-metrics.jsonl" \
     --device cuda --sim-exe "$SIM_EXE" \

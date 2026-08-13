@@ -20,7 +20,11 @@ import torch
 from sts2_env.headless_sim_bridge_client import HeadlessSimError
 from sts2_rl.backends.headless import HeadlessRecoverableProtocolError
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots
-from sts2_rl.macro import MacroCollectionAuthority, load_trunk_state
+from sts2_rl.macro import (
+    JoinedCollectionAuthority,
+    MacroCollectionAuthority,
+    load_trunk_state,
+)
 from sts2_rl.training import build_training_resources, load_training_config
 
 # Sim-side faults the legacy runtime survives with a backend restart; the
@@ -115,9 +119,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--epsilon", type=float, default=0.15)
     parser.add_argument(
         "--control-domain",
-        choices=("macro",),
+        choices=("macro", "combat"),
         default="macro",
-        help="Stage 2 owns macro decisions; combat remains with the frozen champion",
+        help="control domain the trainable authority owns; combat requires "
+        "--bridge-partner (the frozen macro publication owning macro surfaces)",
+    )
+    parser.add_argument(
+        "--bridge-partner",
+        default=None,
+        help="frozen macro publication (.pt) that greedily owns macro surfaces "
+        "during combat-domain collection; required for --control-domain combat",
     )
     parser.add_argument("--model-reload-episodes", type=int, default=5)
     parser.add_argument("--seed", type=int, required=True)
@@ -142,6 +153,7 @@ def main() -> int:
     }
     _atomic_json(status_path, {**base_status, "state": "running", "unix_s": time.time()})
     resources = None
+    bridge_partner_path = Path(args.bridge_partner) if args.bridge_partner is not None else None
     try:
         if init_path is not None and not init_path.is_file():
             raise FileNotFoundError(f"collector initialization does not exist: {init_path}")
@@ -149,6 +161,18 @@ def main() -> int:
             raise FileNotFoundError(
                 "collector has neither a trainer publication nor explicit " f"initialization: {model_path}"
             )
+        if args.control_domain == "combat":
+            if bridge_partner_path is None:
+                raise ValueError(
+                    "--control-domain combat requires --bridge-partner: macro "
+                    "surfaces belong to the frozen macro publication"
+                )
+            if not bridge_partner_path.is_file():
+                raise FileNotFoundError(
+                    f"bridge partner publication does not exist: {bridge_partner_path}"
+                )
+        elif bridge_partner_path is not None:
+            raise ValueError("--bridge-partner applies only to --control-domain combat")
         config = load_training_config(profile="preheat", config_path=Path(args.config))
         config = replace(config, runtime=replace(config.runtime, seed=int(args.seed)))
         if args.device is not None:
@@ -184,13 +208,13 @@ def main() -> int:
         resources = build_resources()
         device = resources.device
 
-        macro_model = copy.deepcopy(resources.model)
+        trainable_model = copy.deepcopy(resources.model)
         if init_path is not None:
             load_trunk_state(
-                macro_model,
+                trainable_model,
                 dict(torch.load(init_path, map_location=device, weights_only=True)),
             )
-        macro_model.eval()
+        trainable_model.eval()
         model_mtime = 0.0
 
         def maybe_reload() -> None:
@@ -200,19 +224,56 @@ def main() -> int:
             mtime = model_path.stat().st_mtime_ns
             if mtime <= model_mtime:
                 return
-            _load_published_model_state(macro_model, model_path, device)
-            macro_model.eval()
+            _load_published_model_state(trainable_model, model_path, device)
+            trainable_model.eval()
             model_mtime = mtime
 
         maybe_reload()
-        authority = MacroCollectionAuthority(
-            forward_q=_forward_factory(macro_model, resources.encoder, resources.device),
+        trainable_authority = MacroCollectionAuthority(
+            forward_q=_forward_factory(trainable_model, resources.encoder, resources.device),
             initial_state=lambda: None,
             epsilon=args.epsilon,
             seed=int(args.seed),
             control_domain=args.control_domain,
         )
-        resources.collector.macro_authority = authority
+        driver: Any = trainable_authority
+        if args.control_domain == "combat":
+            # The frozen macro publication greedily owns macro surfaces.  It
+            # acts, it does not record: its finished episodes are discarded
+            # each iteration; the spool carries the combat domain only.  It
+            # is loaded once and never reloaded (pinned partner).
+            assert bridge_partner_path is not None
+            partner_model = copy.deepcopy(resources.model)
+            load_trunk_state(
+                partner_model,
+                dict(torch.load(bridge_partner_path, map_location=device, weights_only=True)),
+            )
+            partner_model.eval()
+            partner_authority = MacroCollectionAuthority(
+                forward_q=_forward_factory(partner_model, resources.encoder, resources.device),
+                initial_state=lambda: None,
+                epsilon=0.0,
+                seed=int(args.seed),
+                control_domain="macro",
+            )
+            driver = JoinedCollectionAuthority(
+                macro=partner_authority,
+                combat=trainable_authority,
+            )
+        resources.collector.macro_authority = driver
+
+        def finish_recorded_episode(episode_id: str) -> Any:
+            if isinstance(driver, JoinedCollectionAuthority):
+                episodes = driver.finish_episodes(episode_id)
+                # Discard the frozen partner's episode; keep the combat view.
+                return episodes["combat"]
+            return driver.finish_episode(episode_id)
+
+        def discard_episodes() -> None:
+            if isinstance(driver, JoinedCollectionAuthority):
+                driver.finish_episodes(f"discard-{uuid.uuid4().hex}")
+            else:
+                driver.finish_episode()
 
         produced = 0
         with metrics_path.open("a", encoding="utf-8") as metrics_file:
@@ -258,18 +319,18 @@ def main() -> int:
                     metrics_file.flush()
                     # The interrupted episode's macro view is unusable; the
                     # authority state resets with a discarded finish.
-                    authority.finish_episode()
+                    discard_episodes()
                     try:
                         resources.close()
                     except Exception:
                         pass
                     resources = build_resources()
-                    resources.collector.macro_authority = authority
+                    resources.collector.macro_authority = driver
                     continue
-                macro_episode = authority.finish_episode(
+                macro_episode = finish_recorded_episode(
                     f"spool-{args.pipeline_id}-{args.producer_id}-{run_nonce}-{episode_index:05d}"
                 )
-                authority_metrics = authority.metrics()
+                authority_metrics = trainable_authority.metrics()
                 collected_at = time.time()
                 summary = _episode_summary(
                     episode,
@@ -321,7 +382,7 @@ def main() -> int:
                                 authority_metrics["executor_failures"]
                             ),
                             "semantic_executor_last_failure": (
-                                authority.last_executor_failure
+                                trainable_authority.last_executor_failure
                             ),
                         }
                     )

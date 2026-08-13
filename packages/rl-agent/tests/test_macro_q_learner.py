@@ -101,7 +101,7 @@ def test_transition_contract_rejects_illegal_and_terminal_bootstrap() -> None:
             branch="rest",
             control_domain="macro",
         )
-    with pytest.raises(ValueError, match="must end with a terminal step"):
+    with pytest.raises(ValueError, match="must end with a terminal or bridged step"):
         MacroEpisode(episode_id="unfinished", steps=(_step(),))
     episode = MacroEpisode(
         episode_id="ep-1",

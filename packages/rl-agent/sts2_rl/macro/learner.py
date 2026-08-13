@@ -23,6 +23,8 @@ from typing import Any, Final
 import torch
 from torch import Tensor
 
+from sts2_rl.encoding import EncodedDecisionSnapshot
+
 from .replay import MacroSequenceReplay, MacroWindow
 from .transitions import MacroStep, n_step_targets
 
@@ -110,6 +112,7 @@ class MacroQLearner:
             Callable[[Sequence[Any], Any], tuple[Tensor, Any]] | None
         ) = None,
         target_evaluation_context: Callable[[], AbstractContextManager[None]] = nullcontext,
+        bridge_value: Callable[[EncodedDecisionSnapshot], float] | None = None,
     ) -> None:
         self.config = config or MacroQConfig()
         self.forward_online = forward_online
@@ -124,6 +127,12 @@ class MacroQLearner:
         self.forward_online_batch = forward_online_batch
         self.forward_target_batch = forward_target_batch
         self.target_evaluation_context = target_evaluation_context
+        # Cross-domain bootstrap bridge: the pinned partner publication's
+        # masked-max Q over a bridge snapshot, evaluated no-grad at training
+        # time.  Combat-domain replay carries bridge snapshots on its
+        # encounter-closing transitions; training them without a partner is
+        # exactly what the launcher guard forbids.
+        self.bridge_value = bridge_value
         parameters = list(online_parameters)
         if not parameters:
             raise ValueError("macro Q learner requires trainable parameters")
@@ -377,6 +386,38 @@ class MacroQLearner:
             )
         return results
 
+    def _bridge_bootstraps(
+        self,
+        bootstraps: tuple[float, ...],
+        learn_steps: Sequence[MacroStep],
+    ) -> tuple[tuple[float, ...], tuple[bool, ...] | None]:
+        """Replace domain-terminal bootstraps with the pinned partner value.
+
+        A learn step carrying a bridge snapshot is an encounter-closing
+        combat transition: its bootstrap is the partner's masked-max Q over
+        the post-combat macro surface (no-grad), and the n-step chain is
+        force-truncated there so no continuation crosses the encounter
+        boundary.
+        """
+
+        if all(step.bridge_snapshot is None for step in learn_steps):
+            return bootstraps, None
+        if self.bridge_value is None:
+            raise RuntimeError(
+                "combat replay carries bridge snapshots but the learner has no "
+                "bridge_value partner; combat training without a pinned macro "
+                "publication is forbidden"
+            )
+        adjusted = list(bootstraps)
+        forced = [False] * len(learn_steps)
+        for index, step in enumerate(learn_steps):
+            if step.bridge_snapshot is None:
+                continue
+            with torch.no_grad():
+                adjusted[index] = float(self.bridge_value(step.bridge_snapshot))
+            forced[index] = True
+        return tuple(adjusted), tuple(forced)
+
     def state_dict(self) -> dict[str, Any]:
         """Return optimizer and schedule/metric state for exact continuation.
 
@@ -428,12 +469,16 @@ class MacroQLearner:
         else:
             window_values = [self._window_values(window) for window in windows]
         for executed_q, rewards, discounts, bootstraps, learn_steps in window_values:
+            bridged_bootstraps, forced_truncations = self._bridge_bootstraps(
+                bootstraps, learn_steps
+            )
             targets = torch.as_tensor(
                 n_step_targets(
                     rewards,
                     discounts,
-                    bootstraps,
+                    bridged_bootstraps,
                     n_step=self.config.n_step,
+                    forced_truncations=forced_truncations,
                 ),
                 dtype=executed_q.dtype,
                 device=executed_q.device,
