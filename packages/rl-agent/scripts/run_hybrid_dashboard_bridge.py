@@ -21,6 +21,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--target-runs", type=int, required=True)
     parser.add_argument("--collector-episode-capacity", type=int, required=True)
     parser.add_argument("--collector-count", type=int, default=1)
+    parser.add_argument("--collector-device", default="cpu")
     parser.add_argument("--maximum-pending-runs", type=int, required=True)
     parser.add_argument("--revival-budget", type=int, required=True)
     parser.add_argument("--curriculum-mode", default="hybrid-candidate-q")
@@ -151,7 +152,7 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 },
                 "runtime": {
                     "device": "cuda",
-                    "collector_device": "cpu",
+                    "collector_device": args.collector_device,
                     "collector_workers": args.collector_count,
                     "total_environment_steps": 0,
                     "target_training_episodes": args.target_runs,

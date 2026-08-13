@@ -81,6 +81,7 @@ def test_parallel_dashboard_uses_learner_acknowledgement_order(tmp_path: Path) -
         target_runs=100,
         collector_episode_capacity=120,
         collector_count=2,
+        collector_device="cuda",
         maximum_pending_runs=2,
         revival_budget=64,
         curriculum_mode="hybrid-completion-preheat",
@@ -90,6 +91,7 @@ def test_parallel_dashboard_uses_learner_acknowledgement_order(tmp_path: Path) -
     assert [row["producer_id"] for row in episodes] == ["collector-0", "collector-1"]
     assert [row["reset_seed"] for row in episodes] == [10, 20]
     assert events[0]["config"]["runtime"]["collector_workers"] == 2
+    assert events[0]["config"]["runtime"]["collector_device"] == "cuda"
     updates = [row for row in events if row["event"] == "learner_update"]
     assert [row["rollout_queue"]["size"] for row in updates] == [1, 0]
 
@@ -136,6 +138,7 @@ def test_parallel_dashboard_resume_starts_at_checkpoint_counters(tmp_path: Path)
         target_runs=128,
         collector_episode_capacity=200,
         collector_count=2,
+        collector_device="cuda",
         maximum_pending_runs=2,
         revival_budget=64,
         curriculum_mode="hybrid-completion-preheat",
