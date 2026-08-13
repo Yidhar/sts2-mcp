@@ -260,6 +260,22 @@ def test_dashboard_reads_hybrid_evaluation_summary() -> None:
     assert '"hybrid_last_target_sync_update": item.get(' in source
 
 
+def test_monitor_projects_hybrid_target_sync_clock() -> None:
+    from sts2_rl.monitoring import _project_learner
+
+    point, latest = _project_learner(
+        {
+            "event": "learner_update",
+            "policy_version": 164,
+            "hybrid_target_syncs": 2,
+            "hybrid_last_target_sync_update": 164,
+        }
+    )
+    for projected in (point, latest):
+        assert projected["hybrid_target_syncs"] == 2
+        assert projected["hybrid_last_target_sync_update"] == 164
+
+
 def test_dashboard_tail_replacement_preserves_non_update_rows() -> None:
     bridge = _script("run_hybrid_dashboard_bridge.py")
     rows = [

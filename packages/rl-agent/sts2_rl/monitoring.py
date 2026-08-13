@@ -320,6 +320,10 @@ def _project_learner(event: JsonDict) -> tuple[JsonDict, JsonDict]:
         "hybrid_macro_td_abs": event.get("hybrid_macro_td_abs"),
         "hybrid_combat_td_abs": event.get("hybrid_combat_td_abs"),
         "hybrid_shared_gradient_cosine": event.get("hybrid_shared_gradient_cosine"),
+        "hybrid_target_syncs": event.get("hybrid_target_syncs"),
+        "hybrid_last_target_sync_update": event.get(
+            "hybrid_last_target_sync_update"
+        ),
     }
     latest = {
         **point,
