@@ -244,6 +244,7 @@ def main() -> int:
         last_publication = ingested
         with metrics_path.open("a", encoding="utf-8") as metrics:
             while ingested < args.stop_after_runs:
+                previous_ingested = ingested
                 files = sorted(
                     spool.glob("*.pkl"),
                     key=lambda item: item.stat().st_mtime_ns,
@@ -283,7 +284,8 @@ def main() -> int:
                     update_metrics = learner.update()
                 if (
                     args.target_sync_every_runs > 0
-                    and ingested % args.target_sync_every_runs == 0
+                    and previous_ingested // args.target_sync_every_runs
+                    < ingested // args.target_sync_every_runs
                 ):
                     learner.sync_target()
                     update_metrics = learner.metrics.as_mapping()
