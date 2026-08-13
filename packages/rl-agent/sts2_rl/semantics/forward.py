@@ -445,6 +445,58 @@ def _single_step_candidates(
     return _deduplicate_candidates(result)
 
 
+def _macro_selection_candidates(
+    legal_actions: Sequence[Mapping[str, Any]],
+) -> tuple[SemanticCandidate, ...] | None:
+    """Compile a standalone macro picker as a monotone choice surface.
+
+    Composite Smith/Remove pickers are consumed by their pending executor
+    plan before this function runs. A remaining picker is therefore itself a
+    strategic macro choice (for example an event card selection). Reverse
+    traffic is excluded so select/cancel churn cannot become a preference.
+    """
+
+    kinds = [_token(action.get("kind") or action.get("action")) for action in legal_actions]
+    selection_surface = any(
+        kind
+        in (
+            _COMBAT_SELECTION_ADD_KINDS
+            | _COMBAT_SELECTION_COMMIT_KINDS
+            | _COMBAT_SELECTION_REVERSE_KINDS
+        )
+        for kind in kinds
+    )
+    if not selection_surface:
+        return None
+    candidates: list[SemanticCandidate] = []
+    for index, action in enumerate(legal_actions):
+        kind = _token(action.get("kind") or action.get("action"))
+        if kind in _COMBAT_SELECTION_ADD_KINDS:
+            branch = "selection_add"
+        elif kind in _COMBAT_SELECTION_COMMIT_KINDS:
+            branch = "selection_commit"
+        else:
+            continue
+        target: Mapping[str, Any] | None = None
+        if isinstance(action.get("card"), Mapping):
+            target = _card_facts(action["card"])
+        candidates.append(
+            SemanticCandidate(
+                branch=branch,
+                target_key=_target_key(target) if target else None,
+                target=target,
+                plan=(NativeStep(kind=kind, target=target),),
+                semantic_action=_semantic_action(
+                    action,
+                    model_kind="card_selection",
+                    branch=branch,
+                ),
+                native_index=index,
+            )
+        )
+    return _deduplicate_candidates(candidates) if candidates else None
+
+
 def _combat_candidates(
     legal_actions: Sequence[Mapping[str, Any]],
 ) -> tuple[SemanticCandidate, ...] | None:
@@ -524,8 +576,8 @@ def forward_decision(
     caller then exposes the raw native decision unchanged (fail-closed).
     One compiler call belongs to exactly one control domain.  A macro owner
     never receives combat candidates and a combat owner never receives macro
-    candidates; joined control is expressed by two authorities, not a flag on
-    one recurrent state.
+    candidates.  A joint controller chooses the active domain before calling
+    this compiler and keeps its run/combat memories split in the model.
     """
 
     if control_domain not in {"macro", "combat"}:
@@ -542,6 +594,10 @@ def forward_decision(
 
     if control_domain == "combat":
         return None
+
+    selection = _macro_selection_candidates(legal_actions)
+    if selection is not None:
+        return ForwardDecision(surface="selection", candidates=selection)
 
     rest = _rest_candidates(observation, legal_actions)
     if rest is not None:
@@ -570,6 +626,49 @@ def forward_decision(
             target_field=None,
         )
     )
+    # Combat rewards are a second reward surface. Each claimable slot is a
+    # real strategic alternative (gold/relic/potion/card opening), while
+    # ``proceed``/``skip_rewards`` is the refusal branch. Keep them atomic:
+    # selecting a card from a claimed card pack is compiled separately by the
+    # card-reward surface above.
+    reward_claims = _actions_of_kind(legal_actions, "claim_reward")
+    for index, action in reward_claims:
+        raw_reward = action.get("reward")
+        reward = dict(raw_reward) if isinstance(raw_reward, Mapping) else {}
+        reward_type = _token(reward.get("reward_type") or reward.get("type"))
+        branch = f"claim_{reward_type}" if reward_type else "claim"
+        rewards.append(
+            SemanticCandidate(
+                branch=branch,
+                target_key=_target_key(reward) if reward else None,
+                target=reward or None,
+                plan=(NativeStep(kind="claim_reward", target=reward or None),),
+                semantic_action=_semantic_action(
+                    action,
+                    model_kind="reward",
+                    branch=branch,
+                ),
+                native_index=index,
+            )
+        )
+    reward_leaves = list(_actions_of_kind(legal_actions, "skip_rewards"))
+    if reward_claims or reward_leaves:
+        reward_leaves.extend(_actions_of_kind(legal_actions, "proceed"))
+    for index, action in reward_leaves:
+        rewards.append(
+            SemanticCandidate(
+                branch="leave",
+                target_key=None,
+                target=None,
+                plan=(NativeStep(kind=_token(action.get("kind") or action.get("action"))),),
+                semantic_action=_semantic_action(
+                    action,
+                    model_kind="reward",
+                    branch="leave",
+                ),
+                native_index=index,
+            )
+        )
     if rewards:
         return ForwardDecision(
             surface="reward",

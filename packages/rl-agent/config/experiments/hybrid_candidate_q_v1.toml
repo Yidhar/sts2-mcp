@@ -1,0 +1,37 @@
+# Hybrid combat/macro Candidate-Q reset.
+#
+# This file supplies the existing factual encoder/environment contract. The
+# joint scripts do not construct or optimize the legacy V-trace learner,
+# transaction CE/AWR bridge, liveness actor, or scalar cross-domain bridge.
+
+[optimization]
+learning_rate = 0.0001
+
+[transaction_learning]
+enabled = false
+
+[failure_credit]
+mode = "disabled"
+
+[rollout]
+deterministic_probe_interval_episodes = 0
+deterministic_probe_environment_steps = []
+
+[episodic_learning]
+enabled = false
+
+[curriculum]
+revival_budget = 40
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 100000
+
+[runtime]
+rocm_sdpa_backend = "math"
+seed = 6500000
+log_dir = "runs/hybrid-candidate-q-v1"
+checkpoint_dir = "checkpoints/hybrid-candidate-q-v1"
+evaluation_steps = []
+early_evaluation_steps = []
+final_audit_steps = []
+evaluation_liveness_guard_enabled = false

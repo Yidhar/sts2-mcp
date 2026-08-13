@@ -227,6 +227,38 @@ def test_reward_map_event_are_native_atomic() -> None:
     assert len(takes) == 2 and all(c.target is not None for c in takes)
 
 
+def test_combat_reward_claim_and_leave_are_atomic_branches() -> None:
+    observation = {
+        "phase": "actions",
+        "state_type": "combat_rewards",
+        "combat": {"in_progress": False},
+    }
+    actions = [
+        {
+            "kind": "claim_reward",
+            "model_action_kind": "reward",
+            "index": 0,
+            "reward": {"reward_type": "gold", "amount": 35, "slot_index": 0},
+        },
+        {
+            "kind": "claim_reward",
+            "model_action_kind": "reward",
+            "index": 1,
+            "reward": {
+                "reward_type": "relic",
+                "slot_index": 1,
+                "relic": {"id": "RELIC.TEST"},
+            },
+        },
+        {"kind": "proceed", "model_action_kind": "proceed", "index": 2},
+    ]
+    decision = forward_decision(observation, actions)
+    assert decision is not None and decision.surface == "reward"
+    assert decision.branches == ("claim_gold", "claim_relic", "leave")
+    assert [candidate.native_index for candidate in decision.candidates] == [0, 1, 2]
+    assert all(len(candidate.plan) == 1 for candidate in decision.candidates)
+
+
 def test_combat_and_unknown_surfaces_fail_closed() -> None:
     combat_observation = {"phase": "combat", "combat": {"in_progress": True}}
     assert forward_decision(combat_observation, [{"kind": "play_card"}]) is None
@@ -259,6 +291,22 @@ def test_state_type_shop_with_inventory_is_recognized() -> None:
     decision = forward_decision(observation, actions)
     assert decision is not None and decision.surface == "shop"
     assert decision.branches == ("leave",)
+
+
+def test_macro_selection_is_monotone_add_or_commit() -> None:
+    observation = {"phase": "card_selection", "combat": {"in_progress": False}}
+    actions = [
+        {"kind": "select_card", "card": _card("CARD.A", copy=1)},
+        {"kind": "select_card", "card": _card("CARD.B", copy=2)},
+        {"kind": "cancel_selection"},
+    ]
+    decision = forward_decision(observation, actions)
+    assert decision is not None and decision.surface == "selection"
+    assert [candidate.branch for candidate in decision.candidates] == [
+        "selection_add",
+        "selection_add",
+    ]
+    assert [candidate.native_index for candidate in decision.candidates] == [0, 1]
 
 
 def test_combat_selection_is_monotone_add_or_commit() -> None:

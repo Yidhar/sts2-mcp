@@ -3565,6 +3565,91 @@ class GroundedCollector:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         encoding_ms = (time.perf_counter_ns() - encoding_started_ns) / 1_000_000.0
+        # A semantic joint authority is itself the control model.  Give it
+        # first ownership so collection does not run the retired actor/value
+        # network merely to discard that output. Mechanical/unsupported
+        # fall-through still uses the legacy path below to keep the generic
+        # collector contract intact.
+        if (
+            self.macro_authority is not None
+            and getattr(self.macro_authority, "exclusive_control", False)
+            and (
+                not deterministic
+                or getattr(self.macro_authority, "evaluation_ownership", False)
+            )
+        ):
+            valid = encoded.snapshot.action_mask.astype(bool, copy=False)
+            override_started_ns = time.perf_counter_ns()
+            override = self.macro_authority.choose(
+                observation=state.observation,
+                semantic_actions=semantic_actions,
+                snapshot=encoded.snapshot,
+                valid=valid,
+            )
+            if override is not None:
+                selected = int(override)
+                if not 0 <= selected < len(valid) or not bool(valid[selected]):
+                    raise CollectionProtocolError(
+                        "macro authority chose an illegal candidate index"
+                    )
+                q_values = getattr(
+                    self.macro_authority,
+                    "last_native_q_values",
+                    None,
+                )
+                if not isinstance(q_values, np.ndarray):
+                    raise CollectionProtocolError(
+                        "exclusive authority did not publish its candidate Q values"
+                    )
+                q_values = np.asarray(q_values, dtype=np.float32)
+                if q_values.shape != valid.shape:
+                    raise CollectionProtocolError(
+                        "exclusive authority Q shape differs from native candidates"
+                    )
+                legal = np.flatnonzero(valid & np.isfinite(q_values))
+                if legal.size == 0 or selected not in legal:
+                    raise CollectionProtocolError(
+                        "exclusive authority did not map its choice to native Q"
+                    )
+                shifted = q_values.astype(np.float64, copy=True)
+                shifted[legal] -= float(np.max(shifted[legal]))
+                weights = np.zeros_like(shifted, dtype=np.float64)
+                weights[legal] = np.exp(shifted[legal])
+                weights /= float(weights.sum())
+                policy = weights.astype(np.float32)
+                reference = encoded.action(selected)
+                return _ActionChoice(
+                    candidate_index=selected,
+                    dispatch_position=reference.position,
+                    dispatch_handle=reference.handle,
+                    equivalence_fingerprint=reference.equivalence_fingerprint,
+                    multiplicity=reference.multiplicity,
+                    action_references=encoded.actions,
+                    semantic_actions=semantic_actions,
+                    behavior_log_probability=0.0,
+                    model_log_probability=float(
+                        math.log(max(float(policy[selected]), 1e-30))
+                    ),
+                    valid_count=int(legal.size),
+                    snapshot=encoded.snapshot,
+                    # The legacy recurrent state is unused in this recordless
+                    # path; the authority owns and advances hybrid memory.
+                    recurrent_state=recurrent_state,
+                    policy=policy,
+                    value=float(np.max(q_values[legal])),
+                    encoding_ms=encoding_ms,
+                    policy_forward_ms=(
+                        time.perf_counter_ns() - override_started_ns
+                    )
+                    / 1_000_000.0,
+                    definition_hash_collisions=encoded.definition_hash_collisions,
+                    relation_hash_collisions=encoded.relation_hash_collisions,
+                    effective_epsilon=(
+                        0.0
+                        if getattr(self.macro_authority, "last_q_values", None) is None
+                        else float(self.macro_authority.epsilon)
+                    ),
+                )
         policy_started_ns = time.perf_counter_ns()
         was_training = self.model.training
         self.model.eval()
@@ -4329,10 +4414,10 @@ class GroundedCollector:
                 # The accepted transition is the factual terminal learning
                 # prefix. Do not dispatch another forced end-turn into a
                 # simulator state whose Status-card work is already runaway.
-                stall_evidence = runaway_combat_status.evidence(
+                runaway_evidence = runaway_combat_status.evidence(
                     detected_step=next_state.step_index,
                 )
-                stall_evidence.update(
+                runaway_evidence.update(
                     {
                         "window": combat_window_selection.effective_window,
                         "default_window": combat_window_selection.default_window,
@@ -4349,6 +4434,7 @@ class GroundedCollector:
                         "legal_action_kinds": _legal_action_kind_counts(next_state.legal_actions),
                     }
                 )
+                stall_evidence = runaway_evidence
             elif combat_progress_stalled:
                 # Construct this bounded snapshot only for the terminating
                 # transition. Ordinary decisions retain no additional state.

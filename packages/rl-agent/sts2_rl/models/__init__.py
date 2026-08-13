@@ -19,8 +19,16 @@ from .grounded_candidate import (
     WorldEncoding,
     WorldTokenBatch,
 )
+from .hybrid_candidate_q import (
+    HYBRID_CANDIDATE_Q_VERSION,
+    HybridCandidateQConfig,
+    HybridCandidateQOutput,
+    HybridDomainCandidateQModel,
+    initialize_hybrid_from_grounded,
+)
 
 __all__ = [
+    "HYBRID_CANDIDATE_Q_VERSION",
     "MACRO_ECONOMIC_SURFACE_CARD_REWARD",
     "MACRO_ECONOMIC_SURFACE_NONE",
     "MACRO_ECONOMIC_SURFACE_REMOVAL_SELECTION",
@@ -34,8 +42,12 @@ __all__ = [
     "CandidateTokenBatch",
     "GroundedCandidateBatch",
     "GroundedCandidateConfig",
+    "HybridCandidateQConfig",
+    "HybridCandidateQOutput",
+    "HybridDomainCandidateQModel",
     "RecurrentCandidateModel",
     "RecurrentCandidateOutput",
     "WorldEncoding",
     "WorldTokenBatch",
+    "initialize_hybrid_from_grounded",
 ]
