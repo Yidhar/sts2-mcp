@@ -30,6 +30,8 @@ import torch
 from sts2_rl.encoding import EncodedDecisionSnapshot
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots
 from sts2_rl.macro import (
+    JoinedCollectionAuthority,
+    MacroCollectionAuthority,
     MacroEpisode,
     MacroQConfig,
     MacroQLearner,
@@ -38,6 +40,7 @@ from sts2_rl.macro import (
     load_trunk_state,
 )
 from sts2_rl.training import build_training_resources, load_training_config
+from sts2_rl.training.seeding import held_out_evaluation_seeds
 
 TRAINING_STATE_FORMAT = "sts2-stage2-pipeline-state-v1"
 SPOOL_ENVELOPE_FORMAT = "sts2-stage2-spool-envelope-v1"
@@ -284,6 +287,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-windows", type=int, default=16)
     parser.add_argument("--replay-episodes", type=int, default=128)
     parser.add_argument("--save-interval-episodes", type=int, default=20)
+    parser.add_argument(
+        "--eval-interval-episodes",
+        type=int,
+        default=100,
+        help="held-out evaluation gate cadence in ingested episodes (0 disables)",
+    )
+    parser.add_argument(
+        "--eval-episodes",
+        type=int,
+        default=8,
+        help="held-out seeds per evaluation gate (fixed odd prefix)",
+    )
     parser.add_argument("--metrics-out", required=True)
     parser.add_argument("--device", default=None)
     parser.add_argument("--sim-exe", default=None)
@@ -471,6 +486,7 @@ def main() -> int:
         durable_ingested = ingested
         durable_environment_steps = environment_steps
         last_saved_at = ingested
+        last_eval_at = ingested
         last_progress = time.monotonic()
         producer_ids = tuple(args.producer_ids)
         pending_paths: list[Path] = []
@@ -487,6 +503,17 @@ def main() -> int:
             dashboard_file.write(json.dumps(dict(payload)) + "\n")
             dashboard_file.flush()
 
+        # The panel derives its progress bar from the config's step target;
+        # the pipeline budgets in episodes, so the step target is the episode
+        # budget times the observed (or a nominal prior) steps-per-episode.
+        steps_per_episode = (
+            environment_steps / ingested if ingested > 0 else 520.0
+        )
+        environment_step_target = int(args.stop_after_episodes * steps_per_episode)
+        dashboard_config = config.to_mapping()
+        dashboard_runtime = dict(dashboard_config.get("runtime") or {})
+        dashboard_runtime["total_environment_steps"] = environment_step_target
+        dashboard_config["runtime"] = dashboard_runtime
         dashboard_write(
             {
                 "event": "run_start",
@@ -498,8 +525,127 @@ def main() -> int:
                     "environment_steps": environment_steps,
                     "episodes": ingested,
                 },
+                "episodes_target": args.stop_after_episodes,
+                "environment_step_target_estimate": environment_step_target,
+                "config": dashboard_config,
             }
         )
+
+        def run_evaluation_gate(gate_environment_steps: int) -> None:
+            """Held-out fixed-seed gate on the trainer's own idle backend.
+
+            Reuses the collection authority stack: the online publication
+            drives this trainer's domain greedily; combat gates compose the
+            pinned bridge partner over macro surfaces through the router.
+            Emits the panel's native evaluation record pair — the summary
+            event in metrics.jsonl and the per-episode journal file.
+            """
+
+            assert resources is not None
+            seeds = held_out_evaluation_seeds(config.runtime.seed, args.eval_episodes)
+            online_forward = _forward_factory(
+                macro_online, resources.encoder, device, detach_hidden=True
+            )
+            if args.control_domain == "combat":
+                partner_forward = _forward_factory(
+                    partner_model, resources.encoder, device, detach_hidden=True
+                )
+                macro_arm = MacroCollectionAuthority(
+                    forward_q=partner_forward,
+                    initial_state=lambda: None,
+                    epsilon=0.0,
+                    control_domain="macro",
+                    evaluation_ownership=True,
+                )
+                combat_arm = MacroCollectionAuthority(
+                    forward_q=online_forward,
+                    initial_state=lambda: None,
+                    epsilon=0.0,
+                    control_domain="combat",
+                    evaluation_ownership=True,
+                )
+                authority: Any = JoinedCollectionAuthority(
+                    macro=macro_arm, combat=combat_arm
+                )
+            else:
+                authority = MacroCollectionAuthority(
+                    forward_q=online_forward,
+                    initial_state=lambda: None,
+                    epsilon=0.0,
+                    control_domain="macro",
+                    evaluation_ownership=True,
+                )
+            journal_path = (
+                status_path.parent
+                / f"evaluation-step-{gate_environment_steps:09d}.jsonl"
+            )
+            rows: list[dict[str, Any]] = []
+            resources.collector.macro_authority = authority
+            try:
+                with _evaluation_mode(macro_online), journal_path.open(
+                    "a", encoding="utf-8"
+                ) as journal:
+                    for seed in seeds:
+                        episode = resources.collector.collect_episode(
+                            epsilon=0.0,
+                            deterministic=True,
+                            record=False,
+                            evaluation_seed=seed,
+                        )
+                        row = {
+                            "event": "evaluation_episode",
+                            "evaluation_seed": seed,
+                            "unix_s": time.time(),
+                            "steps": episode.metrics.steps,
+                            "run_won": episode.metrics.run_won,
+                            "act1_cleared": episode.metrics.act1_cleared,
+                            "max_act": episode.metrics.max_act,
+                            "max_floor": episode.metrics.max_floor,
+                            "revivals_used": episode.metrics.revivals_used,
+                            "reward_total": episode.metrics.reward_total,
+                            "terminal_reason": episode.metrics.terminal_reason,
+                        }
+                        rows.append(row)
+                        journal.write(json.dumps(row) + "\n")
+                        journal.flush()
+            finally:
+                resources.collector.macro_authority = None
+            floors = sorted(row["max_floor"] for row in rows)
+            summary = {
+                "episodes": len(rows),
+                "wins": sum(1 for row in rows if row["run_won"]),
+                "act1_clears": sum(1 for row in rows if row["act1_cleared"]),
+                "floor_p50": floors[len(floors) // 2] if floors else None,
+                "floor_mean": (sum(floors) / len(floors)) if floors else None,
+            }
+            dashboard_write(
+                {
+                    "event": "evaluation",
+                    "unix_s": time.time(),
+                    "environment_steps": gate_environment_steps,
+                    "evaluation_gate": gate_environment_steps,
+                    "evaluation_attempt": 1,
+                    "gate_kind": "validation",
+                    "data_partition": "held_out",
+                    "policy_version": learner.metrics.updates,
+                    "seeds": list(seeds),
+                    **summary,
+                }
+            )
+            metrics_file.write(
+                json.dumps(
+                    {
+                        "event": "trainer_evaluation",
+                        "unix_s": time.time(),
+                        "pipeline_id": args.pipeline_id,
+                        "ingested_total": ingested,
+                        "environment_steps": gate_environment_steps,
+                        **summary,
+                    }
+                )
+                + "\n"
+            )
+            metrics_file.flush()
         with metrics_path.open("a", encoding="utf-8") as metrics_file:
             metrics_file.write(
                 json.dumps(
@@ -660,6 +806,13 @@ def main() -> int:
                     target=args.stop_after_episodes,
                 ):
                     flush_pending()
+                if (
+                    args.eval_interval_episodes > 0
+                    and ingested - last_eval_at >= args.eval_interval_episodes
+                ):
+                    flush_pending()
+                    run_evaluation_gate(environment_steps)
+                    last_eval_at = ingested
 
             flush_pending()
             _require_producers_not_failed(Path(args.producer_status_dir), producer_ids)
