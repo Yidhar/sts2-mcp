@@ -18,7 +18,7 @@ from typing import Any, Final, Literal
 
 from sts2_rl.encoding import EncodedDecisionSnapshot
 
-MACRO_TRANSITION_CONTRACT_VERSION: Final = "sts2-macro-transition-v5"
+MACRO_TRANSITION_CONTRACT_VERSION: Final = "sts2-macro-transition-v6"
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,11 +43,16 @@ class MacroStep:
     target_key: str | None = None
     behavior_epsilon: float = 0.0
     # Cross-domain bootstrap bridge (design doc §2): the encounter-closing
-    # combat transition carries the next MACRO decision snapshot.  The combat
-    # learner bootstraps this step from the pinned macro publication instead
-    # of its own value function; run-terminal steps keep bootstrap 0 via the
-    # clock and therefore never carry a bridge.
+    # combat transition carries the next OWNED macro decision snapshot plus
+    # the macro authority's greedy legal value of that exact surface,
+    # captured at COLLECTION time under the partner's real run-scale
+    # recurrent state (the pinned frozen partner keeps the recorded value
+    # stationary for the whole segment).  The combat learner bootstraps
+    # this step from the recorded value instead of its own value function;
+    # run-terminal steps keep bootstrap 0 via the clock and therefore
+    # never carry a bridge.
     bridge_snapshot: EncodedDecisionSnapshot | None = None
+    bridge_value: float | None = None
     version: str = MACRO_TRANSITION_CONTRACT_VERSION
 
     def __post_init__(self) -> None:
@@ -76,6 +81,12 @@ class MacroStep:
             raise TypeError("macro step recurrent_reset must be a boolean")
         if not math.isfinite(self.behavior_epsilon) or not 0.0 <= self.behavior_epsilon <= 1.0:
             raise ValueError("macro step behavior_epsilon must be in [0, 1]")
+        if (self.bridge_snapshot is None) != (self.bridge_value is None):
+            raise ValueError(
+                "macro step bridge_snapshot and bridge_value must be recorded together"
+            )
+        if self.bridge_value is not None and not math.isfinite(self.bridge_value):
+            raise ValueError("macro step bridge_value must be finite")
         if self.bridge_snapshot is not None:
             if not isinstance(self.bridge_snapshot, EncodedDecisionSnapshot):
                 raise TypeError("macro step bridge_snapshot has the wrong type")

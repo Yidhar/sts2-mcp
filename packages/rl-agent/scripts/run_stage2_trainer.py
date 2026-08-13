@@ -18,7 +18,7 @@ import json
 import pickle
 import random
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -27,7 +27,6 @@ from typing import Any
 import numpy as np
 import torch
 
-from sts2_rl.encoding import EncodedDecisionSnapshot
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots
 from sts2_rl.macro import (
     JoinedCollectionAuthority,
@@ -388,42 +387,40 @@ def main() -> int:
 
         device = resources.device
 
-        # Cross-domain bootstrap bridge: the pinned macro publication is
-        # loaded exactly once at segment start; a segment never mixes partner
-        # versions inside one target computation (bridge doc §2.4).
-        bridge_value: Callable[[EncodedDecisionSnapshot], float] | None = None
+        # Cross-domain bootstrap bridge: bridge values are captured at
+        # COLLECTION time by the pinned macro partner's live recurrent state
+        # (they arrive on the spooled transitions as MacroStep.bridge_value),
+        # so the trainer's learn loop never evaluates the partner model.  The
+        # trainer still pins the partner's identity for provenance and only
+        # loads its weights — lazily, exactly once per segment — when a
+        # held-out evaluation gate composes the macro arm (bridge doc §2.4).
         bridge_partner_record: dict[str, str] | None = None
+        partner_model: Any = None
         if bridge_partner_path is not None:
             bridge_partner_record = {
                 "path": str(bridge_partner_path),
                 "sha256": hashlib.sha256(bridge_partner_path.read_bytes()).hexdigest(),
             }
-            partner_model = copy.deepcopy(resources.model)
-            load_trunk_state(
-                partner_model,
-                dict(torch.load(bridge_partner_path, map_location=device, weights_only=True)),
-            )
-            partner_model.eval()
-            for parameter in partner_model.parameters():
-                parameter.requires_grad_(False)
-            partner_forward = _batched_forward_factory(
-                partner_model, resources.encoder, device, detach_hidden=True
-            )
 
-            def _partner_bridge_value(snapshot: EncodedDecisionSnapshot) -> float:
-                # Masked max over the partner's candidate Q values, no-grad.
-                with torch.no_grad():
-                    q_values, _ = partner_forward((snapshot,), None)
-                    mask = torch.zeros(
-                        q_values.shape[-1], dtype=torch.bool, device=q_values.device
-                    )
-                    count = len(snapshot.action_mask)
-                    mask[:count] = torch.tensor(
-                        snapshot.action_mask, dtype=torch.bool, device=q_values.device
-                    )
-                    return float(q_values[0].masked_fill(~mask, float("-inf")).max().item())
-
-            bridge_value = _partner_bridge_value
+        def _bridge_partner_model() -> Any:
+            nonlocal partner_model
+            if partner_model is None:
+                assert bridge_partner_path is not None
+                assert resources is not None
+                loaded = copy.deepcopy(resources.model)
+                load_trunk_state(
+                    loaded,
+                    dict(
+                        torch.load(
+                            bridge_partner_path, map_location=device, weights_only=True
+                        )
+                    ),
+                )
+                loaded.eval()
+                for parameter in loaded.parameters():
+                    parameter.requires_grad_(False)
+                partner_model = loaded
+            return partner_model
 
         replay = MacroSequenceReplay(
             capacity_episodes=args.replay_episodes,
@@ -441,7 +438,6 @@ def main() -> int:
             forward_online_batch=_batched_forward_factory(macro_online, resources.encoder, device, detach_hidden=False),
             forward_target_batch=_batched_forward_factory(macro_target, resources.encoder, device, detach_hidden=True),
             target_evaluation_context=lambda: _evaluation_mode(macro_target),
-            bridge_value=bridge_value,
         )
 
         if resume_path is not None:
@@ -549,7 +545,7 @@ def main() -> int:
             )
             if args.control_domain == "combat":
                 partner_forward = _forward_factory(
-                    partner_model, resources.encoder, device, detach_hidden=True
+                    _bridge_partner_model(), resources.encoder, device, detach_hidden=True
                 )
                 macro_arm = MacroCollectionAuthority(
                     forward_q=partner_forward,

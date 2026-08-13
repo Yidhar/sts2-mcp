@@ -80,6 +80,7 @@ def _combat_step(
     terminal: bool = False,
     recurrent_reset: bool = False,
     bridge_snapshot: EncodedDecisionSnapshot | None = None,
+    bridge_value: float | None = None,
 ) -> MacroStep:
     return MacroStep(
         snapshot=_snapshot(),
@@ -92,6 +93,7 @@ def _combat_step(
         control_domain="combat",
         recurrent_reset=recurrent_reset,
         bridge_snapshot=bridge_snapshot,
+        bridge_value=bridge_value,
     )
 
 
@@ -99,7 +101,7 @@ def _combat_step(
 
 
 def test_macro_step_bridge_validation_and_contract_version() -> None:
-    assert MACRO_TRANSITION_CONTRACT_VERSION == "sts2-macro-transition-v5"
+    assert MACRO_TRANSITION_CONTRACT_VERSION == "sts2-macro-transition-v6"
     bridge = _snapshot()
     with pytest.raises(ValueError, match="combat-domain"):
         MacroStep(
@@ -112,11 +114,23 @@ def test_macro_step_bridge_validation_and_contract_version() -> None:
             branch="rest",
             control_domain="macro",
             bridge_snapshot=bridge,
+            bridge_value=1.0,
         )
     with pytest.raises(ValueError, match="never terminal"):
-        _combat_step(terminal=True, discount=0.0, bridge_snapshot=bridge)
-    step = _combat_step(discount=0.5, bridge_snapshot=bridge)
+        _combat_step(terminal=True, discount=0.0, bridge_snapshot=bridge, bridge_value=1.0)
+    # The collection-time value and its surface snapshot are one record:
+    # neither may appear alone, and the recorded value must be finite.
+    with pytest.raises(ValueError, match="together"):
+        _combat_step(discount=0.5, bridge_snapshot=bridge)
+    with pytest.raises(ValueError, match="together"):
+        _combat_step(discount=0.5, bridge_value=1.0)
+    with pytest.raises(ValueError, match="finite"):
+        _combat_step(discount=0.5, bridge_snapshot=bridge, bridge_value=float("nan"))
+    with pytest.raises(ValueError, match="finite"):
+        _combat_step(discount=0.5, bridge_snapshot=bridge, bridge_value=float("inf"))
+    step = _combat_step(discount=0.5, bridge_snapshot=bridge, bridge_value=2.25)
     assert step.bridge_snapshot is bridge
+    assert step.bridge_value == pytest.approx(2.25)
 
 
 def test_episode_may_end_at_a_domain_terminal_bridge_step() -> None:
@@ -124,7 +138,7 @@ def test_episode_may_end_at_a_domain_terminal_bridge_step() -> None:
         episode_id="bridged-tail",
         steps=(
             _combat_step(recurrent_reset=True),
-            _combat_step(discount=0.5, bridge_snapshot=_snapshot()),
+            _combat_step(discount=0.5, bridge_snapshot=_snapshot(), bridge_value=3.0),
         ),
     )
     assert bridged.steps[-1].terminal is False
@@ -168,7 +182,13 @@ def _bridged_replay() -> tuple[MacroSequenceReplay, EncodedDecisionSnapshot]:
             episode_id="two-encounters",
             steps=(
                 _combat_step(action_index=0, recurrent_reset=True),
-                _combat_step(action_index=1, reward=0.5, discount=0.5, bridge_snapshot=bridge),
+                _combat_step(
+                    action_index=1,
+                    reward=0.5,
+                    discount=0.5,
+                    bridge_snapshot=bridge,
+                    bridge_value=10.0,
+                ),
                 _combat_step(action_index=2, recurrent_reset=True),
                 _combat_step(action_index=3, reward=1.0, discount=0.0, terminal=True),
             ),
@@ -189,16 +209,9 @@ class _FakeQ:
         return self.target[: len(step.snapshot.action_mask)], hidden
 
 
-def test_sequential_learner_trains_executed_q_toward_bridge_target() -> None:
-    replay, bridge = _bridged_replay()
+def test_sequential_learner_trains_executed_q_toward_recorded_bridge_value() -> None:
+    replay, _ = _bridged_replay()
     fake = _FakeQ()
-    seen_bridges: list[EncodedDecisionSnapshot] = []
-
-    def bridge_value(snapshot: EncodedDecisionSnapshot) -> float:
-        assert not torch.is_grad_enabled()
-        seen_bridges.append(snapshot)
-        return 10.0
-
     learner = MacroQLearner(
         online_parameters=[fake.online],
         forward_online=fake.forward_online,
@@ -213,23 +226,22 @@ def test_sequential_learner_trains_executed_q_toward_bridge_target() -> None:
             target_update_interval=10_000,
             sample_windows=1,
         ),
-        bridge_value=bridge_value,
     )
     for _ in range(400):
         learner.update()
-    # The bridge step's executed Q trains toward reward + Gamma * bridge value
-    # (0.5 + 0.5*10), the step before it chains through the bridge and stops,
-    # and the following encounter's steps stay at their own factual return —
-    # untouched by the previous encounter's partner value.
+    # The bridge step's executed Q trains toward reward + Gamma * the value
+    # RECORDED at collection time (0.5 + 0.5*10) — no partner callable is
+    # evaluated at training time.  The step before it chains through the
+    # bridge and stops, and the following encounter's steps stay at their own
+    # factual return — untouched by the previous encounter's partner value.
     assert float(fake.online[0].item()) == pytest.approx(5.5, abs=0.1)
     assert float(fake.online[1].item()) == pytest.approx(5.5, abs=0.1)
     assert float(fake.online[2].item()) == pytest.approx(1.0, abs=0.1)
     assert float(fake.online[3].item()) == pytest.approx(1.0, abs=0.1)
-    assert seen_bridges and all(snapshot is bridge for snapshot in seen_bridges)
 
 
 def test_batched_learner_path_produces_the_same_bridge_targets() -> None:
-    replay, bridge = _bridged_replay()
+    replay, _ = _bridged_replay()
     online = torch.nn.Parameter(torch.zeros(4))
 
     def batch_online(snapshots: Any, hidden: Any) -> tuple[torch.Tensor, Any]:
@@ -258,7 +270,6 @@ def test_batched_learner_path_produces_the_same_bridge_targets() -> None:
         config=MacroQConfig(n_step=8, sample_windows=1, target_update_interval=10_000),
         forward_online_batch=batch_online,
         forward_target_batch=batch_target,
-        bridge_value=lambda snapshot: 10.0,
     )
     (executed_q, rewards, discounts, bootstraps, learn_steps) = (
         learner._batched_window_values(list(replay._windows()))[0]
@@ -274,21 +285,10 @@ def test_batched_learner_path_produces_the_same_bridge_targets() -> None:
     assert metrics["steps_trained"] == 4
 
 
-def test_learner_refuses_bridge_steps_without_a_partner() -> None:
-    replay, _ = _bridged_replay()
-    fake = _FakeQ()
-    learner = MacroQLearner(
-        online_parameters=[fake.online],
-        forward_online=fake.forward_online,
-        forward_target=fake.forward_target,
-        sync_target=lambda: None,
-        initial_state=lambda: None,
-        target_evaluation_context=nullcontext,
-        replay=replay,
-        config=MacroQConfig(n_step=8, sample_windows=1),
-    )
-    with pytest.raises(RuntimeError, match="bridge"):
-        learner.update()
+# A bridge step without its recorded value can no longer reach the learner:
+# the MacroStep DTO rejects a bridge_snapshot without bridge_value at
+# construction (covered in the transitions section above), so the deleted
+# training-time partner callable needs no learner-side guard.
 
 
 # ------------------------------------------------------------------ authority
@@ -302,6 +302,23 @@ _MAP_ACTIONS = [
         "map_node": {"row": 3, "col": 0},
     }
 ]
+
+_TWO_MAP_ACTIONS = [
+    {
+        "kind": "choose_map_node",
+        "model_action_kind": "map",
+        "map_node": {"row": 3, "col": 0},
+    },
+    {
+        "kind": "choose_map_node",
+        "model_action_kind": "map",
+        "map_node": {"row": 3, "col": 1},
+    },
+]
+
+# A macro surface the semantic compiler does not recognize: the macro
+# authority DECLINES it (the frozen champion would handle it live).
+_PROCEED_ACTIONS = [{"kind": "proceed", "model_action_kind": "proceed"}]
 
 
 def _combat_observation(floor: int) -> dict[str, Any]:
@@ -358,12 +375,13 @@ def test_encounter_end_holds_the_open_transition_until_the_bridge_closes() -> No
     # decision keep folding into the still-open transition.
     authority.observe_step(reward=0.05, floor=6, terminal=False)
     bridge = _encode(_map_observation(6), _MAP_ACTIONS)
-    authority.close_encounter(bridge)
+    authority.close_encounter(bridge, 4.25)
     assert authority.has_pending_bridge is False
     episode = authority.finish_episode()
     assert episode is not None and len(episode.steps) == 1
     step = episode.steps[0]
     assert step.bridge_snapshot is bridge
+    assert step.bridge_value == pytest.approx(4.25)
     assert step.terminal is False
     assert step.reward == pytest.approx(0.30)
     assert step.discount == pytest.approx(DECISION_CLOCK_BASE)  # one durable floor
@@ -392,6 +410,7 @@ def test_run_terminal_close_stays_terminal_without_a_bridge() -> None:
     assert step.terminal is True
     assert step.discount == 0.0  # run terminal keeps bootstrap 0 via the clock
     assert step.bridge_snapshot is None
+    assert step.bridge_value is None
 
 
 def test_missing_bridge_capture_marks_the_episode_replay_invalid() -> None:
@@ -431,7 +450,7 @@ def test_close_encounter_contract_misuse_raises() -> None:
     combat = _combat_authority()
     combat.begin_episode("enc-misuse")
     with pytest.raises(RuntimeError, match="awaits a bridge"):
-        combat.close_encounter(_snapshot())
+        combat.close_encounter(_snapshot(), 0.0)
     macro = MacroCollectionAuthority(
         forward_q=lambda snapshot, hidden: (
             torch.zeros(snapshot.candidate_count),
@@ -441,22 +460,91 @@ def test_close_encounter_contract_misuse_raises() -> None:
         control_domain="macro",
     )
     with pytest.raises(RuntimeError, match="combat authority"):
-        macro.close_encounter(_snapshot())
+        macro.close_encounter(_snapshot(), 0.0)
+
+
+def test_close_encounter_rejects_a_non_finite_bridge_value() -> None:
+    authority = _combat_authority()
+    authority.begin_episode("enc-nan")
+    observation = _combat_observation(5)
+    assert (
+        authority.choose(
+            observation=observation,
+            semantic_actions=_COMBAT_ACTIONS,
+            snapshot=_encode(observation, _COMBAT_ACTIONS),
+            valid=np.ones(1, dtype=np.bool_),
+        )
+        == 0
+    )
+    authority.observe_observation(_map_observation(5))
+    assert authority.has_pending_bridge is True
+    bridge = _encode(_map_observation(5), _MAP_ACTIONS)
+    with pytest.raises(ValueError, match="finite"):
+        authority.close_encounter(bridge, float("nan"))
+    # The rejected close changed nothing; a finite value still closes it.
+    assert authority.has_pending_bridge is True
+    authority.close_encounter(bridge, 1.5)
+    assert authority.has_pending_bridge is False
+
+
+def test_owned_decision_publishes_greedy_value_regardless_of_epsilon_draw() -> None:
+    macro = MacroCollectionAuthority(
+        forward_q=lambda snapshot, hidden: (
+            torch.tensor([1.0, 4.0])[: snapshot.candidate_count],
+            hidden,
+        ),
+        initial_state=lambda: None,
+        epsilon=1.0,  # every executed choice is an exploration draw
+        seed=11,
+        control_domain="macro",
+    )
+    macro.begin_episode("greedy-value")
+    assert macro.last_decision_value is None
+    observation = _map_observation(3)
+    override = macro.choose(
+        observation=observation,
+        semantic_actions=_TWO_MAP_ACTIONS,
+        snapshot=_encode(observation, _TWO_MAP_ACTIONS),
+        valid=np.ones(2, dtype=np.bool_),
+    )
+    # The greedy legal value is published even when epsilon executes the
+    # non-greedy candidate.
+    assert override in (0, 1)
+    assert macro.last_decision_value == pytest.approx(4.0)
+    # A declined surface invalidates the published value (freshness: the
+    # value belongs to exactly one owned decision).
+    assert (
+        macro.choose(
+            observation=_map_observation(3),
+            semantic_actions=_PROCEED_ACTIONS,
+            snapshot=_encode(_map_observation(3), _PROCEED_ACTIONS),
+            valid=np.ones(1, dtype=np.bool_),
+        )
+        is None
+    )
+    assert macro.last_decision_value is None
+    macro.last_decision_value = 2.0
+    macro.begin_episode("freshness-reset")
+    assert macro.last_decision_value is None
 
 
 # --------------------------------------------------------------------- router
 
 
-def test_router_passes_the_macro_decision_snapshot_into_the_pending_bridge() -> None:
-    macro = MacroCollectionAuthority(
+def _greedy_macro_arm(value: float) -> MacroCollectionAuthority:
+    return MacroCollectionAuthority(
         forward_q=lambda snapshot, hidden: (
-            torch.zeros(snapshot.candidate_count),
+            torch.full((snapshot.candidate_count,), value),
             hidden,
         ),
         initial_state=lambda: None,
         epsilon=0.0,
         control_domain="macro",
     )
+
+
+def test_router_closes_the_pending_bridge_with_the_macro_arms_greedy_value() -> None:
+    macro = _greedy_macro_arm(2.5)
     combat = _combat_authority()
     router = JoinedCollectionAuthority(macro=macro, combat=combat)
     router.begin_episode("bridge-route")
@@ -485,15 +573,121 @@ def test_router_passes_the_macro_decision_snapshot_into_the_pending_bridge() -> 
         == 0
     )
     assert combat.has_pending_bridge is False
+    # Read-and-clear freshness: the router consumed the published value.
+    assert macro.last_decision_value is None
     router.observe_step(reward=0.0, floor=3, terminal=True)
     episodes = router.finish_episodes("bridge-route")
     combat_episode = episodes["combat"]
     assert combat_episode is not None and len(combat_episode.steps) == 1
     step = combat_episode.steps[0]
     assert step.bridge_snapshot is macro_snapshot
+    assert step.bridge_value == pytest.approx(2.5)  # live greedy macro value
     assert step.terminal is False
     assert step.reward == pytest.approx(0.1)
     assert step.discount == pytest.approx(DECISION_CLOCK_BASE)  # floor 2 -> 3
     macro_episode = episodes["macro"]
     assert macro_episode is not None
     assert macro_episode.steps[-1].terminal is True
+
+
+def test_declined_macro_surface_leaves_the_bridge_pending_until_owned() -> None:
+    macro = _greedy_macro_arm(2.5)
+    combat = _combat_authority()
+    router = JoinedCollectionAuthority(macro=macro, combat=combat)
+    router.begin_episode("bridge-declined")
+
+    combat_observation = _combat_observation(2)
+    assert (
+        router.choose(
+            observation=combat_observation,
+            semantic_actions=_COMBAT_ACTIONS,
+            snapshot=_encode(combat_observation, _COMBAT_ACTIONS),
+            valid=np.ones(1, dtype=np.bool_),
+        )
+        == 0
+    )
+    router.observe_step(reward=0.1, floor=3, terminal=False)
+
+    # Champion-handled surface: the macro arm declines, so no live macro
+    # value exists yet — the bridge MUST stay pending.
+    declined_observation = _map_observation(3)
+    assert (
+        router.choose(
+            observation=declined_observation,
+            semantic_actions=_PROCEED_ACTIONS,
+            snapshot=_encode(declined_observation, _PROCEED_ACTIONS),
+            valid=np.ones(1, dtype=np.bool_),
+        )
+        is None
+    )
+    assert combat.has_pending_bridge is True
+    # Boundary rewards keep folding into the still-open combat transition.
+    router.observe_step(reward=0.05, floor=3, terminal=False)
+
+    macro_observation = _map_observation(3)
+    macro_snapshot = _encode(macro_observation, _MAP_ACTIONS)
+    assert (
+        router.choose(
+            observation=macro_observation,
+            semantic_actions=_MAP_ACTIONS,
+            snapshot=macro_snapshot,
+            valid=np.ones(1, dtype=np.bool_),
+        )
+        == 0
+    )
+    assert combat.has_pending_bridge is False
+    router.observe_step(reward=0.0, floor=3, terminal=True)
+    episodes = router.finish_episodes("bridge-declined")
+    combat_episode = episodes["combat"]
+    assert combat_episode is not None and len(combat_episode.steps) == 1
+    step = combat_episode.steps[0]
+    assert step.bridge_snapshot is macro_snapshot  # the OWNED surface
+    assert step.bridge_value == pytest.approx(2.5)
+    assert step.reward == pytest.approx(0.15)  # folded across the decline
+
+
+def test_router_fail_closed_when_a_new_encounter_starts_while_pending() -> None:
+    macro = _greedy_macro_arm(2.5)
+    combat = _combat_authority()
+    router = JoinedCollectionAuthority(macro=macro, combat=combat)
+    router.begin_episode("bridge-miss")
+
+    first = _combat_observation(2)
+    assert (
+        router.choose(
+            observation=first,
+            semantic_actions=_COMBAT_ACTIONS,
+            snapshot=_encode(first, _COMBAT_ACTIONS),
+            valid=np.ones(1, dtype=np.bool_),
+        )
+        == 0
+    )
+    router.observe_step(reward=0.1, floor=3, terminal=False)
+    declined_observation = _map_observation(3)
+    assert (
+        router.choose(
+            observation=declined_observation,
+            semantic_actions=_PROCEED_ACTIONS,
+            snapshot=_encode(declined_observation, _PROCEED_ACTIONS),
+            valid=np.ones(1, dtype=np.bool_),
+        )
+        is None
+    )
+    assert combat.has_pending_bridge is True
+
+    # A new encounter begins with the bridge still pending: fail-closed —
+    # the whole combat episode leaves replay (unchanged semantics).
+    second = _combat_observation(3)
+    assert (
+        router.choose(
+            observation=second,
+            semantic_actions=_COMBAT_ACTIONS,
+            snapshot=_encode(second, _COMBAT_ACTIONS),
+            valid=np.ones(1, dtype=np.bool_),
+        )
+        is None
+    )
+    metrics = combat.metrics()
+    assert metrics["episode_replay_invalid"] is True
+    assert metrics["bridge_misses"] == 1
+    assert router.finish_episodes("bridge-miss")["combat"] is None

@@ -153,6 +153,15 @@ class MacroCollectionAuthority:
         self.record_decisions = False
         self.decision_log: list[dict[str, Any]] = []
         self._rng = np.random.default_rng(seed)
+        # Greedy legal value of the most recent OWNED decision (max over the
+        # executable candidates' Q, regardless of the epsilon draw actually
+        # executed), evaluated under this authority's REAL recurrent state.
+        # Freshness contract: invalidated at the start of every ``choose``
+        # call and by ``begin_episode``, published only when this very call
+        # owned a semantic decision; declines and mechanical executor
+        # dispatches leave it ``None``.  The joined router reads-and-clears
+        # it to close a pending combat bridge at collection time.
+        self.last_decision_value: float | None = None
         self._hidden: Any = None
         self._episode_id: str | None = None
         self._steps: list[MacroStep] = []
@@ -173,6 +182,7 @@ class MacroCollectionAuthority:
     # ------------------------------------------------------------------ episode
     def begin_episode(self, episode_id: str) -> None:
         self._episode_id = episode_id
+        self.last_decision_value = None
         self._hidden = self.initial_state()
         self._steps = []
         self._open = None
@@ -233,22 +243,36 @@ class MacroCollectionAuthority:
 
         return self._awaiting_bridge and self._open is not None
 
-    def close_encounter(self, bridge_snapshot: EncodedDecisionSnapshot) -> None:
+    def close_encounter(
+        self,
+        bridge_snapshot: EncodedDecisionSnapshot,
+        bridge_value: float,
+    ) -> None:
         """Close the open encounter transition on the post-combat macro surface.
 
         The closing combat transition receives the boundary rewards accrued
         since the last combat decision, the clock discount to the current
-        floor, and the macro decision snapshot the combat learner bootstraps
-        from via the pinned partner (bridge doc §2).
+        floor, the macro decision snapshot, and the macro authority's greedy
+        legal value of that exact surface — captured at COLLECTION time under
+        the partner's real run-scale recurrent state (bridge doc §2).  The
+        partner is frozen all segment, so the recorded value keeps the
+        pinned-partner stationarity contract.
         """
 
         if self.control_domain != "combat":
             raise RuntimeError("only the combat authority closes encounters over a bridge")
         if not isinstance(bridge_snapshot, EncodedDecisionSnapshot):
             raise TypeError("bridge snapshot has the wrong type")
+        value = float(bridge_value)
+        if not math.isfinite(value):
+            raise ValueError("bridge value must be finite")
         if self._open is None or not self._awaiting_bridge:
             raise RuntimeError("no open encounter transition awaits a bridge snapshot")
-        self._close_open(terminal=False, bridge_snapshot=bridge_snapshot)
+        self._close_open(
+            terminal=False,
+            bridge_snapshot=bridge_snapshot,
+            bridge_value=value,
+        )
 
     def finish_episode(self, episode_id: str | None = None) -> MacroEpisode | None:
         if self._episode_replay_invalid:
@@ -282,6 +306,10 @@ class MacroCollectionAuthority:
         """Return a native candidate index to execute, or None to decline."""
 
         self._ensure_episode()
+        # Freshness: the published greedy value belongs to at most one call.
+        # Every path that does not OWN a semantic decision below (declines,
+        # mechanical executor dispatches, failures) leaves it ``None``.
+        self.last_decision_value = None
         if self._episode_replay_invalid:
             # A composite action changed recurrent state before its native
             # suffix failed.  No later transition in this episode can be
@@ -516,6 +544,12 @@ class MacroCollectionAuthority:
         # Advance recurrent state on every meaningful decision, including a
         # singleton or epsilon-explored one.  Replay sees the same sequence.
         values = self._q_values(snapshot)
+        # Publish the greedy legal value of this OWNED decision — the max over
+        # the executable candidates' Q under the live recurrent state — no
+        # matter which action the epsilon draw below actually executes.
+        self.last_decision_value = float(
+            max(float(values[index].item()) for index in range(len(candidates)))
+        )
         if self._rng.random() < self.epsilon:
             # Branch-balanced: uniform branch, then uniform candidate inside.
             branches = sorted({candidate.branch for candidate in candidates})
@@ -555,6 +589,7 @@ class MacroCollectionAuthority:
         terminal: bool,
         floor: int | None = None,
         bridge_snapshot: EncodedDecisionSnapshot | None = None,
+        bridge_value: float | None = None,
     ) -> None:
         if self._open is None:
             self._awaiting_bridge = False
@@ -579,6 +614,7 @@ class MacroCollectionAuthority:
                 target_key=self._open.target_key,
                 behavior_epsilon=self._open.behavior_epsilon,
                 bridge_snapshot=bridge_snapshot,
+                bridge_value=bridge_value,
             )
         )
         self._open = None

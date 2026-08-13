@@ -119,11 +119,22 @@ class JoinedCollectionAuthority:
             valid=valid,
         )
         if authority is self.macro and self.combat.has_pending_bridge:
-            # Cross-domain bootstrap bridge: the first macro surface after an
-            # encounter (owned or declined) is the combat domain's bootstrap
-            # state.  The router stays policy-free — it only forwards the
-            # decision snapshot it was already given.
-            self.combat.close_encounter(snapshot)
+            # Cross-domain bootstrap bridge: the first OWNED macro decision
+            # after an encounter closes the combat domain's pending bridge
+            # with the macro authority's greedy legal value of that exact
+            # surface, evaluated at collection time under its real run-scale
+            # recurrent state.  Freshness: the macro authority publishes
+            # ``last_decision_value`` only when this very call owned a
+            # semantic decision; the router reads-and-clears it here.  A
+            # DECLINED (champion-handled) surface leaves the bridge pending —
+            # boundary rewards keep folding into the open combat transition
+            # until the next owned macro decision.  The router stays
+            # policy-free: it forwards the decision snapshot it was already
+            # given and a value the partner already computed.
+            bridge_value = self.macro.last_decision_value
+            self.macro.last_decision_value = None
+            if bridge_value is not None:
+                self.combat.close_encounter(snapshot, bridge_value)
         return override
 
     def observe_step(self, *, reward: float, floor: int | None, terminal: bool) -> None:
