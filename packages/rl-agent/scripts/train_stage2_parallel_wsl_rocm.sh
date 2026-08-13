@@ -139,6 +139,7 @@ python scripts/run_stage2_trainer.py \
   --save-interval-episodes "${STS2_STAGE2_SAVE_INTERVAL:-20}" \
   --eval-interval-episodes "${STS2_STAGE2_EVAL_INTERVAL:-100}" \
   --eval-episodes "${STS2_STAGE2_EVAL_EPISODES:-8}" \
+  --target-update-interval "${STS2_STAGE2_TARGET_SYNC:-200}" \
   --idle-timeout-seconds "${STS2_STAGE2_IDLE_TIMEOUT_SECONDS:-1200}" \
   --metrics-out "$RUN_DIR/trainer-metrics.jsonl" \
   --device cuda --sim-exe "$SIM_EXE" \

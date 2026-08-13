@@ -285,6 +285,21 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sample-windows", type=int, default=16)
     parser.add_argument("--replay-episodes", type=int, default=128)
+    parser.add_argument(
+        "--target-update-interval",
+        type=int,
+        default=200,
+        help="learner updates between hard target-network syncs",
+    )
+    parser.add_argument(
+        "--q-scale-calibration-threshold",
+        type=float,
+        default=0.15,
+        help="one-shot final-bias calibration fires on a fresh/model-init "
+        "segment when |mean factual return - mean legal Q| exceeds this "
+        "(0 disables); a mis-scaled initialization otherwise makes argmax "
+        "chase stale unexecuted actions",
+    )
     parser.add_argument("--save-interval-episodes", type=int, default=20)
     parser.add_argument(
         "--eval-interval-episodes",
@@ -434,7 +449,10 @@ def main() -> int:
             sync_target=lambda: macro_target.load_state_dict(macro_online.state_dict()),
             initial_state=lambda: None,
             replay=replay,
-            config=MacroQConfig(sample_windows=args.sample_windows),
+            config=MacroQConfig(
+                sample_windows=args.sample_windows,
+                target_update_interval=args.target_update_interval,
+            ),
             forward_online_batch=_batched_forward_factory(macro_online, resources.encoder, device, detach_hidden=False),
             forward_target_batch=_batched_forward_factory(macro_target, resources.encoder, device, detach_hidden=True),
             target_evaluation_context=lambda: _evaluation_mode(macro_target),
@@ -526,6 +544,77 @@ def main() -> int:
                 "config": dashboard_config,
             }
         )
+
+        q_scale_calibrated = resume_path is not None
+
+        def maybe_calibrate_q_scale() -> None:
+            """One-shot final-bias shift onto the empirical return scale.
+
+            An initialization whose Q magnitudes sit far from the factual
+            return scale makes every EXECUTED action regress toward truth
+            while unexecuted actions keep their stale offset — argmax then
+            systematically chases untried actions (measured: init Q ~ -0.15
+            against ~ -0.87 factual returns collapsed combat behavior).
+            The shift is pure calibration: one scalar added to the shared
+            final bias, applied to online and target together, once per
+            lineage, logged as its own event.
+            """
+
+            nonlocal q_scale_calibrated
+            if q_scale_calibrated or args.q_scale_calibration_threshold <= 0:
+                return
+            assert learner is not None
+            episodes = replay.state_dict()["episodes"]
+            if not episodes:
+                return
+            returns: list[float] = []
+            for episode in episodes:
+                running = 0.0
+                for step in reversed(episode.steps):
+                    if step.bridge_value is not None:
+                        running = step.reward + step.discount * step.bridge_value
+                    else:
+                        running = step.reward + step.discount * running
+                    returns.append(running)
+            q_samples: list[float] = []
+            sampled = [
+                step
+                for episode in episodes[:8]
+                for step in episode.steps[:: max(1, len(episode.steps) // 16)]
+            ][:96]
+            with torch.no_grad(), _evaluation_mode(macro_online):
+                for step in sampled:
+                    values, _ = learner.forward_online(step, None)
+                    legal = values[: len(step.snapshot.action_mask)]
+                    mask = torch.tensor(step.snapshot.action_mask, dtype=torch.bool)
+                    q_samples.extend(legal[mask[: legal.shape[0]]].tolist())
+            if not returns or not q_samples:
+                return
+            mean_return = float(sum(returns) / len(returns))
+            mean_q = float(sum(q_samples) / len(q_samples))
+            delta = mean_return - mean_q
+            q_scale_calibrated = True
+            if abs(delta) < args.q_scale_calibration_threshold:
+                return
+            with torch.no_grad():
+                for model in (macro_online, macro_target):
+                    head = model.transaction_q_head
+                    assert head is not None
+                    head[-1].bias.add_(delta)
+            record = {
+                "event": "q_scale_calibration",
+                "unix_s": time.time(),
+                "pipeline_id": args.pipeline_id,
+                "mean_factual_return": mean_return,
+                "mean_legal_q": mean_q,
+                "bias_shift": delta,
+                "return_samples": len(returns),
+                "q_samples": len(q_samples),
+            }
+            metrics_file.write(json.dumps(record) + "\n")
+            metrics_file.flush()
+            dashboard_write(record)
+            save_publication()
 
         def run_evaluation_gate(gate_environment_steps: int) -> None:
             """Held-out fixed-seed gate on the trainer's own idle backend.
@@ -791,6 +880,9 @@ def main() -> int:
                 last_progress = time.monotonic()
                 ingested += fresh
                 environment_steps += fresh_environment_steps
+                # Calibrate BEFORE the first gradients so mis-scaled targets
+                # never train the head; self-disarms after one decision.
+                maybe_calibrate_q_scale()
                 update_budget = min(
                     args.updates_per_episode * fresh, args.max_updates_per_cycle
                 )
