@@ -37,7 +37,7 @@ _TRANSACTION_PREFIXES = (
     "selection_delta_head.",
     "transaction_q_head.",
 )
-_MACRO_OPTION_PREFIXES = (
+_RETIRED_MACRO_OPTION_PREFIXES = (
     "macro_surface_candidate_embedding.",
     "macro_surface_state_embedding.",
     "macro_policy_head.",
@@ -113,13 +113,29 @@ def _transaction_state(
     return {key: value for key, value in state.items() if key.startswith(_TRANSACTION_PREFIXES)}
 
 
+def _retired_macro_option_state() -> dict[str, torch.Tensor]:
+    """One synthetic complete v47 macro-option family.
+
+    Config v20 deleted these heads from the model, so no current
+    ``RecurrentCandidateModel`` produces them; a real v47-era checkpoint
+    still carries the complete group.
+    """
+
+    return {
+        "macro_surface_candidate_embedding.weight": torch.zeros(6, 16),
+        "macro_surface_state_embedding.weight": torch.zeros(6, 32),
+        "macro_policy_head.3.weight": torch.zeros(1, 16),
+        "macro_option_value_head.3.weight": torch.zeros(1, 32),
+    }
+
+
 def _macro_option_state(
     state: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
     return {
         key: value
         for key, value in state.items()
-        if key.startswith(_MACRO_OPTION_PREFIXES)
+        if key.startswith(_RETIRED_MACRO_OPTION_PREFIXES)
     }
 
 
@@ -190,9 +206,10 @@ def test_v4_policy_is_model_initialization_only_and_freshens_liveness_group(
         assert fresh_liveness
         assert not _liveness_state(source_state)
         dropped_transaction = _transaction_state(source_state)
-        dropped_macro_option = _macro_option_state(source_state)
         assert dropped_transaction
-        assert dropped_macro_option
+        # Config v20 deleted the v47 macro-option heads from the model, so
+        # neither side constructs them anymore.
+        assert not _macro_option_state(source_state)
         assert not _transaction_state(target_before)
         assert not _macro_option_state(target_before)
         assert target.failure_credit_replay is not None
@@ -211,7 +228,7 @@ def test_v4_policy_is_model_initialization_only_and_freshens_liveness_group(
         assert parent == checkpoint.resolve()
         target_after = target.model.state_dict()
         for key, expected in source_state.items():
-            if key in dropped_transaction or key in dropped_macro_option:
+            if key in dropped_transaction:
                 continue
             assert torch.equal(target_after[key], expected), key
             assert torch.equal(
@@ -364,6 +381,8 @@ def test_retired_transaction_v3_heads_drop_only_as_one_complete_source_group() -
         config.model.to_model_config(),
         enable_transaction_heads=True,
     ).state_dict()
+    # A v47-era source additionally carried the retired macro-option family.
+    source.update(_retired_macro_option_state())
     target = RecurrentCandidateModel(
         config.model.to_model_config(),
         enable_liveness_head=True,
@@ -426,6 +445,49 @@ def test_retired_transaction_v3_heads_drop_only_as_one_complete_source_group() -
             allow_source_transaction_head_drop=False,
             allow_missing_liveness_heads=True,
         )
+
+
+def test_retired_macro_option_heads_drop_on_both_loading_paths() -> None:
+    """A state dict that still carries the deleted v47 macro-option head
+    family loads into the current model with exactly that group dropped, on
+    both the legacy model-parameter-initialization path and the macro
+    tolerant trunk-loading path."""
+
+    from sts2_rl.macro import load_trunk_state
+
+    config = _learning_config()
+    model = RecurrentCandidateModel(
+        config.model.to_model_config(),
+        enable_transaction_heads=True,
+        enable_liveness_head=True,
+    )
+    target = model.state_dict()
+    retired = _retired_macro_option_state()
+    source = {key: value.detach().clone() for key, value in target.items()}
+    source.update(retired)
+
+    # Legacy path: the retired family is a permitted source-only group even
+    # though the target transaction learner is enabled.
+    migrated = checkpointing_module._model_parameter_initialization_state(
+        source,
+        target_state=target,
+        allow_missing_transaction_heads=True,
+    )
+    assert set(migrated) == set(target)
+    for key in retired:
+        assert key not in migrated
+
+    # Macro path: the same keys drop through the explicitly tolerated
+    # retired head groups, with no fresh (missing) tensors.
+    report = load_trunk_state(model, dict(source))
+    assert sorted(report["dropped"]) == sorted(retired)
+    assert report["fresh"] == []
+
+    # Anything outside the tolerated groups still refuses.
+    drifted = dict(source)
+    drifted["not_a_tolerated_head.weight"] = torch.zeros(1)
+    with pytest.raises(RuntimeError, match="drift beyond tolerated"):
+        load_trunk_state(model, drifted)
 
 
 def test_v5_failure_credit_checkpoint_roundtrip_restores_replay_and_heads(

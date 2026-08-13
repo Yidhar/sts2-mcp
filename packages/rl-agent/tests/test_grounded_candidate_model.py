@@ -232,54 +232,6 @@ def test_candidate_permutation_equivariance(config: GroundedCandidateConfig) -> 
         torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
 
 
-def test_macro_awr_heads_start_behavior_neutral_and_detach_shared_trunk(
-    config: GroundedCandidateConfig,
-) -> None:
-    model = RecurrentCandidateModel(
-        config,
-        enable_transaction_heads=True,
-    ).eval()
-    batch = _make_batch(config)
-    macro_batch = replace(
-        batch,
-        macro_economic_surface_ids=torch.tensor([1, 2], dtype=torch.long),
-    )
-
-    baseline = model(batch)
-    output = model(macro_batch)
-    assert output.macro_policy_logits is not None
-    assert output.macro_option_value is not None
-    # Reviewed model-init starts from exactly the inherited behavior.
-    assert torch.equal(output.policy_logits, baseline.policy_logits)
-    assert torch.equal(output.macro_policy_logits, output.policy_logits)
-    assert torch.count_nonzero(output.macro_option_value) == 0
-
-    model.zero_grad(set_to_none=True)
-    loss = (
-        -output.macro_policy_log_probabilities()[0, 0]
-        + (output.macro_option_value - 1.0).square().mean()
-    )
-    loss.backward()
-
-    assert model.macro_policy_head is not None
-    assert model.macro_option_value_head is not None
-    assert model.macro_policy_head[-1].weight.grad is not None
-    assert model.macro_option_value_head[-1].weight.grad is not None
-    # Macro value/AWR losses update only sidecars, never the general policy or
-    # shared tactical representation.
-    macro_prefixes = (
-        "macro_surface_candidate_embedding.",
-        "macro_surface_state_embedding.",
-        "macro_policy_head.",
-        "macro_option_value_head.",
-    )
-    assert all(
-        parameter.grad is None
-        for name, parameter in model.named_parameters()
-        if not name.startswith(macro_prefixes)
-    )
-
-
 def test_masked_candidates_are_inert(config: GroundedCandidateConfig) -> None:
     model = RecurrentCandidateModel(config).eval()
     output = model(_make_batch(config))

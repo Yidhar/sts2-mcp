@@ -76,8 +76,6 @@ def _checkpoint_summary(paths: Any) -> dict[str, Any]:
 
 
 def test_v46_adds_only_guarded_option_actor_to_v45_recipe() -> None:
-    from dataclasses import replace
-
     config = load_archived_training_config(profile="preheat", config_path=CONFIG)
     v44 = load_archived_training_config(profile="preheat", config_path=V44_CONFIG)
     v45 = load_archived_training_config(profile="preheat", config_path=V45_CONFIG)
@@ -89,41 +87,10 @@ def test_v46_adds_only_guarded_option_actor_to_v45_recipe() -> None:
     assert config.transaction_learning.transaction_q_weight == (
         v45.transaction_learning.transaction_q_weight
     ) == 0.05
-    assert config.transaction_learning.lifecycle_advantage_policy_weight == 0.05
-    assert config.transaction_learning.lifecycle_advantage_start_update == 256
-    assert config.transaction_learning.lifecycle_advantage_temperature == 0.25
-    assert config.transaction_learning.lifecycle_advantage_clip == 1.0
-    assert config.transaction_learning.lifecycle_advantage_q_error_gate == 0.25
-    assert config.transaction_learning.lifecycle_advantage_max_policy_lag == 128
-    assert (
-        config.transaction_learning.lifecycle_advantage_max_log_probability_shift
-        == 1.0
-    )
-    assert replace(
-        config.transaction_learning,
-        lifecycle_advantage_policy_weight=(
-            v45.transaction_learning.lifecycle_advantage_policy_weight
-        ),
-        lifecycle_advantage_start_update=(
-            v45.transaction_learning.lifecycle_advantage_start_update
-        ),
-        lifecycle_advantage_temperature=(
-            v45.transaction_learning.lifecycle_advantage_temperature
-        ),
-        lifecycle_advantage_clip=(
-            v45.transaction_learning.lifecycle_advantage_clip
-        ),
-        lifecycle_advantage_q_error_gate=(
-            v45.transaction_learning.lifecycle_advantage_q_error_gate
-        ),
-        lifecycle_advantage_max_policy_lag=(
-            v45.transaction_learning.lifecycle_advantage_max_policy_lag
-        ),
-        lifecycle_advantage_max_log_probability_shift=(
-            v45.transaction_learning.lifecycle_advantage_max_log_probability_shift
-        ),
-    ) == v45.transaction_learning
-    assert v45.transaction_learning.lifecycle_advantage_policy_weight == 0.0
+    # The v46 recipe differed from v45 only by the retired option-advantage
+    # actor bridge; under the v20 archive projection both collapse to the
+    # same surviving transaction contract.
+    assert config.transaction_learning == v45.transaction_learning
     assert config.failure_credit == v45.failure_credit == v44.failure_credit
     assert config.episodic_learning == v45.episodic_learning == v44.episodic_learning
     assert config.model == v45.model == v44.model

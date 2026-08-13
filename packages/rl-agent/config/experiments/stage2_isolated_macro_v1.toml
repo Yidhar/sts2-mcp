@@ -33,19 +33,6 @@ transaction_q_weight = 0.05
 pairwise_ranking_weight = 0.0
 lifecycle_smdp_q_weight = 0.10
 lifecycle_smdp_horizon = "next_resource_opportunity"
-lifecycle_advantage_policy_weight = 0.0
-lifecycle_advantage_start_update = 256
-lifecycle_advantage_temperature = 0.25
-lifecycle_advantage_clip = 1.0
-lifecycle_advantage_q_error_gate = 0.25
-lifecycle_advantage_max_policy_lag = 128
-lifecycle_advantage_max_log_probability_shift = 1.0
-macro_option_value_weight = 0.10
-macro_option_actor_weight = 0.03
-macro_option_actor_temperature = 0.25
-macro_option_actor_log_weight_clip = 2.0
-macro_option_max_policy_lag = 128
-macro_option_max_log_probability_shift = 2.0
 
 [failure_credit]
 # Stage-2 collection is unrecorded; no failure-credit evidence is gathered.

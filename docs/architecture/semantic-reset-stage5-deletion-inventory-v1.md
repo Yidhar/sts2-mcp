@@ -1,5 +1,23 @@
 # Stage-5 deletion inventory — §9 retirement list code sites
 
+## EXECUTED (2026-08-13)
+
+- `8463aa2` — execution step 1 (items 1+2): entry/selection exploration
+  floors and completion guidance deleted; config v20 strip-migration.
+- `43894bc` — execution steps 2+3 (items 10, 3+4): entropy collapse breaker
+  (learner dynamics v3), two-sided entry support corridor, and transaction
+  completion/selection-group CE deleted; `support_eligible` + SMDP-Q kept.
+- `8fd5629` — execution steps 4+5+6 (items 7+8, 6, 9): success/act-segment/
+  revival imitation with exemptions/ratchets, liveness policy actors
+  (critics kept), and sidecar policy layers deleted; episodic replay v5,
+  failure-credit replay v6, transaction replay v8.
+- final commit (this change) — execution step 7 (item 5): macro residual
+  AWR + lifecycle actor bridge config/objectives/metrics and the
+  macro_policy/macro_option_value model heads deleted (state-dict key set
+  changed; retired family drops via tolerated loader groups), dashboard
+  retired-series cleanup, CLAUDE.md semantic-executor rewrite +
+  anti-accretion rule.
+
 Status: read-only inventory (2026-08-11) prepared BEFORE the stage-3 handoff
 decision; deletion itself executes only after the corresponding controller is
 replaced (reset doc §10 stage 5, domain-scoped). Line numbers reference the

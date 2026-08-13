@@ -2,7 +2,8 @@
 
 The isolated semantic-reset lineages evolve head shapes deliberately (the
 retired liveness heads; the candidate-Q head widened to read state
-features). Loading inherits every shape-compatible tensor and refuses any
+features; the v47 macro residual-actor and option-value heads retired with
+config v20). Loading inherits every shape-compatible tensor and refuses any
 drift outside the explicitly tolerated head groups — the macro analogue of
 the legacy model-parameter-initialization contract.
 """
@@ -19,6 +20,13 @@ TOLERATED_HEAD_GROUPS: Final[tuple[str, ...]] = (
     "candidate_liveness_cost_head",
     "liveness_cost_value_head",
     "transaction_q_head",
+    # Retired v47 macro-option family: v47-era champion checkpoints and
+    # existing macro publications still carry these tensors; the current
+    # model never constructs them, so they load as explicit drops.
+    "macro_surface_candidate_embedding",
+    "macro_surface_state_embedding",
+    "macro_policy_head",
+    "macro_option_value_head",
 )
 
 

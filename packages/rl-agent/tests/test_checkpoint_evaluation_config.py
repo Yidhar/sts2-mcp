@@ -20,13 +20,6 @@ def _v10_payload() -> dict[str, Any]:
     for key in (
         "lifecycle_smdp_q_weight",
         "lifecycle_smdp_horizon",
-        "lifecycle_advantage_policy_weight",
-        "lifecycle_advantage_start_update",
-        "lifecycle_advantage_temperature",
-        "lifecycle_advantage_clip",
-        "lifecycle_advantage_q_error_gate",
-        "lifecycle_advantage_max_policy_lag",
-        "lifecycle_advantage_max_log_probability_shift",
     ):
         del transaction_learning[key]
     episodic = payload["episodic_learning"]

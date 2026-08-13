@@ -364,28 +364,6 @@ class TransactionLearningConfig:
     ] = (
         "transaction_exit"
     )
-    # A calibrated factual option-Q target can directly move the shared actor
-    # even when the selected action has reached a softmax absorbing state.
-    # This bounded CE bridge is deliberately opt-in and separately gated by
-    # learner age, policy provenance, Q residual and collection/current policy
-    # drift.  It is neither an action bonus nor an expert label.
-    lifecycle_advantage_policy_weight: float = 0.0
-    lifecycle_advantage_start_update: int = 0
-    lifecycle_advantage_temperature: float = 0.25
-    lifecycle_advantage_clip: float = 1.0
-    lifecycle_advantage_q_error_gate: float = 0.25
-    lifecycle_advantage_max_policy_lag: int = 128
-    lifecycle_advantage_max_log_probability_shift: float = 1.0
-    # V47 macro economy path.  The factual state baseline replaces v46's
-    # unexecuted-alternative Q baseline.  AWR uses the observed option return
-    # and a detached candidate-independent value; both actor and value heads
-    # are isolated from the shared tactical trunk by model construction.
-    macro_option_value_weight: float = 0.0
-    macro_option_actor_weight: float = 0.0
-    macro_option_actor_temperature: float = 0.25
-    macro_option_actor_log_weight_clip: float = 2.0
-    macro_option_max_policy_lag: int = 128
-    macro_option_max_log_probability_shift: float = 2.0
     # Cross-trajectory outcome ranking remains explicit opt-in.  Factual Q,
     # effect and selection-delta heads are safe by default; pairwise policy
     # supervision requires context-equivalent repeated states and must not be
@@ -415,29 +393,9 @@ class TransactionLearningConfig:
             minimum=0,
         )
         for name in (
-            "lifecycle_advantage_start_update",
-            "lifecycle_advantage_max_policy_lag",
-            "macro_option_max_policy_lag",
-        ):
-            _require_int(
-                getattr(self, name),
-                label=f"transaction_learning.{name}",
-                minimum=0,
-            )
-        for name in (
             "effect_weight",
             "transaction_q_weight",
             "lifecycle_smdp_q_weight",
-            "lifecycle_advantage_policy_weight",
-            "lifecycle_advantage_temperature",
-            "lifecycle_advantage_clip",
-            "lifecycle_advantage_q_error_gate",
-            "lifecycle_advantage_max_log_probability_shift",
-            "macro_option_value_weight",
-            "macro_option_actor_weight",
-            "macro_option_actor_temperature",
-            "macro_option_actor_log_weight_clip",
-            "macro_option_max_log_probability_shift",
             "pairwise_ranking_weight",
             "pairwise_margin",
             "minimum_return_gap",
@@ -456,28 +414,7 @@ class TransactionLearningConfig:
                 "transaction_learning.lifecycle_smdp_horizon must be "
                 "transaction_exit, next_rest_or_act or next_resource_opportunity"
             )
-        if self.lifecycle_advantage_temperature <= 0.0:
-            raise ValueError(
-                "transaction_learning.lifecycle_advantage_temperature must be positive"
-            )
-        if self.lifecycle_advantage_clip <= 0.0:
-            raise ValueError(
-                "transaction_learning.lifecycle_advantage_clip must be positive"
-            )
-        if self.macro_option_actor_temperature <= 0.0:
-            raise ValueError(
-                "transaction_learning.macro_option_actor_temperature must be positive"
-            )
-        if self.macro_option_actor_log_weight_clip <= 0.0:
-            raise ValueError(
-                "transaction_learning.macro_option_actor_log_weight_clip must be positive"
-            )
-        if not self.enabled and (
-            self.lifecycle_smdp_q_weight > 0.0
-            or self.lifecycle_advantage_policy_weight > 0.0
-            or self.macro_option_value_weight > 0.0
-            or self.macro_option_actor_weight > 0.0
-        ):
+        if not self.enabled and self.lifecycle_smdp_q_weight > 0.0:
             raise ValueError(
                 "transaction lifecycle losses require transaction_learning.enabled"
             )
@@ -1341,10 +1278,13 @@ def model_initialization_config_from_mapping(
     eligibility floor for the liveness risk actor, an explicit success-
     imitation surface exemption, and the policy-collapse-v2 entropy breaker.
     V18 adds healthy Act-prefix imitation, a bounded factual combat HP-loss
-    head, and the extended factual transaction option horizon. V19 adds a
-    guarded factual option-advantage actor bridge; all of its new controls
-    migrate disabled so an older policy is never reinterpreted as supervised
-    actor data. V20 retires the operation-specific entry/selection exploration
+    head, and the extended factual transaction option horizon. V19 added a
+    guarded factual option-advantage actor bridge and the v47 macro
+    value/AWR controls; V20 retires that whole macro residual-actor family,
+    so the reviewed migration strips the ``lifecycle_advantage_*`` and
+    ``macro_option_*`` actor keys from every older payload and a V20 payload
+    that still contains them fails the strict parser.
+    V20 retires the operation-specific entry/selection exploration
     floors and completion guidance entirely: the ``transaction_exploration``
     table and the curriculum ``selection_surface_epsilon_floor`` key are
     stripped from every older payload, and a V20 payload that still contains
@@ -1593,30 +1533,6 @@ def model_initialization_config_from_mapping(
             f"{source_version} model-initialization config unexpectedly "
             "contains the V18 transaction option horizon"
         )
-    v19_transaction_fields = {
-        "lifecycle_advantage_policy_weight": 0.0,
-        "lifecycle_advantage_start_update": 0,
-        "lifecycle_advantage_temperature": 0.25,
-        "lifecycle_advantage_clip": 1.0,
-        "lifecycle_advantage_q_error_gate": 0.25,
-        "lifecycle_advantage_max_policy_lag": 128,
-        "lifecycle_advantage_max_log_probability_shift": 1.0,
-    }
-    if source_version == _MODEL_INITIALIZATION_SOURCE_CONFIG_V19:
-        missing_v19 = set(v19_transaction_fields) - set(raw_transaction)
-        if missing_v19:
-            raise ValueError(
-                "V19 model-initialization config is missing transaction "
-                "actor fields: " + ", ".join(sorted(missing_v19))
-            )
-    else:
-        unexpected_v19 = set(v19_transaction_fields).intersection(raw_transaction)
-        if unexpected_v19:
-            raise ValueError(
-                f"{source_version} model-initialization config unexpectedly "
-                "contains V19 transaction actor fields: "
-                + ", ".join(sorted(unexpected_v19))
-            )
     migrated_transaction = {
         **dict(raw_transaction),
         **(
@@ -1628,20 +1544,30 @@ def model_initialization_config_from_mapping(
             }
             else {"lifecycle_smdp_horizon": "transaction_exit"}
         ),
-        **(
-            {}
-            if source_version == _MODEL_INITIALIZATION_SOURCE_CONFIG_V19
-            else v19_transaction_fields
-        ),
     }
-    # V20 retired the transaction completion/selection-group CE objectives and
-    # the two-sided entry support corridor. Strip the retired keys from every
-    # older payload; a V20 payload containing them fails the strict parser.
+    # V20 retired the transaction completion/selection-group CE objectives,
+    # the two-sided entry support corridor, the V19 option-advantage actor
+    # bridge and the v47 macro value/AWR residual actor. Strip the retired
+    # keys from every older payload; a V20 payload containing them fails the
+    # strict parser.
     for retired_transaction_field in (
         "completion_policy_weight",
         "lifecycle_entry_support_weight",
         "lifecycle_entry_support_probability_floor",
         "macro_option_group_completion_weight",
+        "lifecycle_advantage_policy_weight",
+        "lifecycle_advantage_start_update",
+        "lifecycle_advantage_temperature",
+        "lifecycle_advantage_clip",
+        "lifecycle_advantage_q_error_gate",
+        "lifecycle_advantage_max_policy_lag",
+        "lifecycle_advantage_max_log_probability_shift",
+        "macro_option_value_weight",
+        "macro_option_actor_weight",
+        "macro_option_actor_temperature",
+        "macro_option_actor_log_weight_clip",
+        "macro_option_max_policy_lag",
+        "macro_option_max_log_probability_shift",
     ):
         migrated_transaction.pop(retired_transaction_field, None)
     migrated["transaction_learning"] = migrated_transaction

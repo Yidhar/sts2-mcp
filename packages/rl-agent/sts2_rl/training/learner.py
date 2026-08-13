@@ -14,16 +14,8 @@ from torch import Tensor
 from sts2_baseline import SequenceUnroll
 from sts2_rl.encoding import GroundedObservationEncoder
 from sts2_rl.encoding.grounded import grounding_encoding_identity
-from sts2_rl.encoding.snapshot import (
-    EncodedDecisionSnapshot,
-    collate_encoded_snapshots,
-)
+from sts2_rl.encoding.snapshot import collate_encoded_snapshots
 from sts2_rl.models import (
-    MACRO_ECONOMIC_SURFACE_CARD_REWARD,
-    MACRO_ECONOMIC_SURFACE_REMOVAL_SELECTION,
-    MACRO_ECONOMIC_SURFACE_REST,
-    MACRO_ECONOMIC_SURFACE_SHOP,
-    MACRO_ECONOMIC_SURFACE_UPGRADE_SELECTION,
     RecurrentCandidateModel,
     RecurrentCandidateOutput,
 )
@@ -64,14 +56,6 @@ _LIVENESS_AUTOGRAD_PACKING_VERSION = 1
 _LIVENESS_AUTOGRAD_MAX_STEPS = 256
 _LIVENESS_AUTOGRAD_MAX_CANDIDATES = 1_024
 _LIVENESS_AUTOGRAD_MAX_SEGMENTS = 16
-
-_MACRO_SURFACE_NAME_BY_ID = {
-    MACRO_ECONOMIC_SURFACE_REST: "rest_site",
-    MACRO_ECONOMIC_SURFACE_SHOP: "shop",
-    MACRO_ECONOMIC_SURFACE_CARD_REWARD: "card_reward",
-    MACRO_ECONOMIC_SURFACE_UPGRADE_SELECTION: "upgrade_selection",
-    MACRO_ECONOMIC_SURFACE_REMOVAL_SELECTION: "removal_selection",
-}
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,33 +99,11 @@ class LearnerMetrics:
     transaction_q_loss: float
     transaction_pairwise_ranking_loss: float
     transaction_smdp_q_loss: float
-    transaction_advantage_policy_loss: float
-    transaction_macro_option_value_loss: float
-    transaction_macro_option_actor_loss: float
     transaction_traces: int
     transaction_effect_labels: int
     transaction_q_labels: int
     transaction_pairs: int
     transaction_smdp_q_labels: int
-    transaction_advantage_policy_labels: int
-    transaction_advantage_policy_positive_labels: int
-    transaction_advantage_policy_negative_labels: int
-    transaction_advantage_policy_phase_suppressed_labels: int
-    transaction_advantage_policy_lag_suppressed_labels: int
-    transaction_advantage_policy_q_error_suppressed_labels: int
-    transaction_advantage_policy_drift_suppressed_labels: int
-    transaction_advantage_policy_singleton_suppressed_labels: int
-    transaction_advantage_mean: float
-    transaction_macro_option_value_labels: int
-    transaction_macro_option_actor_labels: int
-    transaction_macro_option_actor_lag_suppressed_labels: int
-    transaction_macro_option_actor_drift_suppressed_labels: int
-    transaction_macro_option_actor_singleton_suppressed_labels: int
-    transaction_macro_option_advantage_mean: float
-    transaction_macro_option_weight_mean: float
-    transaction_macro_option_weight_max: float
-    transaction_macro_option_value_labels_by_surface: dict[str, int]
-    transaction_macro_option_actor_labels_by_surface: dict[str, int]
     transaction_lifecycle_committed: int
     transaction_lifecycle_cancelled: int
     transaction_lifecycle_unresolved: int
@@ -193,32 +155,10 @@ class _TransactionLossBatch:
     q_loss: Tensor
     pairwise_loss: Tensor
     smdp_q_loss: Tensor
-    advantage_policy_loss: Tensor
-    macro_option_value_loss: Tensor
-    macro_option_actor_loss: Tensor
     effect_labels: int
     q_labels: int
     pair_count: int
     smdp_q_labels: int
-    advantage_policy_labels: int
-    advantage_policy_positive_labels: int
-    advantage_policy_negative_labels: int
-    advantage_policy_phase_suppressed_labels: int
-    advantage_policy_lag_suppressed_labels: int
-    advantage_policy_q_error_suppressed_labels: int
-    advantage_policy_drift_suppressed_labels: int
-    advantage_policy_singleton_suppressed_labels: int
-    advantage_mean: float
-    macro_option_value_labels: int
-    macro_option_actor_labels: int
-    macro_option_actor_lag_suppressed_labels: int
-    macro_option_actor_drift_suppressed_labels: int
-    macro_option_actor_singleton_suppressed_labels: int
-    macro_option_advantage_mean: float
-    macro_option_weight_mean: float
-    macro_option_weight_max: float
-    macro_option_value_labels_by_surface: dict[str, int]
-    macro_option_actor_labels_by_surface: dict[str, int]
     lifecycle_committed: int
     lifecycle_cancelled: int
     lifecycle_unresolved: int
@@ -1682,12 +1622,6 @@ class VTraceLearner:
             + self.transaction_config.pairwise_ranking_weight * transaction_pairwise_loss
             + self.transaction_config.lifecycle_smdp_q_weight
             * transaction_losses.smdp_q_loss
-            + self.transaction_config.lifecycle_advantage_policy_weight
-            * transaction_losses.advantage_policy_loss
-            + self.transaction_config.macro_option_value_weight
-            * transaction_losses.macro_option_value_loss
-            + self.transaction_config.macro_option_actor_weight
-            * transaction_losses.macro_option_actor_loss
         )
         total_loss = online_objective_loss + transaction_objective_loss
         _require_finite(
@@ -1701,18 +1635,6 @@ class VTraceLearner:
                 ("transaction_q_loss", transaction_q_loss),
                 ("transaction_pairwise_loss", transaction_pairwise_loss),
                 ("transaction_smdp_q_loss", transaction_losses.smdp_q_loss),
-                (
-                    "transaction_advantage_policy_loss",
-                    transaction_losses.advantage_policy_loss,
-                ),
-                (
-                    "transaction_macro_option_value_loss",
-                    transaction_losses.macro_option_value_loss,
-                ),
-                (
-                    "transaction_macro_option_actor_loss",
-                    transaction_losses.macro_option_actor_loss,
-                ),
             ),
         )
         target_and_loss_ms = _elapsed_ms(target_started_ns)
@@ -1979,75 +1901,11 @@ class VTraceLearner:
             transaction_smdp_q_loss=float(
                 transaction_losses.smdp_q_loss.detach().item()
             ),
-            transaction_advantage_policy_loss=float(
-                transaction_losses.advantage_policy_loss.detach().item()
-            ),
-            transaction_macro_option_value_loss=float(
-                transaction_losses.macro_option_value_loss.detach().item()
-            ),
-            transaction_macro_option_actor_loss=float(
-                transaction_losses.macro_option_actor_loss.detach().item()
-            ),
             transaction_traces=len(transaction_traces),
             transaction_effect_labels=transaction_losses.effect_labels,
             transaction_q_labels=transaction_losses.q_labels,
             transaction_pairs=transaction_losses.pair_count,
             transaction_smdp_q_labels=transaction_losses.smdp_q_labels,
-            transaction_advantage_policy_labels=(
-                transaction_losses.advantage_policy_labels
-            ),
-            transaction_advantage_policy_positive_labels=(
-                transaction_losses.advantage_policy_positive_labels
-            ),
-            transaction_advantage_policy_negative_labels=(
-                transaction_losses.advantage_policy_negative_labels
-            ),
-            transaction_advantage_policy_phase_suppressed_labels=(
-                transaction_losses.advantage_policy_phase_suppressed_labels
-            ),
-            transaction_advantage_policy_lag_suppressed_labels=(
-                transaction_losses.advantage_policy_lag_suppressed_labels
-            ),
-            transaction_advantage_policy_q_error_suppressed_labels=(
-                transaction_losses.advantage_policy_q_error_suppressed_labels
-            ),
-            transaction_advantage_policy_drift_suppressed_labels=(
-                transaction_losses.advantage_policy_drift_suppressed_labels
-            ),
-            transaction_advantage_policy_singleton_suppressed_labels=(
-                transaction_losses.advantage_policy_singleton_suppressed_labels
-            ),
-            transaction_advantage_mean=transaction_losses.advantage_mean,
-            transaction_macro_option_value_labels=(
-                transaction_losses.macro_option_value_labels
-            ),
-            transaction_macro_option_actor_labels=(
-                transaction_losses.macro_option_actor_labels
-            ),
-            transaction_macro_option_actor_lag_suppressed_labels=(
-                transaction_losses.macro_option_actor_lag_suppressed_labels
-            ),
-            transaction_macro_option_actor_drift_suppressed_labels=(
-                transaction_losses.macro_option_actor_drift_suppressed_labels
-            ),
-            transaction_macro_option_actor_singleton_suppressed_labels=(
-                transaction_losses.macro_option_actor_singleton_suppressed_labels
-            ),
-            transaction_macro_option_advantage_mean=(
-                transaction_losses.macro_option_advantage_mean
-            ),
-            transaction_macro_option_weight_mean=(
-                transaction_losses.macro_option_weight_mean
-            ),
-            transaction_macro_option_weight_max=(
-                transaction_losses.macro_option_weight_max
-            ),
-            transaction_macro_option_value_labels_by_surface=(
-                transaction_losses.macro_option_value_labels_by_surface
-            ),
-            transaction_macro_option_actor_labels_by_surface=(
-                transaction_losses.macro_option_actor_labels_by_surface
-            ),
             transaction_lifecycle_committed=(
                 transaction_losses.lifecycle_committed
             ),
@@ -2404,32 +2262,10 @@ class VTraceLearner:
                 q_loss=zero,
                 pairwise_loss=zero,
                 smdp_q_loss=zero,
-                advantage_policy_loss=zero,
-                macro_option_value_loss=zero,
-                macro_option_actor_loss=zero,
                 effect_labels=0,
                 q_labels=0,
                 pair_count=0,
                 smdp_q_labels=0,
-                advantage_policy_labels=0,
-                advantage_policy_positive_labels=0,
-                advantage_policy_negative_labels=0,
-                advantage_policy_phase_suppressed_labels=0,
-                advantage_policy_lag_suppressed_labels=0,
-                advantage_policy_q_error_suppressed_labels=0,
-                advantage_policy_drift_suppressed_labels=0,
-                advantage_policy_singleton_suppressed_labels=0,
-                advantage_mean=0.0,
-                macro_option_value_labels=0,
-                macro_option_actor_labels=0,
-                macro_option_actor_lag_suppressed_labels=0,
-                macro_option_actor_drift_suppressed_labels=0,
-                macro_option_actor_singleton_suppressed_labels=0,
-                macro_option_advantage_mean=0.0,
-                macro_option_weight_mean=0.0,
-                macro_option_weight_max=0.0,
-                macro_option_value_labels_by_surface={},
-                macro_option_actor_labels_by_surface={},
                 lifecycle_committed=0,
                 lifecycle_cancelled=0,
                 lifecycle_unresolved=0,
@@ -2445,235 +2281,12 @@ class VTraceLearner:
         selected_policy_log_probabilities: dict[tuple[int, int], Tensor] = {}
         smdp_q_predictions: list[Tensor] = []
         smdp_q_targets: list[Tensor] = []
-        advantage_policy_terms: list[Tensor] = []
-        advantage_values: list[float] = []
-        advantage_policy_positive_labels = 0
-        advantage_policy_negative_labels = 0
-        advantage_policy_phase_suppressed_labels = 0
-        advantage_policy_lag_suppressed_labels = 0
-        advantage_policy_q_error_suppressed_labels = 0
-        advantage_policy_drift_suppressed_labels = 0
-        advantage_policy_singleton_suppressed_labels = 0
-        macro_option_value_predictions: list[Tensor] = []
-        macro_option_value_targets: list[Tensor] = []
-        # ``surface -> [(selected macro log-probability, factual advantage)]``.
-        # Normalizing within the resource-opportunity surface prevents the much
-        # more frequent card-reward rows from setting the scale for scarce shop
-        # and rest-site decisions.
-        macro_option_actor_rows: dict[str, list[tuple[Tensor, Tensor]]] = {}
-        macro_option_actor_lag_suppressed_labels = 0
-        macro_option_actor_drift_suppressed_labels = 0
-        macro_option_actor_singleton_suppressed_labels = 0
-        macro_option_advantages: list[float] = []
-        macro_option_weights: list[float] = []
-        macro_option_value_labels_by_surface: dict[str, int] = {}
-        macro_option_actor_labels_by_surface: dict[str, int] = {}
         lifecycle_counts = {
             TransactionLifecycleOutcome.COMMITTED: 0,
             TransactionLifecycleOutcome.CANCELLED: 0,
             TransactionLifecycleOutcome.UNRESOLVED: 0,
             TransactionLifecycleOutcome.DEADLOCK: 0,
         }
-
-        def add_advantage_policy_target(
-            *,
-            output: RecurrentCandidateOutput,
-            snapshot: EncodedDecisionSnapshot,
-            action_index: int,
-            target: Tensor,
-            collection_model_log_probability: float,
-            provenance_policy_version: int,
-        ) -> None:
-            """Admit one bounded, factual option-advantage actor target.
-
-            Unlike V-trace/importance-weighted imitation, the CE derivative is
-            non-zero when the selected policy probability is numerically zero.
-            Admission is nevertheless fail-closed: only a calibrated selected
-            Q prediction from a recent, collection-compatible policy may move
-            the actor.  The target and all gating/strength terms are detached;
-            gradients flow only through normalized policy log-probabilities.
-            """
-
-            nonlocal advantage_policy_positive_labels
-            nonlocal advantage_policy_negative_labels
-            nonlocal advantage_policy_phase_suppressed_labels
-            nonlocal advantage_policy_lag_suppressed_labels
-            nonlocal advantage_policy_q_error_suppressed_labels
-            nonlocal advantage_policy_drift_suppressed_labels
-            nonlocal advantage_policy_singleton_suppressed_labels
-
-            if self.transaction_config.lifecycle_advantage_policy_weight <= 0.0:
-                return
-            legal_indices = [
-                index
-                for index, enabled in enumerate(snapshot.action_mask)
-                if bool(enabled)
-            ]
-            if len(legal_indices) <= 1:
-                advantage_policy_singleton_suppressed_labels += 1
-                return
-            if (
-                schedule_learner_update
-                < self.transaction_config.lifecycle_advantage_start_update
-            ):
-                advantage_policy_phase_suppressed_labels += 1
-                return
-            lag = current_policy_version - provenance_policy_version
-            if lag < 0:
-                raise ValueError(
-                    "transaction option target comes from a future policy version"
-                )
-            if lag > self.transaction_config.lifecycle_advantage_max_policy_lag:
-                advantage_policy_lag_suppressed_labels += 1
-                return
-            if output.transaction_q_values is None:  # pragma: no cover - caller invariant
-                raise RuntimeError("option actor target requires transaction Q values")
-            log_policy = output.policy_log_probabilities()[0].float()
-            current_log_probability = log_policy[action_index].detach()
-            if (
-                abs(
-                    float(current_log_probability.item())
-                    - float(collection_model_log_probability)
-                )
-                > self.transaction_config.lifecycle_advantage_max_log_probability_shift
-            ):
-                advantage_policy_drift_suppressed_labels += 1
-                return
-            selected_q = output.transaction_q_values[0, action_index].float()
-            detached_target = target.detach().float()
-            if (
-                abs(float((selected_q.detach() - detached_target).item()))
-                > self.transaction_config.lifecycle_advantage_q_error_gate
-            ):
-                advantage_policy_q_error_suppressed_labels += 1
-                return
-            legal = torch.tensor(
-                legal_indices,
-                device=self.device,
-                dtype=torch.long,
-            )
-            alternatives = legal[legal != action_index]
-            if alternatives.numel() == 0:  # pragma: no cover - singleton gate
-                raise RuntimeError("option target lost its legal alternative")
-            # The baseline must be counterfactual.  Including the selected
-            # action makes a probability-one incumbent cancel its own
-            # advantage exactly, recreating the absorbing state this bridge
-            # exists to remove.  Renormalizing only the other legal actions is
-            # stable even when every alternative has exponentially small
-            # current probability.
-            alternative_weights = torch.softmax(
-                log_policy[alternatives].detach(),
-                dim=0,
-            )
-            alternative_q_values = output.transaction_q_values[
-                0, alternatives
-            ].float().detach()
-            baseline = (alternative_weights * alternative_q_values).sum()
-            advantage = float((detached_target - baseline).item())
-            if abs(advantage) <= 1.0e-8:
-                return
-            strength = min(
-                abs(advantage)
-                / self.transaction_config.lifecycle_advantage_temperature,
-                self.transaction_config.lifecycle_advantage_clip,
-            )
-            if advantage > 0.0:
-                advantage_policy_terms.append(-strength * log_policy[action_index])
-                advantage_policy_positive_labels += 1
-            else:
-                advantage_policy_terms.append(
-                    -strength * torch.logsumexp(log_policy[alternatives], dim=0)
-                )
-                advantage_policy_negative_labels += 1
-            advantage_values.append(advantage)
-
-        def add_macro_option_target(
-            *,
-            output: RecurrentCandidateOutput,
-            snapshot: EncodedDecisionSnapshot,
-            action_index: int,
-            target: Tensor,
-            collection_model_log_probability: float,
-            provenance_policy_version: int,
-        ) -> None:
-            """Add one factual macro-value/AWR row without touching the trunk.
-
-            The baseline is a candidate-independent factual value at the same
-            resource-opportunity surface.  It is *not* an estimate for an
-            unexecuted alternative.  ``macro_policy_logits`` and
-            ``macro_option_value`` are structurally detached from the shared
-            state/policy features in the model, so this objective can recover a
-            saturated reject branch without displacing combat or target-choice
-            competence.
-            """
-
-            nonlocal macro_option_actor_lag_suppressed_labels
-            nonlocal macro_option_actor_drift_suppressed_labels
-            nonlocal macro_option_actor_singleton_suppressed_labels
-
-            if (
-                self.transaction_config.macro_option_value_weight <= 0.0
-                and self.transaction_config.macro_option_actor_weight <= 0.0
-            ):
-                return
-            if snapshot.macro_economic_surface_id <= 0:
-                # Old/non-economic rows must not be silently aliased onto a
-                # reviewed macro surface.
-                return
-            if output.macro_option_value is None or output.macro_policy_logits is None:
-                raise RuntimeError(
-                    "macro-option learner received a model without v47 heads"
-                )
-            detached_target = target.detach().float()
-            value_prediction = output.macro_option_value[0].float()
-            macro_option_value_predictions.append(value_prediction)
-            macro_option_value_targets.append(detached_target)
-            surface_name = _MACRO_SURFACE_NAME_BY_ID.get(
-                snapshot.macro_economic_surface_id
-            )
-            if surface_name is None:  # pragma: no cover - reviewed-ID invariant
-                raise RuntimeError("macro option target has an unknown surface ID")
-            macro_option_value_labels_by_surface[surface_name] = (
-                macro_option_value_labels_by_surface.get(surface_name, 0) + 1
-            )
-
-            if self.transaction_config.macro_option_actor_weight <= 0.0:
-                return
-            legal_indices = [
-                index
-                for index, enabled in enumerate(snapshot.action_mask)
-                if bool(enabled)
-            ]
-            if len(legal_indices) <= 1:
-                macro_option_actor_singleton_suppressed_labels += 1
-                return
-            lag = current_policy_version - provenance_policy_version
-            if lag < 0:
-                raise ValueError(
-                    "macro option target comes from a future policy version"
-                )
-            if lag > self.transaction_config.macro_option_max_policy_lag:
-                macro_option_actor_lag_suppressed_labels += 1
-                return
-            macro_log_policy = output.macro_policy_log_probabilities()[0].float()
-            current_log_probability = macro_log_policy[action_index].detach()
-            if (
-                abs(
-                    float(current_log_probability.item())
-                    - float(collection_model_log_probability)
-                )
-                > self.transaction_config.macro_option_max_log_probability_shift
-            ):
-                macro_option_actor_drift_suppressed_labels += 1
-                return
-            advantage = detached_target - value_prediction.detach()
-            macro_option_actor_rows.setdefault(
-                surface_name, []
-            ).append((macro_log_policy[action_index], advantage))
-            macro_option_actor_labels_by_surface[surface_name] = (
-                macro_option_actor_labels_by_surface.get(surface_name, 0) + 1
-            )
-            macro_option_advantages.append(float(advantage.item()))
 
         for trace_index, trace in enumerate(traces):
             configured_burn_in = self.transaction_config.burn_in_steps
@@ -2759,9 +2372,6 @@ class VTraceLearner:
                     entry_action_index = trace.steps[
                         lifecycle.entry_step_index
                     ].action_index
-                    entry_snapshot = trace.steps[
-                        lifecycle.entry_step_index
-                    ].snapshot
 
                     if not lifecycle.option_target_observed:
                         if (
@@ -2824,30 +2434,6 @@ class VTraceLearner:
                         ].float()
                     )
                     smdp_q_targets.append(smdp_target.detach())
-                    add_macro_option_target(
-                        output=entry_output,
-                        snapshot=entry_snapshot,
-                        action_index=entry_action_index,
-                        target=smdp_target,
-                        collection_model_log_probability=trace.steps[
-                            lifecycle.entry_step_index
-                        ].model_log_probability,
-                        provenance_policy_version=(
-                            lifecycle.entry_policy_version
-                        ),
-                    )
-                    add_advantage_policy_target(
-                        output=entry_output,
-                        snapshot=entry_snapshot,
-                        action_index=entry_action_index,
-                        target=smdp_target,
-                        collection_model_log_probability=trace.steps[
-                            lifecycle.entry_step_index
-                        ].model_log_probability,
-                        provenance_policy_version=(
-                            lifecycle.entry_policy_version
-                        ),
-                    )
 
                     # Target selection rows use their own action-origin return;
                     # the entry-prefix return is never copied onto them.  A
@@ -2885,26 +2471,6 @@ class VTraceLearner:
                             ]
                         )
                         q_targets.append(float(step_target.detach().item()))
-                        add_macro_option_target(
-                            output=step_output,
-                            snapshot=step.snapshot,
-                            action_index=step.action_index,
-                            target=step_target,
-                            collection_model_log_probability=(
-                                step.model_log_probability
-                            ),
-                            provenance_policy_version=trace.policy_version,
-                        )
-                        add_advantage_policy_target(
-                            output=step_output,
-                            snapshot=step.snapshot,
-                            action_index=step.action_index,
-                            target=step_target,
-                            collection_model_log_probability=(
-                                step.model_log_probability
-                            ),
-                            provenance_policy_version=trace.policy_version,
-                        )
 
         effect_loss = (
             F.cross_entropy(
@@ -2956,59 +2522,6 @@ class VTraceLearner:
             if smdp_q_predictions
             else zero
         )
-        advantage_policy_loss = (
-            torch.stack(advantage_policy_terms).mean()
-            if advantage_policy_terms
-            else zero
-        )
-        macro_option_value_loss = (
-            F.smooth_l1_loss(
-                torch.stack(macro_option_value_predictions).float(),
-                torch.stack(macro_option_value_targets).float(),
-            )
-            if macro_option_value_predictions
-            else zero
-        )
-        macro_option_actor_surface_terms: list[Tensor] = []
-        macro_option_actor_label_count = 0
-        for rows in macro_option_actor_rows.values():
-            surface_log_probabilities = torch.stack(
-                [log_probability for log_probability, _ in rows]
-            ).float()
-            surface_advantages = torch.stack(
-                [advantage for _, advantage in rows]
-            ).float()
-            log_weights = (
-                surface_advantages
-                / self.transaction_config.macro_option_actor_temperature
-            ).clamp(
-                min=-self.transaction_config.macro_option_actor_log_weight_clip,
-                max=self.transaction_config.macro_option_actor_log_weight_clip,
-            )
-            weights = torch.exp(log_weights)
-            # Preserve the absolute factual-advantage scale, including for a
-            # surface represented by only one row.  Dividing by the observed
-            # mean would turn every singleton into weight 1 and erase exactly
-            # the state-level signal this AWR bridge exists to provide.
-            # Instead, average rows *within* each reviewed surface and then
-            # average surfaces below.  A busy card-reward stream therefore
-            # cannot overwhelm a scarce rest or shop opportunity by count.
-            macro_option_actor_surface_terms.append(
-                (-weights.detach() * surface_log_probabilities).mean()
-            )
-            macro_option_actor_label_count += len(rows)
-            macro_option_weights.extend(
-                float(item)
-                for item in weights.detach().cpu().tolist()
-            )
-        macro_option_actor_loss = (
-            torch.stack(macro_option_actor_surface_terms).mean()
-            if macro_option_actor_surface_terms
-            else zero
-        )
-
-        def mean_or_zero(values: list[float]) -> float:
-            return float(sum(values) / len(values)) if values else 0.0
 
         return _TransactionLossBatch(
             effect_loss=effect_loss,
@@ -3016,58 +2529,10 @@ class VTraceLearner:
             q_loss=q_loss,
             pairwise_loss=pairwise_loss,
             smdp_q_loss=smdp_q_loss,
-            advantage_policy_loss=advantage_policy_loss,
-            macro_option_value_loss=macro_option_value_loss,
-            macro_option_actor_loss=macro_option_actor_loss,
             effect_labels=len(effect_targets),
             q_labels=len(q_targets),
             pair_count=len(pairs),
             smdp_q_labels=len(smdp_q_predictions),
-            advantage_policy_labels=len(advantage_policy_terms),
-            advantage_policy_positive_labels=(
-                advantage_policy_positive_labels
-            ),
-            advantage_policy_negative_labels=(
-                advantage_policy_negative_labels
-            ),
-            advantage_policy_phase_suppressed_labels=(
-                advantage_policy_phase_suppressed_labels
-            ),
-            advantage_policy_lag_suppressed_labels=(
-                advantage_policy_lag_suppressed_labels
-            ),
-            advantage_policy_q_error_suppressed_labels=(
-                advantage_policy_q_error_suppressed_labels
-            ),
-            advantage_policy_drift_suppressed_labels=(
-                advantage_policy_drift_suppressed_labels
-            ),
-            advantage_policy_singleton_suppressed_labels=(
-                advantage_policy_singleton_suppressed_labels
-            ),
-            advantage_mean=mean_or_zero(advantage_values),
-            macro_option_value_labels=len(macro_option_value_predictions),
-            macro_option_actor_labels=macro_option_actor_label_count,
-            macro_option_actor_lag_suppressed_labels=(
-                macro_option_actor_lag_suppressed_labels
-            ),
-            macro_option_actor_drift_suppressed_labels=(
-                macro_option_actor_drift_suppressed_labels
-            ),
-            macro_option_actor_singleton_suppressed_labels=(
-                macro_option_actor_singleton_suppressed_labels
-            ),
-            macro_option_advantage_mean=mean_or_zero(macro_option_advantages),
-            macro_option_weight_mean=mean_or_zero(macro_option_weights),
-            macro_option_weight_max=(
-                max(macro_option_weights) if macro_option_weights else 0.0
-            ),
-            macro_option_value_labels_by_surface=dict(
-                sorted(macro_option_value_labels_by_surface.items())
-            ),
-            macro_option_actor_labels_by_surface=dict(
-                sorted(macro_option_actor_labels_by_surface.items())
-            ),
             lifecycle_committed=lifecycle_counts[
                 TransactionLifecycleOutcome.COMMITTED
             ],

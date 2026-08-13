@@ -73,8 +73,13 @@ sts2_rl.train
 - Run-scale memory updates outside combat. Combat-scale memory updates inside
   combat and clears on exit; keep the combined recurrent tensor ABI stable.
 - Only the authoritative environment legality mask can suppress an action.
-- No MCTS, planner, root bias, action rewrite or policy distillation is allowed
-  in the baseline.
+- No MCTS, planner, root bias or policy distillation is allowed. The
+  semantic executor executes compiled semantic decisions: UI mechanics
+  (selection traffic, confirmation, pickers) are mechanical suffixes of a
+  chosen semantic candidate, never independently optimized actions.
+  Strategic choice is never rewritten below the semantic layer; the
+  authoritative legality mask remains the only suppressor of semantic
+  candidates.
 - Each profile selects exactly one immutable reward identity. Backend scalars
   are never accepted as targets (the headless adapter strips them and may
   retain a diagnostic); objective vectors and settlement bonuses are rejected.
@@ -133,6 +138,11 @@ sts2_rl.train
   reward bonus or turn an auxiliary Q value into an action rewrite.
 - Evaluation uses generic semantic state/action recurrence detection and writes
   diagnostic trajectories; diagnostics never become training samples.
+- One domain, one primary preference-learning objective. A proposed
+  second policy-shaping channel for a domain (imitation, corridor, CE,
+  actor bridge, exploration floor) is an architecture change and requires
+  a written case for why the primary objective cannot carry the signal —
+  not a patch lineage.
 
 ## Contracts, artifacts and checkpoints
 

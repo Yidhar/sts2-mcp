@@ -61,10 +61,6 @@ def test_v47_recipe_is_factual_isolated_macro_awr() -> None:
     assert config.version == CONFIG_VERSION == "sts2-relational-curriculum-config-v20"
     assert tx.enabled is True
     assert tx.lifecycle_smdp_horizon == "next_resource_opportunity"
-    assert tx.lifecycle_advantage_policy_weight == 0.0
-    assert tx.macro_option_value_weight == pytest.approx(0.10)
-    assert tx.macro_option_actor_weight == pytest.approx(0.03)
-    assert tx.macro_option_actor_temperature == pytest.approx(0.25)
     assert config.curriculum.revival_budget == 40
     assert config.runtime.total_environment_steps == 30_000
     assert config.runtime.evaluation_steps == (0, 5_000, 10_000, 20_000)

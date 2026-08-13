@@ -32,7 +32,10 @@ from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
 from sts2_rl.checkpoints import validate_resume_checkpoint
 from sts2_rl.encoding import GroundedObservationEncoder
 from sts2_rl.models import RecurrentCandidateModel, RecurrentCandidateOutput
-from sts2_rl.training.checkpointing import preflight_model_initialization
+from sts2_rl.training.checkpointing import (
+    RETIRED_MACRO_OPTION_HEAD_PREFIXES,
+    preflight_model_initialization,
+)
 from sts2_rl.training.config import (
     CONFIG_VERSION,
     TrainingConfig,
@@ -1133,7 +1136,19 @@ def evaluate_checkpoint_macro_sensitivity(
     )
     if not isinstance(state, dict):
         raise ValueError("checkpoint network payload must be an object")
-    model.load_state_dict(state, strict=True)
+    # A v47-era checkpoint still carries the retired macro-option head family
+    # that config v20 deleted from the model.  Drop exactly that reviewed
+    # group; every surviving tensor keeps the strict full-ABI load.
+    retired_macro_keys = {
+        key
+        for key in state
+        if isinstance(key, str)
+        and key.startswith(RETIRED_MACRO_OPTION_HEAD_PREFIXES)
+    }
+    surviving_state = {
+        key: value for key, value in state.items() if key not in retired_macro_keys
+    }
+    model.load_state_dict(surviving_state, strict=True)
     encoder = GroundedObservationEncoder(config.model.to_encoding_config())
     result = evaluate_macro_sensitivity(model, encoder)
     training_state = validated.metadata.get("training_state")

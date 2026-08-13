@@ -120,19 +120,31 @@ def _remove_v18_act_prefix_fields(payload: dict[str, object]) -> None:
     transaction.pop("lifecycle_smdp_horizon")
 
 
-def _remove_v19_transaction_actor_fields(payload: dict[str, object]) -> None:
+_RETIRED_V20_TRANSACTION_ACTOR_FIELDS: dict[str, object] = {
+    "lifecycle_advantage_policy_weight": 0.05,
+    "lifecycle_advantage_start_update": 256,
+    "lifecycle_advantage_temperature": 0.25,
+    "lifecycle_advantage_clip": 1.0,
+    "lifecycle_advantage_q_error_gate": 0.25,
+    "lifecycle_advantage_max_policy_lag": 128,
+    "lifecycle_advantage_max_log_probability_shift": 1.0,
+    "macro_option_value_weight": 0.10,
+    "macro_option_actor_weight": 0.03,
+    "macro_option_actor_temperature": 0.25,
+    "macro_option_actor_log_weight_clip": 2.0,
+    "macro_option_max_policy_lag": 128,
+    "macro_option_max_log_probability_shift": 2.0,
+}
+
+
+def _add_retired_v20_macro_actor_fields(payload: dict[str, object]) -> None:
+    """Reproduce a real v19 payload: it still spelled out the retired V19
+    option-advantage actor bridge and the v47 macro value/AWR controls that
+    config v20 deleted."""
+
     transaction = payload["transaction_learning"]
     assert isinstance(transaction, dict)
-    for field in (
-        "lifecycle_advantage_policy_weight",
-        "lifecycle_advantage_start_update",
-        "lifecycle_advantage_temperature",
-        "lifecycle_advantage_clip",
-        "lifecycle_advantage_q_error_gate",
-        "lifecycle_advantage_max_policy_lag",
-        "lifecycle_advantage_max_log_probability_shift",
-    ):
-        transaction.pop(field)
+    transaction.update(_RETIRED_V20_TRANSACTION_ACTOR_FIELDS)
 
 
 def test_profiles_use_relational_recurrent_vtrace_v3_with_bounded_transaction_sidecar() -> None:
@@ -731,7 +743,6 @@ def test_old_v1_config_is_rejected_instead_of_migrated() -> None:
 
 def test_v10_config_migration_is_model_initialization_only_and_opt_in() -> None:
     source = TrainingConfig().to_mapping()
-    _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v10"
     _remove_v18_act_prefix_fields(source)
     _remove_v16_guard_field(source)
@@ -766,7 +777,6 @@ def test_v10_config_migration_is_model_initialization_only_and_opt_in() -> None:
 
 def test_v11_exact_resume_is_rejected_but_model_initialization_is_reviewed() -> None:
     source = TrainingConfig().to_mapping()
-    _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v11"
     _remove_v18_act_prefix_fields(source)
     _remove_v16_guard_field(source)
@@ -783,7 +793,6 @@ def test_v11_exact_resume_is_rejected_but_model_initialization_is_reviewed() -> 
 
 def test_v13_config_migration_is_model_init_only() -> None:
     source = TrainingConfig().to_mapping()
-    _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v13"
     _remove_v18_act_prefix_fields(source)
     _remove_v16_guard_field(source)
@@ -804,7 +813,6 @@ def test_v13_config_migration_is_model_init_only() -> None:
 
 def test_v14_transaction_lifecycle_migration_is_model_init_only() -> None:
     source = TrainingConfig().to_mapping()
-    _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v14"
     _remove_v18_act_prefix_fields(source)
     _remove_v16_guard_field(source)
@@ -818,7 +826,6 @@ def test_v14_transaction_lifecycle_migration_is_model_init_only() -> None:
     assert migrated.transaction_learning.lifecycle_smdp_q_weight == 0.0
 
     unexpected = TrainingConfig().to_mapping()
-    _remove_v19_transaction_actor_fields(unexpected)
     unexpected["version"] = "sts2-relational-curriculum-config-v14"
     _remove_v18_act_prefix_fields(unexpected)
     with pytest.raises(ValueError, match=r"unexpectedly contains V15"):
@@ -827,7 +834,6 @@ def test_v14_transaction_lifecycle_migration_is_model_init_only() -> None:
 
 def test_v15_guard_recovery_migration_is_model_init_only() -> None:
     source = TrainingConfig().to_mapping()
-    _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v15"
     _remove_v18_act_prefix_fields(source)
     _remove_v16_guard_field(source)
@@ -853,7 +859,6 @@ def test_v15_guard_recovery_migration_is_model_init_only() -> None:
     assert "lifecycle_entry_support_probability_floor" not in migrated_transaction
 
     unexpected = TrainingConfig().to_mapping()
-    _remove_v19_transaction_actor_fields(unexpected)
     unexpected["version"] = "sts2-relational-curriculum-config-v15"
     _remove_v18_act_prefix_fields(unexpected)
     with pytest.raises(ValueError, match=r"V16 evaluation guard"):
@@ -862,7 +867,6 @@ def test_v15_guard_recovery_migration_is_model_init_only() -> None:
 
 def test_v16_stability_migration_is_model_init_only() -> None:
     source = TrainingConfig().to_mapping()
-    _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v16"
     _remove_v18_act_prefix_fields(source)
 
@@ -880,7 +884,6 @@ def test_v16_stability_migration_is_model_init_only() -> None:
 
 def test_v17_act_prefix_and_hp_loss_migration_is_model_init_only() -> None:
     source = TrainingConfig().to_mapping()
-    _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v17"
     _remove_v18_act_prefix_fields(source)
     # A real v17 payload spelled out the retired imitation channels and
@@ -900,15 +903,13 @@ def test_v17_act_prefix_and_hp_loss_migration_is_model_init_only() -> None:
     _assert_retired_v20_fields_are_stripped(migrated.to_mapping())
 
     unexpected = TrainingConfig().to_mapping()
-    _remove_v19_transaction_actor_fields(unexpected)
     unexpected["version"] = "sts2-relational-curriculum-config-v17"
     with pytest.raises(ValueError, match=r"V18 episodic fields"):
         model_initialization_config_from_mapping(unexpected)
 
 
-def test_v18_option_actor_migration_is_model_init_only() -> None:
+def test_v18_option_horizon_migration_is_model_init_only() -> None:
     source = TrainingConfig().to_mapping()
-    _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v18"
 
     with pytest.raises(ValueError, match=r"unsupported training config version"):
@@ -916,24 +917,52 @@ def test_v18_option_actor_migration_is_model_init_only() -> None:
 
     migrated = model_initialization_config_from_mapping(source)
     assert migrated.version == CONFIG_VERSION
-    assert migrated.transaction_learning.lifecycle_advantage_policy_weight == 0.0
-    assert migrated.transaction_learning.lifecycle_advantage_start_update == 0
-    assert migrated.transaction_learning.lifecycle_advantage_temperature == pytest.approx(0.25)
-    assert migrated.transaction_learning.lifecycle_advantage_clip == pytest.approx(1.0)
-    assert migrated.transaction_learning.lifecycle_advantage_q_error_gate == pytest.approx(0.25)
-    assert migrated.transaction_learning.lifecycle_advantage_max_policy_lag == 128
-    assert (
-        migrated.transaction_learning.lifecycle_advantage_max_log_probability_shift
-        == pytest.approx(1.0)
-    )
     assert migrated.transaction_learning.lifecycle_smdp_horizon == (
         TrainingConfig().transaction_learning.lifecycle_smdp_horizon
     )
 
-    unexpected = TrainingConfig().to_mapping()
-    unexpected["version"] = "sts2-relational-curriculum-config-v18"
-    with pytest.raises(ValueError, match=r"V19 transaction actor fields"):
-        model_initialization_config_from_mapping(unexpected)
+
+def test_v20_macro_actor_retirement_is_stripped_and_refused() -> None:
+    # A real v19 payload spelled out the retired option-advantage actor
+    # bridge and the v47 macro value/AWR controls; the reviewed
+    # model-initialization migration strips them all.
+    source = TrainingConfig().to_mapping()
+    source["version"] = "sts2-relational-curriculum-config-v19"
+    _add_retired_v20_macro_actor_fields(source)
+
+    with pytest.raises(
+        ValueError,
+        match=r"unknown transaction_learning config keys|unsupported training config version",
+    ):
+        training_config_from_mapping(source)
+
+    migrated = model_initialization_config_from_mapping(source)
+    assert migrated.version == CONFIG_VERSION
+    migrated_transaction = migrated.to_mapping()["transaction_learning"]
+    assert isinstance(migrated_transaction, dict)
+    for field in _RETIRED_V20_TRANSACTION_ACTOR_FIELDS:
+        assert field not in migrated_transaction
+    assert migrated.transaction_learning.lifecycle_smdp_horizon == (
+        TrainingConfig().transaction_learning.lifecycle_smdp_horizon
+    )
+
+    # A v20 payload that still contains any retired key is corrupt and must
+    # fail closed on both parsing paths instead of being migrated.
+    for field, value in _RETIRED_V20_TRANSACTION_ACTOR_FIELDS.items():
+        stale = TrainingConfig().to_mapping()
+        stale_transaction = stale["transaction_learning"]
+        assert isinstance(stale_transaction, dict)
+        stale_transaction[field] = value
+        with pytest.raises(
+            ValueError,
+            match=r"unknown transaction_learning config keys",
+        ):
+            training_config_from_mapping(stale)
+        with pytest.raises(
+            ValueError,
+            match=r"unknown transaction_learning config keys",
+        ):
+            model_initialization_config_from_mapping(stale)
 
 
 def test_v19_exploration_retirement_migration_is_model_init_only() -> None:
@@ -1108,7 +1137,6 @@ def test_v20_imitation_and_liveness_actor_retirement_is_stripped_and_refused() -
     # A real v18 payload carried every retired imitation and liveness-actor
     # key; the reviewed model-initialization migration strips them all.
     source = TrainingConfig().to_mapping()
-    _remove_v19_transaction_actor_fields(source)
     source["version"] = "sts2-relational-curriculum-config-v18"
     _add_retired_v20_imitation_and_actor_fields(source)
 
