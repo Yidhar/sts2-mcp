@@ -1,0 +1,38 @@
+# First completion-exposure course for the Hybrid Candidate-Q architecture.
+#
+# The budget-40 identification run exhausted its revival allowance in 16/18
+# learner-ingested runs and produced no run victory.  Reward v7 keeps a
+# non-zero marginal revival cost through all 64 admitted revivals, so this
+# finite course exposes terminal success without restoring unlimited revival.
+
+[optimization]
+learning_rate = 0.0001
+
+[transaction_learning]
+enabled = false
+
+[failure_credit]
+mode = "disabled"
+
+[rollout]
+deterministic_probe_interval_episodes = 0
+deterministic_probe_environment_steps = []
+
+[episodic_learning]
+enabled = false
+
+[curriculum]
+revival_budget = 64
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 100000
+
+[runtime]
+rocm_sdpa_backend = "math"
+seed = 6600000
+log_dir = "runs/hybrid-candidate-q-v1-completion-preheat"
+checkpoint_dir = "checkpoints/hybrid-candidate-q-v1-completion-preheat"
+evaluation_steps = []
+early_evaluation_steps = []
+final_audit_steps = []
+evaluation_liveness_guard_enabled = false

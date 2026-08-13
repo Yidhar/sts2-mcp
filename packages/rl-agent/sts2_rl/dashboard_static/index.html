@@ -2203,6 +2203,8 @@
         const target = finite(progress.target_environment_steps);
         const trainingEpisodes = finite(progress.training_episodes);
         const targetTrainingEpisodes = finite(progress.target_training_episodes);
+        const collectorEpisodeCapacity = finite(progress.collector_episode_capacity);
+        const maximumPendingRuns = finite(progress.maximum_pending_runs);
         const episodeBased = !(target && target > 0) && targetTrainingEpisodes && targetTrainingEpisodes > 0;
         const progressCurrent = episodeBased ? trainingEpisodes : current;
         const progressTarget = episodeBased ? targetTrainingEpisodes : target;
@@ -2249,12 +2251,21 @@
         const trainingMeta = element("training-meta");
         trainingMeta.replaceChildren();
         for (const text of [
-          `训练 episode ${int(progress.training_episodes)}`,
+          `已接收完整 run ${int(progress.training_episodes)}`,
+          targetTrainingEpisodes && targetTrainingEpisodes > 0
+            ? `训练停止目标 ${int(targetTrainingEpisodes)} run`
+            : null,
+          collectorEpisodeCapacity && collectorEpisodeCapacity > 0
+            ? `collector 尝试上限 ${int(collectorEpisodeCapacity)} episode`
+            : null,
+          maximumPendingRuns && maximumPendingRuns > 0
+            ? `待入队容量 ${int(maximumPendingRuns)} run`
+            : null,
           `评估 episode ${int(progress.evaluation_episodes)}`,
           `raw 候选峰值 ${int(progress.maximum_observed_candidates)}`,
           `语义候选峰值 ${int(progress.maximum_observed_semantic_candidates)}`,
           `最大等价类 ${int(progress.maximum_equivalence_class_size)}`
-        ]) {
+        ].filter(Boolean)) {
           const badge = document.createElement("span");
           badge.className = "pill";
           badge.textContent = text;

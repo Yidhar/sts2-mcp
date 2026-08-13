@@ -755,6 +755,10 @@ def test_dashboard_copy_names_collection_progress_and_disclaims_run_completion()
     assert "整个运行尚未完成" in html
     assert "评估门禁提前停止" in html
     assert "采集目标未完成" in html
+    assert "已接收完整 run" in html
+    assert "训练停止目标" in html
+    assert "collector 尝试上限" in html
+    assert "待入队容量" in html
     assert "const latest = evaluations[evaluations.length - 1]" in html
     assert "Held-out 对局下钻" in html
     assert "拿牌记录" in html
@@ -780,6 +784,39 @@ def test_dashboard_copy_names_collection_progress_and_disclaims_run_completion()
     assert "不代表模型在多个策略中选择" in html
     assert '" · forced"' not in html
     assert "innerHTML" not in html
+
+
+def test_episode_collection_limits_are_exposed_separately(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    _, metrics = _create_run(root, RUN_A, unix_s=100.0)
+    start = _run_start(RUN_A, 100.0)
+    runtime = start["config"]["runtime"]
+    assert isinstance(runtime, dict)
+    runtime["total_environment_steps"] = 0
+    runtime["target_training_episodes"] = 400
+    runtime["collector_episode_capacity"] = 500
+    runtime["maximum_pending_runs"] = 2
+    metrics.write_text(
+        json.dumps(start, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    _append_jsonl(
+        metrics,
+        {
+            "event": "train_episode",
+            "unix_s": 101.0,
+            "environment_steps": 100,
+            "max_floor": 17,
+        },
+    )
+
+    progress = DashboardStore(root, now=lambda: 102.0).snapshot()["progress"]
+
+    assert progress["training_episodes"] == 1
+    assert progress["target_training_episodes"] == 400
+    assert progress["collector_episode_capacity"] == 500
+    assert progress["maximum_pending_runs"] == 2
+    assert progress["percent"] == pytest.approx(0.25)
 
 
 def test_exact_resume_parent_is_listed_as_continued(tmp_path: Path) -> None:

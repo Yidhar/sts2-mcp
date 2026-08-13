@@ -19,6 +19,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lineage", required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--target-runs", type=int, required=True)
+    parser.add_argument("--collector-episode-capacity", type=int, required=True)
+    parser.add_argument("--maximum-pending-runs", type=int, required=True)
     parser.add_argument("--revival-budget", type=int, required=True)
     parser.add_argument("--poll-seconds", type=float, default=1.0)
     return parser.parse_args()
@@ -111,6 +113,8 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                     "collector_device": "cpu",
                     "total_environment_steps": 0,
                     "target_training_episodes": args.target_runs,
+                    "collector_episode_capacity": args.collector_episode_capacity,
+                    "maximum_pending_runs": args.maximum_pending_runs,
                 },
                 "model": {"architecture": "hybrid-domain-candidate-q-v1"},
             },
@@ -176,7 +180,10 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "hybrid_macro_td_abs": item.get("macro_td_abs"),
                 "hybrid_combat_td_abs": item.get("combat_td_abs"),
                 "hybrid_shared_gradient_cosine": item.get("shared_gradient_cosine"),
-                "rollout_queue": {"size": pending, "capacity": 2},
+                "rollout_queue": {
+                    "size": pending,
+                    "capacity": args.maximum_pending_runs,
+                },
                 "actor_progress": {
                     "phase": "collecting",
                     "decision_domain": "joint",

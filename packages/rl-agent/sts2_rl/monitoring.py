@@ -1854,6 +1854,10 @@ class DashboardStore:
             )
             target = _integer(runtime.get("total_environment_steps"))
             target_training_episodes = _integer(runtime.get("target_training_episodes"))
+            collector_episode_capacity = _integer(
+                runtime.get("collector_episode_capacity")
+            )
+            maximum_pending_runs = _integer(runtime.get("maximum_pending_runs"))
             percent = (
                 environment_steps / target * 100.0
                 if target > 0
@@ -2079,6 +2083,8 @@ class DashboardStore:
                     "environment_steps": environment_steps,
                     "target_environment_steps": target,
                     "target_training_episodes": target_training_episodes,
+                    "collector_episode_capacity": collector_episode_capacity,
+                    "maximum_pending_runs": maximum_pending_runs,
                     "percent": percent,
                     "training_episodes": training_episodes,
                     "learner_updates": learner_updates,
