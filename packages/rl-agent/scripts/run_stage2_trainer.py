@@ -477,6 +477,29 @@ def main() -> int:
         pending_path_set: set[Path] = set()
         pending_summaries: list[dict[str, Any]] = []
         last_update_metrics: dict[str, Any] = learner.metrics.as_mapping()
+        # Native monitoring-panel stream, exactly like the legacy trainer
+        # lineages: runs/<lineage>/run-<uuid>/metrics.jsonl starting with a
+        # run_start whose run_id matches the run directory.
+        dashboard_path = status_path.parent / "metrics.jsonl"
+        dashboard_file = dashboard_path.open("a", encoding="utf-8")
+
+        def dashboard_write(payload: Mapping[str, Any]) -> None:
+            dashboard_file.write(json.dumps(dict(payload)) + "\n")
+            dashboard_file.flush()
+
+        dashboard_write(
+            {
+                "event": "run_start",
+                "run_id": args.pipeline_id,
+                "unix_s": time.time(),
+                "lineage": args.lineage_id,
+                "control_domain": args.control_domain,
+                "state": {
+                    "environment_steps": environment_steps,
+                    "episodes": ingested,
+                },
+            }
+        )
         with metrics_path.open("a", encoding="utf-8") as metrics_file:
             metrics_file.write(
                 json.dumps(
@@ -523,6 +546,36 @@ def main() -> int:
                 def publish_acknowledgement() -> None:
                     metrics_file.write(json.dumps(ingest_row) + "\n")
                     metrics_file.flush()
+                    for summary in pending_summaries:
+                        dashboard_write(
+                            {
+                                "event": "train_episode",
+                                "unix_s": summary.get("unix_s"),
+                                "environment_steps": summary.get("environment_steps"),
+                                "episode_id": summary.get("episode_id"),
+                                "reset_seed": summary.get("reset_seed"),
+                                "steps": summary.get("steps"),
+                                "run_won": summary.get("run_won"),
+                                "max_floor": summary.get("max_floor"),
+                                "max_act": summary.get("max_act"),
+                                "act1_cleared": summary.get("act1_cleared"),
+                                "revivals_used": summary.get("revivals_used"),
+                                "player_hp_lost": summary.get("player_hp_lost"),
+                                "reward_total": summary.get("reward_total"),
+                                "terminal_reason": summary.get("terminal_reason"),
+                            }
+                        )
+                    dashboard_write(
+                        {
+                            "event": "learner_update",
+                            "unix_s": time.time(),
+                            "environment_steps": environment_steps,
+                            "policy_version": learner.metrics.updates,
+                            "loss": last_update_metrics.get("loss"),
+                            "td_error_mean": last_update_metrics.get("td_error_mean"),
+                            "windows_trained": last_update_metrics.get("windows_trained"),
+                        }
+                    )
 
                 _save_then_acknowledge(
                     save_all,
@@ -621,6 +674,15 @@ def main() -> int:
             }
             metrics_file.write(json.dumps(complete) + "\n")
             metrics_file.flush()
+            dashboard_write(
+                {
+                    "event": "run_complete",
+                    "unix_s": time.time(),
+                    "environment_steps": environment_steps,
+                    "episodes": ingested,
+                }
+            )
+            dashboard_file.close()
         _atomic_json(status_path, {**complete, "state": "complete"})
         return 0
     except BaseException as exc:
