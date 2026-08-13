@@ -315,6 +315,11 @@ def _project_learner(event: JsonDict) -> tuple[JsonDict, JsonDict]:
         "transaction_lifecycle_cancelled": event.get("transaction_lifecycle_cancelled"),
         "transaction_lifecycle_unresolved": event.get("transaction_lifecycle_unresolved"),
         "transaction_lifecycle_deadlock": event.get("transaction_lifecycle_deadlock"),
+        "hybrid_macro_loss": event.get("hybrid_macro_loss"),
+        "hybrid_combat_loss": event.get("hybrid_combat_loss"),
+        "hybrid_macro_td_abs": event.get("hybrid_macro_td_abs"),
+        "hybrid_combat_td_abs": event.get("hybrid_combat_td_abs"),
+        "hybrid_shared_gradient_cosine": event.get("hybrid_shared_gradient_cosine"),
     }
     latest = {
         **point,
@@ -1848,7 +1853,14 @@ class DashboardStore:
                 default=0,
             )
             target = _integer(runtime.get("total_environment_steps"))
-            percent = environment_steps / target * 100.0 if target > 0 else None
+            target_training_episodes = _integer(runtime.get("target_training_episodes"))
+            percent = (
+                environment_steps / target * 100.0
+                if target > 0
+                else training_episodes / target_training_episodes * 100.0
+                if target_training_episodes > 0
+                else None
+            )
 
             all_environment_points: list[tuple[float, int]] = []
             for _, aggregate, boundary in segments:
@@ -2054,13 +2066,19 @@ class DashboardStore:
                 },
                 "lifecycle": {
                     "run_complete_persisted": "run_complete" in selected_parser.latest_by_event,
-                    "training_horizon_reached": target > 0 and environment_steps >= target,
+                    "training_horizon_reached": (
+                        target > 0 and environment_steps >= target
+                    ) or (
+                        target_training_episodes > 0
+                        and training_episodes >= target_training_episodes
+                    ),
                     "completion_status": (_string(completed.get("completion_status")) or None),
                     "pending_evaluation": pending_evaluation,
                 },
                 "progress": {
                     "environment_steps": environment_steps,
                     "target_environment_steps": target,
+                    "target_training_episodes": target_training_episodes,
                     "percent": percent,
                     "training_episodes": training_episodes,
                     "learner_updates": learner_updates,

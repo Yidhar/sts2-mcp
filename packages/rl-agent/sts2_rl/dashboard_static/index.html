@@ -2201,14 +2201,19 @@
         const lifecycle = snapshot.lifecycle || {};
         const current = finite(progress.environment_steps);
         const target = finite(progress.target_environment_steps);
+        const trainingEpisodes = finite(progress.training_episodes);
+        const targetTrainingEpisodes = finite(progress.target_training_episodes);
+        const episodeBased = !(target && target > 0) && targetTrainingEpisodes && targetTrainingEpisodes > 0;
+        const progressCurrent = episodeBased ? trainingEpisodes : current;
+        const progressTarget = episodeBased ? targetTrainingEpisodes : target;
         const suppliedPercent = finite(progress.percent);
         const resolvedPercent = suppliedPercent != null
           ? Math.max(0, Math.min(100, suppliedPercent))
-          : current != null && target && target > 0
-            ? Math.max(0, Math.min(100, current / target * 100))
+          : progressCurrent != null && progressTarget && progressTarget > 0
+            ? Math.max(0, Math.min(100, progressCurrent / progressTarget * 100))
             : 0;
         const horizonReached = lifecycle.training_horizon_reached === true ||
-          (current != null && target != null && target > 0 && current >= target);
+          (progressCurrent != null && progressTarget != null && progressTarget > 0 && progressCurrent >= progressTarget);
         const runComplete = lifecycle.run_complete_persisted === true ||
           statusState(snapshot.status || {}) === "complete";
         const completionStatus = first(lifecycle, ["completion_status"], null);
@@ -2220,7 +2225,10 @@
             : " · 采集目标已达；整个运行尚未完成"
           : "";
 
-        setText("progress-value", `${int(current)} / ${int(target)}`);
+        setText(
+          "progress-value",
+          `${int(progressCurrent)} / ${int(progressTarget)}${episodeBased ? " 完整 run" : " 环境步"}`
+        );
         setText(
           "progress-context",
           `${resolvedPercent.toFixed(1)}% · raw 候选峰值 ${int(progress.maximum_observed_candidates)}` +
@@ -3589,6 +3597,8 @@
         const latestActor = snapshot.latest_actor || null;
         renderKeyValues("latest-learner-kv", latestLearner, [
           "learner_updates", "policy_version", "loss", "online_objective_loss",
+          "hybrid_macro_loss", "hybrid_combat_loss", "hybrid_macro_td_abs",
+          "hybrid_combat_td_abs", "hybrid_shared_gradient_cosine",
           "transaction_objective_loss", "liveness_objective_loss", "episodic_objective_loss",
           "policy_loss", "value_loss",
           "transaction_smdp_q_loss", "transaction_smdp_q_labels",
@@ -3615,6 +3625,8 @@
         const learnerSeries = Array.isArray(snapshot.learner_series) ? snapshot.learner_series : [];
         const objectiveFields = [
           ["loss", "有符号复合目标", "--series-4"],
+          ["hybrid_macro_loss", "宏观 Candidate-Q", "--series-2"],
+          ["hybrid_combat_loss", "战斗 Candidate-Q", "--series-3"],
           ["online_objective_loss", "在线 V-trace", "--series-1"],
           ["transaction_objective_loss", "事务", "--series-2"],
           ["liveness_objective_loss", "Liveness", "--series-3"],
