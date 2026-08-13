@@ -542,6 +542,7 @@ def main() -> int:
             """
 
             assert resources is not None
+            assert learner is not None
             seeds = held_out_evaluation_seeds(config.runtime.seed, args.eval_episodes)
             online_forward = _forward_factory(
                 macro_online, resources.encoder, device, detach_hidden=True
