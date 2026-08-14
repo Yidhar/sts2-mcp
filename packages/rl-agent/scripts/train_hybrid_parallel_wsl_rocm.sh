@@ -20,10 +20,16 @@ COLLECTOR_START_EPISODE="${STS2_HYBRID_COLLECTOR_START_EPISODE:-0}"
 MAXIMUM_PENDING="${STS2_HYBRID_MAXIMUM_PENDING_RUNS:-2}"
 SEED_BASE="${STS2_HYBRID_SEED_BASE:-6600000}"
 COLLECTOR_DEVICE="${STS2_HYBRID_COLLECTOR_DEVICE:-cuda}"
+FINAL_EVALUATION_EPISODES="${STS2_HYBRID_FINAL_EVALUATION_EPISODES:-16}"
+EVALUATION_DEVICE="${STS2_HYBRID_EVALUATION_DEVICE:-cuda}"
 VENV_DIR="${VENV_DIR:-$ARTIFACT_ROOT/environments/wsl-rocm}"
 SIM_EXE="${STS2_HEADLESS_SIM_EXE:-$ARTIFACT_ROOT/dependencies/sts2-ai/STS2AI/ENV/Sim/HeadlessSim/bin/Release/net9.0/HeadlessSim.exe}"
 
 [[ "$COLLECTORS" -gt 0 ]] || { echo "[hybrid-par] collectors must be positive" >&2; exit 2; }
+[[ "$FINAL_EVALUATION_EPISODES" -ge 0 ]] || {
+  echo "[hybrid-par] final evaluation episodes must be non-negative" >&2
+  exit 2
+}
 [[ -f "$RESUME" ]] || { echo "[hybrid-par] resume checkpoint missing: $RESUME" >&2; exit 2; }
 [[ -f "$SIM_EXE" ]] || { echo "[hybrid-par] HeadlessSim missing: $SIM_EXE" >&2; exit 2; }
 
@@ -148,4 +154,28 @@ wait "$TRAINER_PID"
 status=$?
 set -e
 echo "[hybrid-par] trainer exited with $status; stopping collectors"
-exit "$status"
+for collector_pid in "${COLLECTOR_PIDS[@]}"; do
+  kill -TERM "$collector_pid" 2>/dev/null || true
+done
+for collector_pid in "${COLLECTOR_PIDS[@]}"; do
+  wait "$collector_pid" 2>/dev/null || true
+done
+COLLECTOR_PIDS=()
+PIDS=()
+[[ "$status" -eq 0 ]] || exit "$status"
+
+if [[ "$FINAL_EVALUATION_EPISODES" -gt 0 ]]; then
+  EVALUATION="$RUN_ROOT/evaluation"
+  FROZEN_POLICY="$EVALUATION/frozen-final-policy.pt"
+  mkdir -p "$EVALUATION"
+  cp -f "$PUBLICATION" "$FROZEN_POLICY"
+  echo "[hybrid-par] starting final held-out evaluation episodes=$FINAL_EVALUATION_EPISODES"
+  python scripts/run_hybrid_evaluation.py \
+    --config "$CONFIG" \
+    --champion "$CHAMPION" \
+    --model-path "$FROZEN_POLICY" \
+    --episodes "$FINAL_EVALUATION_EPISODES" \
+    --metrics-out "$METRICS/evaluation.jsonl" \
+    --device "$EVALUATION_DEVICE" \
+    --sim-exe "$SIM_EXE" >"$LOGS/evaluation.log" 2>&1
+fi

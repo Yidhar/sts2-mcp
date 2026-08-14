@@ -844,6 +844,30 @@ def test_hybrid_completion_preheat_is_not_reported_as_standard_game(
     }
 
 
+def test_embedded_hybrid_final_evaluation_is_reported_as_evaluating(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "artifacts"
+    _, metrics = _create_run(root, RUN_A, unix_s=100.0)
+    _append_jsonl(
+        metrics,
+        {
+            "event": "evaluation_started",
+            "unix_s": 110.0,
+            "evaluation_kind": "final_audit",
+            "evaluation_gate": 240,
+            "evaluation_attempt": 1,
+            "completed_episodes": 1,
+            "evaluation_episodes": 16,
+        },
+    )
+
+    snapshot = DashboardStore(root, stale_seconds=100.0, now=lambda: 111.0).snapshot()
+
+    assert snapshot["status"]["state"] == "evaluating"
+    assert snapshot["status"]["label"] == "最终审计中 · 门 240"
+
+
 def test_exact_resume_parent_is_listed_as_continued(tmp_path: Path) -> None:
     root = tmp_path / "artifacts"
     _, parent_metrics = _create_run(root, RUN_A, unix_s=100.0)

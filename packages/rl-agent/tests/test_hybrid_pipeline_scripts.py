@@ -268,6 +268,19 @@ def test_hybrid_evaluation_is_greedy_and_does_not_write_replay() -> None:
     assert "deterministic=True" in source
     assert "held_out_evaluation_seeds" in source
     assert "--spool" not in source
+    assert '"event": "hybrid_evaluation_started"' in source
+
+
+def test_parallel_launcher_runs_final_heldout_after_clean_training() -> None:
+    source = (SCRIPT_ROOT / "train_hybrid_parallel_wsl_rocm.sh").read_text(
+        encoding="utf-8"
+    )
+    trainer_exit = source.index('[[ "$status" -eq 0 ]] || exit "$status"')
+    evaluation = source.index("python scripts/run_hybrid_evaluation.py")
+    assert trainer_exit < evaluation
+    assert 'STS2_HYBRID_FINAL_EVALUATION_EPISODES:-16' in source
+    assert 'cp -f "$PUBLICATION" "$FROZEN_POLICY"' in source
+    assert '--metrics-out "$METRICS/evaluation.jsonl"' in source
 
 
 def test_hybrid_checkpoint_uses_streaming_serialization() -> None:
@@ -301,6 +314,8 @@ def test_dashboard_reads_hybrid_evaluation_summary() -> None:
     assert '"event": "evaluation"' in source
     assert '"hybrid_target_syncs": item.get("target_syncs")' in source
     assert '"hybrid_last_target_sync_update": item.get(' in source
+    assert 'row.get("event") == "hybrid_evaluation_started"' in source
+    assert 'state == "complete" and not evaluation_in_progress' in source
 
 
 def test_monitor_projects_hybrid_target_sync_clock() -> None:

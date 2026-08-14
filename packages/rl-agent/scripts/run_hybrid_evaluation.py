@@ -129,6 +129,19 @@ def main() -> int:
         output = Path(args.metrics_out)
         output.parent.mkdir(parents=True, exist_ok=True)
         with output.open("w", encoding="utf-8") as metrics:
+            metrics.write(
+                json.dumps(
+                    {
+                        "event": "hybrid_evaluation_started",
+                        "unix_s": time.time(),
+                        "policy_version": int(publication.get("policy_version", 0)),
+                        "episodes": len(seeds),
+                        "seeds": list(seeds),
+                    }
+                )
+                + "\n"
+            )
+            metrics.flush()
             for seed in seeds:
                 authority.begin_episode(f"hybrid-eval-{seed}")
                 episode = resources.collector.collect_episode(

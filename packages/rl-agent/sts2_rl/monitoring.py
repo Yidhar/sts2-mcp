@@ -1689,6 +1689,18 @@ class DashboardStore:
                 "telemetry_age_s": telemetry_age,
                 "evidence": ["circuit_breaker_open 事件已持久化"],
             }
+        embedded_evaluation = parser.latest_by_event.get("evaluation_started")
+        if embedded_evaluation is not None:
+            return _pending_evaluation_status(
+                {
+                    "kind": _string(
+                        embedded_evaluation.get("evaluation_kind"), "final_audit"
+                    ),
+                    "gate": embedded_evaluation.get("evaluation_gate"),
+                    "attempt": embedded_evaluation.get("evaluation_attempt", 1),
+                },
+                telemetry_age=telemetry_age,
+            )
         if telemetry_age > self.stale_seconds:
             return {
                 "state": "stale",

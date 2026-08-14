@@ -284,6 +284,55 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
         ),
         None,
     )
+    evaluation_started = next(
+        (
+            row
+            for row in reversed(evaluation_rows)
+            if row.get("event") == "hybrid_evaluation_started"
+        ),
+        None,
+    )
+    evaluation_episodes = [
+        row
+        for row in evaluation_rows
+        if row.get("event") == "hybrid_evaluation_episode"
+    ]
+    evaluation_in_progress = evaluation_summary is None and (
+        evaluation_started is not None or bool(evaluation_episodes)
+    )
+    if evaluation_in_progress:
+        policy_version = (
+            evaluation_started.get("policy_version")
+            if evaluation_started is not None
+            else evaluation_episodes[-1].get("policy_version")
+        )
+        expected_episodes = (
+            int(evaluation_started.get("episodes", 0) or 0)
+            if evaluation_started is not None
+            else 0
+        )
+        events.append(
+            {
+                "event": "evaluation_started",
+                "unix_s": (
+                    evaluation_episodes[-1].get("unix_s")
+                    if evaluation_episodes
+                    else evaluation_started.get("unix_s")
+                ),
+                "evaluation_gate": policy_version,
+                "evaluation_kind": "final_audit",
+                "evaluation_attempt": 1,
+                "environment_steps": environment_steps,
+                "policy_version": policy_version,
+                "evaluation_episodes": expected_episodes,
+                "completed_episodes": len(evaluation_episodes),
+                "evaluation_seeds": (
+                    evaluation_started.get("seeds", [])
+                    if evaluation_started is not None
+                    else []
+                ),
+            }
+        )
     if evaluation_summary is not None:
         evaluation_count = int(evaluation_summary.get("episodes", 0) or 0)
         evaluation_wins = int(evaluation_summary.get("wins", 0) or 0)
@@ -323,7 +372,7 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
             }
         )
     state = trainer_status.get("state")
-    if state == "complete":
+    if state == "complete" and not evaluation_in_progress:
         events.append(
             {
                 "event": "run_complete",
