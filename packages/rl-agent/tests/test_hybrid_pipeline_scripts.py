@@ -240,6 +240,19 @@ def test_hybrid_evaluation_is_greedy_and_does_not_write_replay() -> None:
     assert "--spool" not in source
 
 
+def test_hybrid_checkpoint_uses_streaming_serialization() -> None:
+    source = (SCRIPT_ROOT / "run_hybrid_trainer.py").read_text(encoding="utf-8")
+    assert "_use_new_zipfile_serialization=False" in source
+
+
+def test_windows_supervisor_marks_native_wsl_exit() -> None:
+    source = (SCRIPT_ROOT / "run_hybrid_parallel_windows.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert 'state = "interrupted"' in source
+    assert 'error = "native_wsl_exit:$exitCode"' in source
+
+
 def test_dashboard_replaces_abandoned_tail_after_in_place_resume() -> None:
     bridge = _script("run_hybrid_dashboard_bridge.py")
     rows = [

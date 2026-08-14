@@ -295,6 +295,11 @@ def main() -> int:
                     "rng": _rng_state(),
                 },
                 temporary,
+                # The replay is mostly immutable Python facts rather than
+                # tensor storage.  Zip serialization first builds a very
+                # large in-memory pickle; the legacy writer streams that
+                # pickle and cuts checkpoint-save RSS substantially.
+                _use_new_zipfile_serialization=False,
             )
             temporary.replace(checkpoint)
             publish()
