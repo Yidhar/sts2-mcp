@@ -172,6 +172,7 @@ def test_parallel_launcher_defaults_to_two_collectors_and_one_update() -> None:
     assert '--start-episode-index "$COLLECTOR_START_EPISODE"' in script
     assert 'COLLECTOR_PIDS+=("$!")' in script
     assert "exited while learner was running" in script
+    assert 'rm -f "$PUBLICATION"' in script
 
 
 def test_parallel_dashboard_surfaces_collector_failure(tmp_path: Path) -> None:
@@ -239,6 +240,16 @@ def test_trainer_publication_uses_unique_atomic_replacement() -> None:
     source = (SCRIPT_ROOT / "run_hybrid_trainer.py").read_text(encoding="utf-8")
     assert "uuid.uuid4().hex" in source
     assert "os.replace(publication_temporary, publication)" in source
+
+
+def test_exact_resume_republishes_without_rewriting_the_replay_checkpoint() -> None:
+    source = (SCRIPT_ROOT / "run_hybrid_trainer.py").read_text(encoding="utf-8")
+    startup = source.index("        if args.resume:\n            # The checkpoint")
+    loop = source.index("        spool = Path(args.spool)", startup)
+    block = source[startup:loop]
+    assert "publish()" in block
+    assert "if schedule_migration is not None:\n                save()" in block
+    assert "else:\n            save()" in block
 
 
 def test_trainer_discards_uncheckpointed_metric_tail_before_resume() -> None:

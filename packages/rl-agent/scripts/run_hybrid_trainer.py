@@ -304,7 +304,17 @@ def main() -> int:
             temporary.replace(checkpoint)
             publish()
 
-        save()
+        if args.resume:
+            # The checkpoint is already the durable authority.  Re-publish its
+            # restored online weights so collectors cannot start from a newer,
+            # uncheckpointed publication left by the interrupted process.
+            # Rewriting the multi-gigabyte replay checkpoint here adds no state
+            # unless this launch intentionally migrated the target schedule.
+            publish()
+            if schedule_migration is not None:
+                save()
+        else:
+            save()
         spool = Path(args.spool)
         spool.mkdir(parents=True, exist_ok=True)
         metrics_path = Path(args.metrics_out)

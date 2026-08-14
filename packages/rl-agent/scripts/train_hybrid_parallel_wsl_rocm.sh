@@ -45,6 +45,10 @@ mkdir -p "$SPOOL" "$METRICS" "$STATUS" "$LOGS" "$(dirname "$PUBLICATION")" "$(di
   echo "[hybrid-par] continuation spool must start empty" >&2
   exit 2
 }
+# A publication is a derived collector cache, not the resume authority.  Drop
+# any file left by the interrupted process so the existence wait below can
+# only be satisfied by weights freshly restored from this checkpoint.
+rm -f "$PUBLICATION"
 
 cd "$PACKAGE_ROOT"
 PRODUCER_ARGS=()
