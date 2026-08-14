@@ -272,6 +272,7 @@ def test_hybrid_evaluation_is_greedy_and_does_not_write_replay() -> None:
     assert "journal_episode_id_prefix=episode_namespace" in source
     assert '"act3_reached": bool(episode.metrics.max_act >= 3)' in source
     assert "summarize_evaluation" in source
+    assert '"simulator": simulator_provenance' in source
     assert "--spool" not in source
     assert '"event": "hybrid_evaluation_started"' in source
 

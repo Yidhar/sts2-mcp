@@ -20,10 +20,12 @@ from typing import Any
 
 import torch
 
+from sts2_env.headless_sim_bridge_client import resolve_headless_sim_exe
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots
 from sts2_rl.joint import HybridCollectionAuthority
 from sts2_rl.macro import load_trunk_state
 from sts2_rl.models import HybridCandidateQConfig, HybridDomainCandidateQModel
+from sts2_rl.simulator_identity import verify_headless_simulator
 from sts2_rl.training import (
     build_training_resources,
     load_training_config,
@@ -33,6 +35,21 @@ from sts2_rl.training.seeding import held_out_evaluation_seeds
 from sts2_rl.training.trajectory import TrajectoryJournal
 
 HYBRID_PUBLICATION = "sts2-hybrid-publication-v1"
+
+
+def _simulator_provenance(config: Any) -> dict[str, Any]:
+    """Return the established journal provenance for the active backend."""
+
+    backend = str(config.environment.backend)
+    if backend != "headless":
+        return {"backend": backend}
+    simulator = verify_headless_simulator(
+        resolve_headless_sim_exe(config.environment.sim_exe_path)
+    )
+    return {
+        "backend": "headless",
+        "simulator_identity": simulator.to_mapping(),
+    }
 
 
 def _summary(
@@ -87,6 +104,7 @@ def main() -> int:
                 config.environment, backend="headless", sim_exe_path=args.sim_exe
             ),
         )
+    simulator_provenance = _simulator_provenance(config)
     resources = build_training_resources(config)
     try:
         champion_state = torch.load(
@@ -174,6 +192,7 @@ def main() -> int:
                     "evaluation_seeds": list(seeds),
                     "epsilon": 0.0,
                     "deterministic": True,
+                    "simulator": simulator_provenance,
                 }
             )
             metrics.write(
