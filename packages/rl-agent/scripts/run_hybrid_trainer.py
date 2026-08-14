@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gc
 import json
 import os
 import pickle
@@ -194,7 +195,13 @@ def main() -> int:
             else Path(args.champion) / "network.pt"
         )
         if args.resume:
-            payload = torch.load(args.resume, map_location=device, weights_only=False)
+            # Replay is authoritative CPU-side factual state. Loading the
+            # multi-gigabyte continuation directly onto the accelerator keeps
+            # duplicate model/optimizer tensors (and any tensor-backed replay
+            # fields) resident beside the live learner until the payload dies.
+            # Restore from CPU; module/optimizer loaders move only their owned
+            # state to the parameter device.
+            payload = torch.load(args.resume, map_location="cpu", weights_only=False)
             if payload.get("format") != HYBRID_TRAINING_STATE:
                 raise ValueError("resume is not a hybrid training state")
             if payload.get("lineage_id") != args.lineage_id:
@@ -234,6 +241,10 @@ def main() -> int:
                 for domain in ("macro", "combat")
             }
             _restore_rng(payload["rng"])
+            del payload
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
         else:
             if args.migrate_target_schedule:
                 raise ValueError("target schedule migration requires --resume")

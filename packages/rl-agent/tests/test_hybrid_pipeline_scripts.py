@@ -245,6 +245,8 @@ def test_trainer_publication_uses_unique_atomic_replacement() -> None:
 
 def test_exact_resume_republishes_without_rewriting_the_replay_checkpoint() -> None:
     source = (SCRIPT_ROOT / "run_hybrid_trainer.py").read_text(encoding="utf-8")
+    assert 'torch.load(args.resume, map_location="cpu", weights_only=False)' in source
+    assert "del payload\n            gc.collect()" in source
     startup = source.index("        if args.resume:\n            # The checkpoint")
     loop = source.index("        spool = Path(args.spool)", startup)
     block = source[startup:loop]
