@@ -3,7 +3,9 @@
 
 This process has no spool and no learner.  It uses the fixed odd held-out seed
 prefix, forces both domain exploration schedules to zero through evaluation
-ownership, and only writes report telemetry.
+ownership, and writes the same bounded readable trajectory journal used by the
+established held-out evaluator.  ``record=False`` prevents replay/training
+output; the explicitly supplied :class:`TrajectoryJournal` is diagnostic only.
 """
 
 from __future__ import annotations
@@ -22,18 +24,33 @@ from sts2_rl.encoding.snapshot import collate_encoded_snapshots
 from sts2_rl.joint import HybridCollectionAuthority
 from sts2_rl.macro import load_trunk_state
 from sts2_rl.models import HybridCandidateQConfig, HybridDomainCandidateQModel
-from sts2_rl.training import build_training_resources, load_training_config
+from sts2_rl.training import (
+    build_training_resources,
+    load_training_config,
+    summarize_evaluation,
+)
 from sts2_rl.training.seeding import held_out_evaluation_seeds
+from sts2_rl.training.trajectory import TrajectoryJournal
 
 HYBRID_PUBLICATION = "sts2-hybrid-publication-v1"
 
 
-def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _summary(
+    rows: list[dict[str, Any]],
+    *,
+    episode_metrics: list[Any],
+    objective: str,
+) -> dict[str, Any]:
     floors = sorted(int(row["max_floor"]) for row in rows)
+    standard = dict(summarize_evaluation(episode_metrics, objective=objective))
     return {
+        **standard,
+        # Keep the compact aliases consumed by archived hybrid dashboard
+        # bridges while making the standard evaluation contract authoritative.
         "episodes": len(rows),
         "wins": sum(bool(row["run_won"]) for row in rows),
         "act1_clears": sum(bool(row["act1_cleared"]) for row in rows),
+        "act3_reaches": sum(bool(row["act3_reached"]) for row in rows),
         "floor_p50": floors[len(floors) // 2] if floors else 0,
         "floor_mean": sum(floors) / len(floors) if floors else 0.0,
         "mean_revivals": (
@@ -51,6 +68,11 @@ def main() -> int:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--episodes", type=int, default=16)
     parser.add_argument("--metrics-out", required=True)
+    parser.add_argument(
+        "--journal-directory",
+        required=True,
+        help="canonical dashboard run directory for evaluation-step-*.jsonl",
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument("--sim-exe", default=None)
     args = parser.parse_args()
@@ -126,54 +148,135 @@ def main() -> int:
         resources.collector.macro_authority = authority
         seeds = held_out_evaluation_seeds(config.runtime.seed, args.episodes)
         rows: list[dict[str, Any]] = []
+        collected_metrics: list[Any] = []
         output = Path(args.metrics_out)
         output.parent.mkdir(parents=True, exist_ok=True)
-        with output.open("w", encoding="utf-8") as metrics:
+        policy_version = int(publication.get("policy_version", 0))
+        journal_directory = Path(args.journal_directory)
+        journal_directory.mkdir(parents=True, exist_ok=True)
+        journal_path = journal_directory / f"evaluation-step-{policy_version:09d}.jsonl"
+        # This command represents one complete final evaluation attempt.  A
+        # rerun replaces its own partial journal rather than concatenating two
+        # attempts under one immutable filename.
+        journal_path.unlink(missing_ok=True)
+        with (
+            output.open("w", encoding="utf-8") as metrics,
+            TrajectoryJournal(journal_path) as journal,
+        ):
+            journal.write_episode_boundary(
+                {
+                    "event": "evaluation_started",
+                    "evaluation_gate": policy_version,
+                    "evaluation_attempt": 1,
+                    "gate_kind": "validation",
+                    "data_partition": "validation",
+                    "policy_version": policy_version,
+                    "evaluation_seeds": list(seeds),
+                    "epsilon": 0.0,
+                    "deterministic": True,
+                }
+            )
             metrics.write(
                 json.dumps(
                     {
                         "event": "hybrid_evaluation_started",
                         "unix_s": time.time(),
-                        "policy_version": int(publication.get("policy_version", 0)),
+                        "policy_version": policy_version,
                         "episodes": len(seeds),
                         "seeds": list(seeds),
+                        "journal_name": journal_path.name,
                     }
                 )
                 + "\n"
             )
             metrics.flush()
             for seed in seeds:
-                authority.begin_episode(f"hybrid-eval-{seed}")
-                episode = resources.collector.collect_episode(
-                    epsilon=0.0,
-                    deterministic=True,
-                    record=False,
-                    evaluation_seed=seed,
+                episode_namespace = f"heldout-seed-{seed}-attempt-1:"
+                journal.write_episode_boundary(
+                    {
+                        "event": "evaluation_attempt_started",
+                        "evaluation_seed": seed,
+                        "attempt": 1,
+                        "journal_episode_namespace": episode_namespace,
+                        "data_partition": "validation",
+                    }
                 )
+                authority.begin_episode(f"hybrid-eval-{seed}")
+                try:
+                    episode = resources.collector.collect_episode(
+                        epsilon=0.0,
+                        deterministic=True,
+                        record=False,
+                        evaluation_seed=seed,
+                        policy_version=policy_version,
+                        trajectory_journal=journal,
+                        journal_episode_id_prefix=episode_namespace,
+                    )
+                except BaseException as exc:
+                    journal.write_episode_boundary(
+                        {
+                            "event": "evaluation_attempt_aborted",
+                            "evaluation_seed": seed,
+                            "attempt": 1,
+                            "exception_type": (
+                                f"{type(exc).__module__}.{type(exc).__qualname__}"
+                            ),
+                            "message": str(exc)[:1024],
+                            "retryable": getattr(exc, "recoverable", False) is True,
+                        }
+                    )
+                    raise
                 authority.finish_run(
                     f"hybrid-eval-{seed}", environment_steps=episode.metrics.steps
+                )
+                episode_id = f"{episode_namespace}{episode.metrics.episode_id}"
+                journal.write_episode_boundary(
+                    {
+                        "event": "evaluation_attempt_completed",
+                        "evaluation_seed": seed,
+                        "attempt": 1,
+                        "episode_id": episode_id,
+                        "steps": episode.metrics.steps,
+                    }
                 )
                 row = {
                     "event": "hybrid_evaluation_episode",
                     "unix_s": time.time(),
                     "evaluation_seed": seed,
-                    "policy_version": int(publication.get("policy_version", 0)),
+                    "policy_version": policy_version,
+                    "episode_id": episode_id,
                     "run_won": bool(episode.metrics.run_won),
                     "act1_cleared": bool(episode.metrics.act1_cleared),
+                    "act3_reached": bool(episode.metrics.max_act >= 3),
+                    "max_act": int(episode.metrics.max_act),
                     "max_floor": int(episode.metrics.max_floor),
                     "steps": int(episode.metrics.steps),
                     "revivals_used": int(episode.metrics.revivals_used),
+                    "player_hp_lost": float(episode.metrics.player_hp_lost),
+                    "deadlocked": bool(episode.metrics.deadlocked),
+                    "combat_progress_stalled": bool(
+                        episode.metrics.combat_progress_stalled
+                    ),
+                    "noncombat_progress_stalled": bool(
+                        episode.metrics.noncombat_progress_stalled
+                    ),
                     "terminal_reason": episode.metrics.terminal_reason,
                 }
                 rows.append(row)
+                collected_metrics.append(episode.metrics)
                 metrics.write(json.dumps(row) + "\n")
                 metrics.flush()
             summary = {
                 "event": "hybrid_evaluation_summary",
                 "unix_s": time.time(),
-                "policy_version": int(publication.get("policy_version", 0)),
+                "policy_version": policy_version,
                 "seeds": list(seeds),
-                **_summary(rows),
+                "journal_name": journal_path.name,
+                **_summary(
+                    rows,
+                    episode_metrics=collected_metrics,
+                    objective=resources.collector.objective,
+                ),
             }
             metrics.write(json.dumps(summary) + "\n")
         print(json.dumps(summary, indent=2))

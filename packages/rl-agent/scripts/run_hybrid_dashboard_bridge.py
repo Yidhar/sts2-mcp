@@ -335,13 +335,36 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
         )
     if evaluation_summary is not None:
         evaluation_count = int(evaluation_summary.get("episodes", 0) or 0)
-        evaluation_wins = int(evaluation_summary.get("wins", 0) or 0)
-        evaluation_act1 = int(evaluation_summary.get("act1_clears", 0) or 0)
-        events.append(
+        evaluation_wins = int(
+            evaluation_summary.get(
+                "successful_run_count", evaluation_summary.get("wins", 0)
+            )
+            or 0
+        )
+        evaluation_act1 = int(
+            evaluation_summary.get(
+                "act1_clear_count", evaluation_summary.get("act1_clears", 0)
+            )
+            or 0
+        )
+        evaluation_act3 = int(
+            evaluation_summary.get(
+                "act3_reach_count", evaluation_summary.get("act3_reaches", 0)
+            )
+            or 0
+        )
+        evaluation_event = {
+            key: value
+            for key, value in evaluation_summary.items()
+            if key not in {"event", "seeds"}
+        }
+        evaluation_event.update(
             {
                 "event": "evaluation",
                 "unix_s": evaluation_summary.get("unix_s"),
                 "evaluation_gate": evaluation_summary.get("policy_version"),
+                "gate_kind": "validation",
+                "data_partition": "validation",
                 "environment_steps": environment_steps,
                 "policy_version": evaluation_summary.get("policy_version"),
                 "episodes": evaluation_count,
@@ -349,20 +372,31 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "run_win_rate": (
                     evaluation_wins / evaluation_count if evaluation_count else 0.0
                 ),
-                "act1_reach_count": evaluation_act1,
+                "act1_clear_count": evaluation_act1,
                 "act1_clear_rate": (
                     evaluation_act1 / evaluation_count if evaluation_count else 0.0
                 ),
-                "mean_max_floor": evaluation_summary.get("floor_mean"),
-                "maximum_floor": max(
-                    (
-                        int(row.get("max_floor", 0) or 0)
-                        for row in evaluation_rows
-                        if row.get("event") == "hybrid_evaluation_episode"
-                    ),
-                    default=0,
+                "act3_reach_count": evaluation_act3,
+                "act3_reach_rate": (
+                    evaluation_act3 / evaluation_count if evaluation_count else 0.0
                 ),
-                "mean_revivals_used": evaluation_summary.get("mean_revivals"),
+                "mean_max_floor": evaluation_summary.get(
+                    "mean_max_floor", evaluation_summary.get("floor_mean")
+                ),
+                "maximum_floor": evaluation_summary.get(
+                    "maximum_floor",
+                    max(
+                        (
+                            int(row.get("max_floor", 0) or 0)
+                            for row in evaluation_rows
+                            if row.get("event") == "hybrid_evaluation_episode"
+                        ),
+                        default=0,
+                    ),
+                ),
+                "mean_revivals_used": evaluation_summary.get(
+                    "mean_revivals_used", evaluation_summary.get("mean_revivals")
+                ),
                 "evaluation_context": {
                     "policy_version": evaluation_summary.get("policy_version"),
                     "data_partition": "validation",
@@ -371,6 +405,7 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 },
             }
         )
+        events.append(evaluation_event)
     state = trainer_status.get("state")
     if state == "complete" and not evaluation_in_progress:
         events.append(

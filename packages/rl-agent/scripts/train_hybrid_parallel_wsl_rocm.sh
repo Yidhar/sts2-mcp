@@ -8,6 +8,8 @@ set -euo pipefail
 PACKAGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 ARTIFACT_ROOT="${STS2_ARTIFACT_ROOT:?set STS2_ARTIFACT_ROOT}"
 RUN_ROOT="${STS2_HYBRID_RUN_ROOT:?set STS2_HYBRID_RUN_ROOT}"
+RUN_RELATIVE="${RUN_ROOT#"$ARTIFACT_ROOT/hybrid_runs/"}"
+DASHBOARD_RUN_ROOT="${STS2_HYBRID_DASHBOARD_RUN_ROOT:-$ARTIFACT_ROOT/runs/$RUN_RELATIVE}"
 CONFIG="${STS2_HYBRID_CONFIG:?set STS2_HYBRID_CONFIG}"
 CHAMPION="${STS2_HYBRID_CHAMPION:?set STS2_HYBRID_CHAMPION}"
 RESUME="${STS2_HYBRID_RESUME:?set STS2_HYBRID_RESUME}"
@@ -46,7 +48,7 @@ CHECKPOINT="$RUN_ROOT/checkpoint/hybrid-training.pt"
 METRICS="$RUN_ROOT/metrics"
 STATUS="$RUN_ROOT/status"
 LOGS="$RUN_ROOT/logs"
-mkdir -p "$SPOOL" "$METRICS" "$STATUS" "$LOGS" "$(dirname "$PUBLICATION")" "$(dirname "$CHECKPOINT")"
+mkdir -p "$SPOOL" "$METRICS" "$STATUS" "$LOGS" "$DASHBOARD_RUN_ROOT" "$(dirname "$PUBLICATION")" "$(dirname "$CHECKPOINT")"
 [[ -z "$(find "$SPOOL" -maxdepth 1 -name '*.pkl' -print -quit)" ]] || {
   echo "[hybrid-par] continuation spool must start empty" >&2
   exit 2
@@ -176,6 +178,7 @@ if [[ "$FINAL_EVALUATION_EPISODES" -gt 0 ]]; then
     --model-path "$FROZEN_POLICY" \
     --episodes "$FINAL_EVALUATION_EPISODES" \
     --metrics-out "$METRICS/evaluation.jsonl" \
+    --journal-directory "$DASHBOARD_RUN_ROOT" \
     --device "$EVALUATION_DEVICE" \
     --sim-exe "$SIM_EXE" >"$LOGS/evaluation.log" 2>&1
 fi

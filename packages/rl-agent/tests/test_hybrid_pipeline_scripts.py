@@ -267,6 +267,11 @@ def test_hybrid_evaluation_is_greedy_and_does_not_write_replay() -> None:
     assert "evaluation_ownership=True" in source
     assert "deterministic=True" in source
     assert "held_out_evaluation_seeds" in source
+    assert "TrajectoryJournal" in source
+    assert "trajectory_journal=journal" in source
+    assert "journal_episode_id_prefix=episode_namespace" in source
+    assert '"act3_reached": bool(episode.metrics.max_act >= 3)' in source
+    assert "summarize_evaluation" in source
     assert "--spool" not in source
     assert '"event": "hybrid_evaluation_started"' in source
 
@@ -281,6 +286,70 @@ def test_parallel_launcher_runs_final_heldout_after_clean_training() -> None:
     assert 'STS2_HYBRID_FINAL_EVALUATION_EPISODES:-16' in source
     assert 'cp -f "$PUBLICATION" "$FROZEN_POLICY"' in source
     assert '--metrics-out "$METRICS/evaluation.jsonl"' in source
+    assert '--journal-directory "$DASHBOARD_RUN_ROOT"' in source
+
+
+def test_parallel_dashboard_preserves_standard_hybrid_evaluation_fields(
+    tmp_path: Path,
+) -> None:
+    bridge = _script("run_hybrid_dashboard_bridge.py")
+    run_root = tmp_path / "evaluated"
+    (run_root / "launcher").mkdir(parents=True)
+    (run_root / "status").mkdir()
+    (run_root / "launcher" / "launch.json").write_text("{}", encoding="utf-8")
+    (run_root / "status" / "trainer.json").write_text(
+        json.dumps({"state": "complete"}), encoding="utf-8"
+    )
+    _append(
+        run_root / "metrics" / "trainer.jsonl",
+        {
+            "event": "hybrid_update",
+            "ingested_runs": 200,
+            "environment_steps": 139_035,
+            "learner": {"updates": 240},
+            "replay": {},
+        },
+    )
+    _append(
+        run_root / "metrics" / "evaluation.jsonl",
+        {
+            "event": "hybrid_evaluation_summary",
+            "unix_s": 20.0,
+            "policy_version": 240,
+            "episodes": 16,
+            "successful_run_count": 5,
+            "run_win_rate": 5 / 16,
+            "act1_clear_count": 14,
+            "act1_clear_rate": 14 / 16,
+            "act3_reach_count": 11,
+            "act3_reach_rate": 11 / 16,
+            "mean_max_floor": 39.4375,
+            "maximum_floor": 46,
+            "mean_revivals_used": 51.3125,
+            "mean_player_hp_lost": 900.0,
+            "deadlock_rate": 0.0,
+        },
+    )
+    args = SimpleNamespace(
+        run_root=str(run_root),
+        lineage="hybrid-parallel",
+        run_id="run-eval",
+        target_runs=200,
+        collector_episode_capacity=200,
+        collector_count=2,
+        collector_device="cuda",
+        maximum_pending_runs=2,
+        revival_budget=64,
+        curriculum_mode="hybrid-completion-preheat",
+    )
+    evaluation = next(
+        row for row in bridge._projection(args) if row["event"] == "evaluation"
+    )
+    assert evaluation["act1_clear_count"] == 14
+    assert evaluation["act3_reach_count"] == 11
+    assert evaluation["act3_reach_rate"] == 11 / 16
+    assert evaluation["successful_run_count"] == 5
+    assert evaluation["mean_player_hp_lost"] == 900.0
 
 
 def test_hybrid_checkpoint_uses_streaming_serialization() -> None:
