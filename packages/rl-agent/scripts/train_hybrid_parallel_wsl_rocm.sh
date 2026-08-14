@@ -98,7 +98,8 @@ python scripts/run_hybrid_trainer.py \
 TRAINER_PID=$!
 PIDS+=("$TRAINER_PID")
 
-for _ in $(seq 1 120); do
+PUBLICATION_WAIT_SECONDS="${STS2_HYBRID_PUBLICATION_WAIT_SECONDS:-600}"
+for _ in $(seq 1 "$PUBLICATION_WAIT_SECONDS"); do
   [[ -f "$PUBLICATION" ]] && break
   kill -0 "$TRAINER_PID" 2>/dev/null || {
     cat "$LOGS/trainer.log" >&2

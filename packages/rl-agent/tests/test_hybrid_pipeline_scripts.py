@@ -173,6 +173,7 @@ def test_parallel_launcher_defaults_to_two_collectors_and_one_update() -> None:
     assert 'COLLECTOR_PIDS+=("$!")' in script
     assert "exited while learner was running" in script
     assert 'rm -f "$PUBLICATION"' in script
+    assert 'PUBLICATION_WAIT_SECONDS="${STS2_HYBRID_PUBLICATION_WAIT_SECONDS:-600}"' in script
 
 
 def test_parallel_dashboard_surfaces_collector_failure(tmp_path: Path) -> None:
