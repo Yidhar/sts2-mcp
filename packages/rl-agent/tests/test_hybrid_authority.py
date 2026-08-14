@@ -59,6 +59,34 @@ def test_hybrid_authority_records_only_factual_terminal_runs() -> None:
     assert run.environment_steps == 17
 
 
+def test_infrastructure_discard_cannot_leak_a_partial_run() -> None:
+    authority = _authority()
+    authority.begin_episode("interrupted")
+    authority.choose(
+        observation=_rest_observation(),
+        semantic_actions=_REST_ACTIONS,
+        snapshot=_snapshot(candidate_count=2),
+        valid=np.ones(2, dtype=np.bool_),
+    )
+    authority.observe_step(reward=0.25, floor=7, terminal=False)
+    authority.discard_run()
+
+    authority.begin_episode("replacement-session")
+    authority.choose(
+        observation=_rest_observation(),
+        semantic_actions=_REST_ACTIONS,
+        snapshot=_snapshot(candidate_count=2),
+        valid=np.ones(2, dtype=np.bool_),
+    )
+    authority.observe_step(reward=1.0, floor=8, terminal=True)
+    run = authority.finish_run(environment_steps=9)
+
+    assert run is not None
+    assert run.run_id == "replacement-session"
+    assert len(run.steps) == 1
+    assert run.steps[0].reward == 1.0
+
+
 def test_domain_clocks_roundtrip_and_evaluation_forces_zero_epsilon() -> None:
     authority = _authority()
     authority.load_exploration_state_dict(

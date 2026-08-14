@@ -228,6 +228,15 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
         self._hybrid_steps = []
         return run
 
+    def discard_run(self) -> None:
+        """Discard an infrastructure-interrupted run without inventing a terminal."""
+
+        self._episode_replay_invalid = True
+        self.finish_run()
+        self._terminal_observed = False
+        self._open_encounter_id = None
+        self._was_in_combat = False
+
     def set_epsilon(self, domain: Literal["macro", "combat"], value: float) -> None:
         """Set the active domain's exploration just before a decision.
 

@@ -63,6 +63,11 @@
       "path": "third_party/patches/sts2-ai/0002-selectable-card-upgrade-preview.patch",
       "sha256": "16bae925f44e804acc2b15d8f67c867a3857625abc0ff3a0383118d689765bf2",
       "purpose": "Emit an exact instance-preserving upgrade_preview for every upgradable selectable card, with observable native diagnostics; the trainer lifts it into reviewed grounded encoding v15."
+    },
+    {
+      "path": "third_party/patches/sts2-ai/0012-complete-game-action-after-queue-pop.patch",
+      "sha256": "41c5334cf19299a9690bd6c9a95b4a1d910685a50b6b042644935cde4f13488f",
+      "purpose": "Publish GameAction completion only after AfterFinished has removed the action from its queue, preventing combat-settlement continuations from cancelling a still-queued hook action."
     }
   ],
   "migration_notes": [
@@ -70,5 +75,5 @@
     "252bf989feb598c61c20267d3979b00bf316edb5 is a reachable ancestor of origin/main and exactly matches the preimage blobs for the canonical HeadlessSim patch stack.",
     "Obsolete STS2AI/ENV/Sim/Overlay mirror hunks were intentionally removed: that tree was deleted upstream before this base and is not the canonical project."
   ],
-  "patched_tree": "c2998ca7b6fba66f0d2116f1a331d255419f48d2"
+  "patched_tree": "41ac9a426b350fda7b3704eb17ba1b8be5d4af02"
 }

@@ -16,14 +16,18 @@ from typing import Any
 
 import torch
 
+from sts2_env.headless_sim_bridge_client import HeadlessSimError
+from sts2_rl.backends.headless import HeadlessRecoverableProtocolError
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots
 from sts2_rl.joint import DomainExplorationSchedule, HybridCollectionAuthority
 from sts2_rl.macro import load_trunk_state
 from sts2_rl.models import HybridCandidateQConfig, HybridDomainCandidateQModel
-from sts2_rl.training import build_training_resources, load_training_config
+from sts2_rl.training import build_backend, build_training_resources, load_training_config
 
 HYBRID_SPOOL_ENVELOPE = "sts2-hybrid-spool-envelope-v1"
 HYBRID_PUBLICATION = "sts2-hybrid-publication-v1"
+_RECOVERABLE_BACKEND_ERRORS = (HeadlessRecoverableProtocolError, HeadlessSimError)
+_MAX_BACKEND_RESTARTS = 20
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -91,7 +95,12 @@ def main() -> int:
     resources = None
     try:
         config = load_training_config(profile="preheat", config_path=Path(args.config))
-        config = replace(config, runtime=replace(config.runtime, seed=args.seed))
+        # A process continuation starts after its previous local episode
+        # ordinal.  Advance both the environment seed stream and the actor RNG
+        # with that ordinal instead of replaying the first seeds after every
+        # detached restart.
+        collector_seed = args.seed + args.start_episode_index
+        config = replace(config, runtime=replace(config.runtime, seed=collector_seed))
         if args.device:
             config = replace(config, runtime=replace(config.runtime, device=args.device))
         if args.sim_exe:
@@ -101,7 +110,6 @@ def main() -> int:
                     config.environment, backend="headless", sim_exe_path=args.sim_exe
                 ),
             )
-        resources = build_training_resources(config)
         if config.transaction_learning.enabled:
             raise RuntimeError(
                 "hybrid collection requires transaction_learning.enabled=false; "
@@ -109,7 +117,7 @@ def main() -> int:
             )
         champion_state = torch.load(
             Path(args.champion) / "network.pt",
-            map_location=resources.device,
+            map_location="cpu",
             weights_only=True,
         )
         legacy_head_groups = (
@@ -125,12 +133,17 @@ def main() -> int:
             "candidate_effect_head",
             "selection_delta_head",
         )
-        for legacy_model in (resources.model, resources.collector_model):
-            load_trunk_state(
-                legacy_model,
-                dict(champion_state),
-                tolerated_groups=legacy_head_groups,
-            )
+        def build_resources() -> Any:
+            built = build_training_resources(config)
+            for legacy_model in (built.model, built.collector_model):
+                load_trunk_state(
+                    legacy_model,
+                    dict(champion_state),
+                    tolerated_groups=legacy_head_groups,
+                )
+            return built
+
+        resources = build_resources()
         model = HybridDomainCandidateQModel(
             HybridCandidateQConfig(config.model.to_model_config())
         ).to(resources.device)
@@ -202,7 +215,7 @@ def main() -> int:
             forward_q=forward,
             initial_state=lambda: model.initial_state(1, device=resources.device),
             epsilon=0.0,
-            seed=args.seed,
+            seed=collector_seed,
             macro_exploration=macro_schedule,
             combat_exploration=combat_schedule,
         )
@@ -213,6 +226,7 @@ def main() -> int:
         metrics_path.parent.mkdir(parents=True, exist_ok=True)
         nonce = uuid.uuid4().hex[:12]
         produced = 0
+        backend_restarts = 0
         with metrics_path.open("a", encoding="utf-8") as metrics:
             for local_episode_index in range(args.episodes):
                 episode_index = args.start_episode_index + local_episode_index
@@ -220,14 +234,48 @@ def main() -> int:
                     time.sleep(0.25)
                 if episode_index % max(args.reload_episodes, 1) == 0:
                     reload()
-                authority.load_exploration_state_dict(publication_state)
-                authority.begin_episode(
-                    f"{args.producer_id}:{nonce}:{episode_index}"
-                )
                 episode_started = time.monotonic()
-                episode = resources.collector.collect_episode(
-                    epsilon=0.0, deterministic=False, record=False
-                )
+                while True:
+                    authority.load_exploration_state_dict(publication_state)
+                    authority.begin_episode(
+                        f"{args.producer_id}:{nonce}:{episode_index}"
+                    )
+                    try:
+                        episode = resources.collector.collect_episode(
+                            epsilon=0.0, deterministic=False, record=False
+                        )
+                        break
+                    except _RECOVERABLE_BACKEND_ERRORS as error:
+                        backend_restarts += 1
+                        if backend_restarts > _MAX_BACKEND_RESTARTS:
+                            raise
+                        authority.discard_run()
+                        metrics.write(
+                            json.dumps(
+                                {
+                                    "event": "hybrid_collector_backend_restart",
+                                    "unix_s": time.time(),
+                                    **base,
+                                    "attempt": backend_restarts,
+                                    "episode_index": episode_index,
+                                    "error": f"{type(error).__name__}: {error}"[:400],
+                                }
+                            )
+                            + "\n"
+                        )
+                        metrics.flush()
+                        # Keep the collector's next seed and action RNG.  Only
+                        # the poisoned simulator process/session is replaced;
+                        # rebuilding all training resources would rewind both.
+                        replacement = build_backend(config)
+                        old_backend = resources.backend
+                        try:
+                            old_backend.close()
+                            resources.backend = replacement
+                            resources.collector.replace_backend(replacement)
+                        except BaseException:
+                            replacement.close()
+                            raise
                 if not authority.terminal_observed:
                     terminal_reason = str(episode.metrics.terminal_reason or "")
                     factual_terminal = bool(

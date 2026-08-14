@@ -1,0 +1,18 @@
+diff --git a/src/Core/GameActions/GameAction.cs b/src/Core/GameActions/GameAction.cs
+index 72a4167..7fcabfa 100644
+--- a/src/Core/GameActions/GameAction.cs
++++ b/src/Core/GameActions/GameAction.cs
+@@ -90,8 +90,12 @@ public abstract class GameAction
+ 				_logger.VeryDebug($"Action {this} finished execution");
+ 				State = GameActionState.Finished;
+ 				this.JustBeforeFinished?.Invoke(this);
+-				_completionSource.SetResult();
++				// Remove the action from its queue before publishing CompletionTask.
++				// A synchronous completion continuation may end combat and cancel
++				// queued combat actions; publishing first can therefore remove this
++				// action before its own AfterFinished/PopAction callback runs.
+ 				this.AfterFinished?.Invoke(this);
++				_completionSource.SetResult();
+ 			}
+ 			else
+ 			{

@@ -19,7 +19,7 @@ from sts2_rl.training.config import TrainingConfig
 
 EXPECTED_STS2_AI_COMMIT = "252bf989feb598c61c20267d3979b00bf316edb5"
 EXPECTED_STS2_AI_TREE = "9b3674ad857a20ce201a3b78a277621007d3ddda"
-EXPECTED_STS2_AI_PATCHED_TREE = "c2998ca7b6fba66f0d2116f1a331d255419f48d2"
+EXPECTED_STS2_AI_PATCHED_TREE = "41ac9a426b350fda7b3704eb17ba1b8be5d4af02"
 CANONICAL_HEADLESS_PROJECT = "STS2AI/ENV/Sim/HeadlessSim/HeadlessSim.csproj"
 EXPECTED_PATCH_CHAIN = [
     "third_party/patches/sts2-ai/0001-native-revival-curriculum.patch",
@@ -34,6 +34,7 @@ EXPECTED_PATCH_CHAIN = [
     "third_party/patches/sts2-ai/0010-headless-event-and-post-combat-lifecycle.patch",
     "third_party/patches/sts2-ai/0011-single-use-headless-card-removal.patch",
     "third_party/patches/sts2-ai/0002-selectable-card-upgrade-preview.patch",
+    "third_party/patches/sts2-ai/0012-complete-game-action-after-queue-pop.patch",
 ]
 
 

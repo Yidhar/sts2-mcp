@@ -5,7 +5,6 @@ import json
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
-
 SCRIPT_ROOT = Path(__file__).resolve().parents[1] / "scripts"
 
 
@@ -217,6 +216,23 @@ def test_collector_reload_keeps_loaded_policy_during_publication_swap() -> None:
     assert "except FileNotFoundError:" in source
     assert "if initial or model_mtime == 0:" in source
     assert "return False" in source
+
+
+def test_hybrid_collector_restarts_only_the_poisoned_backend_session() -> None:
+    source = (SCRIPT_ROOT / "run_hybrid_collector.py").read_text(encoding="utf-8")
+    assert "except _RECOVERABLE_BACKEND_ERRORS as error:" in source
+    assert "authority.discard_run()" in source
+    assert '"event": "hybrid_collector_backend_restart"' in source
+    assert "replacement = build_backend(config)" in source
+    assert "resources.collector.replace_backend(replacement)" in source
+    assert "while True:" in source
+
+
+def test_hybrid_collector_continuation_advances_its_seed_stream() -> None:
+    source = (SCRIPT_ROOT / "run_hybrid_collector.py").read_text(encoding="utf-8")
+    assert "collector_seed = args.seed + args.start_episode_index" in source
+    assert "replace(config.runtime, seed=collector_seed)" in source
+    assert "seed=collector_seed" in source
 
 
 def test_trainer_publication_uses_unique_atomic_replacement() -> None:
