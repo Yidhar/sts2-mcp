@@ -255,6 +255,9 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "steps": row.get("steps"),
                 "terminal_reason": row.get("terminal_reason"),
                 "run_won": row.get("run_won"),
+                "hybrid_control_forward_retries": row.get(
+                    "control_forward_retries", 0
+                ),
             }
         )
     pending = len(tuple((run_root / "spool").glob("*.pkl")))

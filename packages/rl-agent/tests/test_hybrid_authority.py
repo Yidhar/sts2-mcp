@@ -153,6 +153,41 @@ def test_hybrid_authority_reports_nonfinite_control_scores_at_the_source() -> No
         )
 
 
+def test_hybrid_authority_retries_transient_forward_without_poisoning_recurrence() -> None:
+    initial = torch.tensor([[3.0]])
+    calls: list[torch.Tensor] = []
+
+    def transient_forward(snapshot: Any, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        calls.append(hidden.clone())
+        if len(calls) == 1:
+            return (
+                torch.full((len(snapshot.action_mask),), float("nan")),
+                torch.full_like(hidden, float("nan")),
+            )
+        return torch.tensor([0.0, 2.0])[: len(snapshot.action_mask)], hidden + 1.0
+
+    authority = HybridCollectionAuthority(
+        forward_q=transient_forward,
+        initial_state=lambda: initial.clone(),
+        epsilon=0.0,
+        evaluation_ownership=True,
+    )
+    authority.begin_episode("transient-forward")
+    selected = authority.choose(
+        observation=_rest_observation(),
+        semantic_actions=_REST_ACTIONS,
+        snapshot=_snapshot(candidate_count=2),
+        valid=np.ones(2, dtype=np.bool_),
+    )
+
+    assert selected == 1
+    assert len(calls) == 2
+    torch.testing.assert_close(calls[0], initial)
+    torch.testing.assert_close(calls[1], initial)
+    torch.testing.assert_close(authority._hidden, initial + 1.0)
+    assert authority.metrics()["forward_retries"] == 1
+
+
 def test_semantic_targets_map_back_to_one_native_entry() -> None:
     deck = [
         {

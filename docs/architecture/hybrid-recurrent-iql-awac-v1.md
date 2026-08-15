@@ -41,6 +41,15 @@ once**, before backward or optimizer mutation. A second failure remains fatal
 and reports the exact domain, surface, branch and first non-finite quantity.
 The retry count is telemetry, not another policy or reward mechanism.
 
+The same ROCm symptom was subsequently observed once in a collector: a
+finite policy-24 publication produced four non-finite logits for one forward.
+Collection now applies the same bounded rule at the semantic authority.  The
+pre-decision recurrent state is retained, the identical factual snapshot is
+recomputed once, and the new recurrent state is committed only when both it
+and the policy scores are finite.  A repeated failure remains fatal.  This
+also prevents a transient forward from poisoning every later decision through
+the persistent run memory.
+
 ## 2. Permanent control equations
 
 For one factual transition and its actual semantic successor:

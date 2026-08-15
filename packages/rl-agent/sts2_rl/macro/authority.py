@@ -184,6 +184,7 @@ class MacroCollectionAuthority:
         self.overrides = 0
         self.mechanical_dispatches = 0
         self.declined = 0
+        self.forward_retries = 0
         self._auto_counter = 0
 
     # ------------------------------------------------------------------ episode
@@ -206,6 +207,7 @@ class MacroCollectionAuthority:
         self.overrides = 0
         self.mechanical_dispatches = 0
         self.declined = 0
+        self.forward_retries = 0
 
     def _ensure_episode(self) -> None:
         if self._episode_id is None:
@@ -608,9 +610,49 @@ class MacroCollectionAuthority:
             for index, action in enumerate(semantic_actions)
         )
 
+    @classmethod
+    def _state_is_finite(cls, state: Any) -> bool:
+        if torch.is_tensor(state):
+            return not (state.is_floating_point() or state.is_complex()) or bool(
+                torch.isfinite(state).all().item()
+            )
+        if isinstance(state, Mapping):
+            return all(cls._state_is_finite(value) for value in state.values())
+        if isinstance(state, tuple | list):
+            return all(cls._state_is_finite(value) for value in state)
+        return True
+
+    @classmethod
+    def _forward_is_finite(cls, values: Tensor, hidden: Any) -> bool:
+        return bool(torch.isfinite(values).all().item()) and cls._state_is_finite(hidden)
+
     def _q_values(self, snapshot: EncodedDecisionSnapshot) -> Tensor:
+        # A ROCm math-SDPA forward has twice produced a one-off non-finite
+        # result from finite weights and finite factual inputs.  Keep the
+        # recurrent update transactional: retry the exact same snapshot and
+        # pre-decision state once, and commit the new state only after both
+        # scores and recurrence are finite.  A deterministic fault remains
+        # fatal on the second pass.
+        hidden_before = self._hidden
         with torch.no_grad():
-            values, self._hidden = self.forward_q(snapshot, self._hidden)
+            values, hidden_after = self.forward_q(snapshot, hidden_before)
+        if not self._forward_is_finite(values, hidden_after):
+            self.forward_retries += 1
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            with torch.no_grad():
+                values, hidden_after = self.forward_q(snapshot, hidden_before)
+        if not self._forward_is_finite(values, hidden_after):
+            finite = int(torch.count_nonzero(torch.isfinite(values)).item())
+            if finite != values.numel():
+                raise FloatingPointError(
+                    "semantic controller published non-finite control scores: "
+                    f"finite={finite}/{values.numel()}"
+                )
+            raise FloatingPointError(
+                "semantic controller published a non-finite recurrent state"
+            )
+        self._hidden = hidden_after
         return values
 
     @staticmethod
@@ -741,6 +783,7 @@ class MacroCollectionAuthority:
             "pending_bridge": self.has_pending_bridge,
             "epsilon": self.epsilon,
             "control_domain": self.control_domain,
+            "forward_retries": self.forward_retries,
         }
 
 

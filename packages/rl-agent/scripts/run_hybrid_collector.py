@@ -351,6 +351,7 @@ def main() -> int:
                     episode_index=episode_index,
                     collected_at=collected_at,
                 )
+                summary["control_forward_retries"] = authority.forward_retries
                 if run is not None:
                     envelope = {
                         "format": HYBRID_SPOOL_ENVELOPE,
