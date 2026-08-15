@@ -353,6 +353,59 @@ def test_parallel_dashboard_preserves_standard_hybrid_evaluation_fields(
     assert evaluation["mean_player_hp_lost"] == 900.0
 
 
+def test_dashboard_waits_for_current_policy_evaluation_not_old_summary(
+    tmp_path: Path,
+) -> None:
+    bridge = _script("run_hybrid_dashboard_bridge.py")
+    run_root = tmp_path / "evaluation-race"
+    (run_root / "launcher").mkdir(parents=True)
+    (run_root / "status").mkdir()
+    (run_root / "launcher" / "launch.json").write_text("{}", encoding="utf-8")
+    (run_root / "status" / "trainer.json").write_text(
+        json.dumps({"state": "complete"}), encoding="utf-8"
+    )
+    _append(
+        run_root / "metrics" / "trainer.jsonl",
+        {
+            "event": "hybrid_update",
+            "ingested_runs": 400,
+            "environment_steps": 277_507,
+            "learner": {"updates": 440},
+            "replay": {},
+        },
+    )
+    _append(
+        run_root / "metrics" / "evaluation.jsonl",
+        {
+            "event": "hybrid_evaluation_summary",
+            "policy_version": 240,
+            "episodes": 16,
+            "run_win_rate": 5 / 16,
+        },
+    )
+    args = SimpleNamespace(
+        run_root=str(run_root),
+        lineage="hybrid-parallel",
+        run_id="run-evaluation-race",
+        target_runs=400,
+        collector_episode_capacity=220,
+        collector_count=2,
+        collector_device="cuda",
+        maximum_pending_runs=2,
+        revival_budget=64,
+        final_evaluation_episodes=16,
+        curriculum_mode="hybrid-completion-preheat",
+    )
+
+    events = bridge._projection(args)
+
+    assert not any(row["event"] == "run_complete" for row in events)
+    progress = next(row for row in events if row["event"] == "evaluation_started")
+    assert progress["policy_version"] == 440
+    assert progress["completed_episodes"] == 0
+    assert progress["evaluation_episodes"] == 16
+
+
 def test_hybrid_checkpoint_uses_streaming_serialization() -> None:
     source = (SCRIPT_ROOT / "run_hybrid_trainer.py").read_text(encoding="utf-8")
     assert "_use_new_zipfile_serialization=False" in source

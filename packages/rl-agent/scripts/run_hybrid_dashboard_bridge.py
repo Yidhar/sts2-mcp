@@ -24,6 +24,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--collector-device", default="cpu")
     parser.add_argument("--maximum-pending-runs", type=int, required=True)
     parser.add_argument("--revival-budget", type=int, required=True)
+    parser.add_argument("--final-evaluation-episodes", type=int, default=16)
     parser.add_argument("--curriculum-mode", default="hybrid-candidate-q")
     parser.add_argument("--poll-seconds", type=float, default=1.0)
     return parser.parse_args()
@@ -276,10 +277,16 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 },
             }
         )
+    current_policy_version = learner_updates
+    current_evaluation_rows = [
+        row
+        for row in evaluation_rows
+        if row.get("policy_version") == current_policy_version
+    ]
     evaluation_summary = next(
         (
             row
-            for row in reversed(evaluation_rows)
+            for row in reversed(current_evaluation_rows)
             if row.get("event") == "hybrid_evaluation_summary"
         ),
         None,
@@ -287,29 +294,44 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
     evaluation_started = next(
         (
             row
-            for row in reversed(evaluation_rows)
+            for row in reversed(current_evaluation_rows)
             if row.get("event") == "hybrid_evaluation_started"
         ),
         None,
     )
     evaluation_episodes = [
         row
-        for row in evaluation_rows
+        for row in current_evaluation_rows
         if row.get("event") == "hybrid_evaluation_episode"
     ]
+    state = trainer_status.get("state")
+    expected_final_evaluation_episodes = int(
+        getattr(args, "final_evaluation_episodes", 16)
+    )
+    evaluation_pending = (
+        state == "complete"
+        and expected_final_evaluation_episodes > 0
+        and evaluation_summary is None
+    )
     evaluation_in_progress = evaluation_summary is None and (
-        evaluation_started is not None or bool(evaluation_episodes)
+        evaluation_pending
+        or evaluation_started is not None
+        or bool(evaluation_episodes)
     )
     if evaluation_in_progress:
         policy_version = (
             evaluation_started.get("policy_version")
             if evaluation_started is not None
-            else evaluation_episodes[-1].get("policy_version")
+            else (
+                evaluation_episodes[-1].get("policy_version")
+                if evaluation_episodes
+                else current_policy_version
+            )
         )
         expected_episodes = (
             int(evaluation_started.get("episodes", 0) or 0)
             if evaluation_started is not None
-            else 0
+            else expected_final_evaluation_episodes
         )
         events.append(
             {
@@ -317,7 +339,11 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "unix_s": (
                     evaluation_episodes[-1].get("unix_s")
                     if evaluation_episodes
-                    else evaluation_started.get("unix_s")
+                    else (
+                        evaluation_started.get("unix_s")
+                        if evaluation_started is not None
+                        else trainer_status.get("unix_s", time.time())
+                    )
                 ),
                 "evaluation_gate": policy_version,
                 "evaluation_kind": "final_audit",
@@ -406,7 +432,6 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
             }
         )
         events.append(evaluation_event)
-    state = trainer_status.get("state")
     if state == "complete" and not evaluation_in_progress:
         events.append(
             {
