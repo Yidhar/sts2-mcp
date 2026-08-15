@@ -1,8 +1,13 @@
 """Minimal data and objective contracts for the recurrent V-trace baseline."""
 
 from .objective import (
+    ABSOLUTE_DEATH_PRICE_REWARD_SPEC,
+    ABSOLUTE_DEATH_PRICE_TASK_REWARD_SPEC,
     REVIVAL_EFFICIENCY_REWARD_SPEC,
     TASK_REWARD_SPEC,
+    AbsoluteDeathPriceRewardCalculator,
+    AbsoluteDeathPriceRewardSpec,
+    AbsoluteDeathPriceTaskRewardSpec,
     RevivalEfficiencyRewardCalculator,
     RevivalEfficiencyRewardSpec,
     TaskObjective,
@@ -10,6 +15,7 @@ from .objective import (
     TaskReward,
     TaskRewardCalculator,
     TaskRewardSpec,
+    absolute_death_price_reward_identity,
     revival_efficiency_reward_identity,
     task_reward_identity,
 )
@@ -24,11 +30,16 @@ from .rollout import (
 )
 
 __all__ = [
+    "ABSOLUTE_DEATH_PRICE_REWARD_SPEC",
+    "ABSOLUTE_DEATH_PRICE_TASK_REWARD_SPEC",
     "REVIVAL_EFFICIENCY_REWARD_SPEC",
     "ROLLOUT_QUEUE_VERSION",
     "ROLLOUT_STEP_VERSION",
     "SEQUENCE_UNROLL_VERSION",
     "TASK_REWARD_SPEC",
+    "AbsoluteDeathPriceRewardCalculator",
+    "AbsoluteDeathPriceRewardSpec",
+    "AbsoluteDeathPriceTaskRewardSpec",
     "BoundedRolloutQueue",
     "RevivalEfficiencyRewardCalculator",
     "RevivalEfficiencyRewardSpec",
@@ -40,6 +51,7 @@ __all__ = [
     "TaskReward",
     "TaskRewardCalculator",
     "TaskRewardSpec",
+    "absolute_death_price_reward_identity",
     "revival_efficiency_reward_identity",
     "task_reward_identity",
 ]

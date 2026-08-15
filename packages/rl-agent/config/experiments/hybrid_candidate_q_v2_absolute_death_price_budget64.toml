@@ -1,0 +1,41 @@
+# Hybrid Candidate-Q reward-v8 course, budget 64.
+#
+# The stable transition reward contains outcome/progress, bounded exact HP
+# loss, and pace only.  Exact revival deltas are priced by the learner's
+# source-versioned monotone controller.  This is a model-init course boundary:
+# network tensors may be inherited, while optimizer, replay and schedules are
+# fresh.  Coefficients deliberately remain in source, not in this config.
+
+[optimization]
+learning_rate = 0.0001
+
+[transaction_learning]
+enabled = false
+
+[failure_credit]
+mode = "disabled"
+
+[rollout]
+deterministic_probe_interval_episodes = 0
+deterministic_probe_environment_steps = []
+
+[episodic_learning]
+enabled = false
+
+[curriculum]
+revival_budget = 64
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 100000
+
+[runtime]
+rocm_sdpa_backend = "math"
+# Preserve the fixed training/held-out namespaces used by the preceding
+# hybrid course so paired evaluation remains directly comparable.
+seed = 6600000
+log_dir = "runs/hybrid-candidate-q-v2-absolute-death-price-budget64"
+checkpoint_dir = "checkpoints/hybrid-candidate-q-v2-absolute-death-price-budget64"
+evaluation_steps = []
+early_evaluation_steps = []
+final_audit_steps = []
+evaluation_liveness_guard_enabled = false

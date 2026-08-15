@@ -5,6 +5,16 @@ from .authority import (
     DomainExplorationSchedule,
     HybridCollectionAuthority,
 )
+from .death_price import (
+    DEATH_PRICE_CONTROLLER_VERSION,
+    DEATH_PRICE_COURSE_VERSION,
+    AbsoluteDeathPriceController,
+    DeathPriceCourse,
+    DeathPriceEpisodeOutcome,
+    DeathPriceMetrics,
+    death_price_course,
+    validate_discounted_outcome_margin,
+)
 from .learner import (
     HYBRID_Q_LEARNER_VERSION,
     HybridQConfig,
@@ -25,10 +35,16 @@ from .transitions import (
 )
 
 __all__ = [
+    "DEATH_PRICE_CONTROLLER_VERSION",
+    "DEATH_PRICE_COURSE_VERSION",
     "HYBRID_AUTHORITY_VERSION",
     "HYBRID_Q_LEARNER_VERSION",
     "HYBRID_REPLAY_VERSION",
     "HYBRID_TRANSITION_VERSION",
+    "AbsoluteDeathPriceController",
+    "DeathPriceCourse",
+    "DeathPriceEpisodeOutcome",
+    "DeathPriceMetrics",
     "DomainExplorationSchedule",
     "DomainView",
     "HybridCollectionAuthority",
@@ -39,5 +55,7 @@ __all__ = [
     "HybridRunReplay",
     "HybridStep",
     "HybridViewPair",
+    "death_price_course",
     "next_domain_index",
+    "validate_discounted_outcome_margin",
 ]

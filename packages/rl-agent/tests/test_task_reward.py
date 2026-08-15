@@ -3,8 +3,10 @@ from __future__ import annotations
 import pytest
 
 from sts2_baseline import (
+    AbsoluteDeathPriceRewardCalculator,
     RevivalEfficiencyRewardCalculator,
     TaskRewardCalculator,
+    absolute_death_price_reward_identity,
     revival_efficiency_reward_identity,
     task_reward_identity,
 )
@@ -208,17 +210,14 @@ def test_run_objective_fails_closed_without_typed_run_result() -> None:
             _result(step=1, terminated=True, combat_result="victory"),
         )
 
+
 def test_preheat_reward_uses_exact_hp_loss_and_revival_counters() -> None:
     identity = revival_efficiency_reward_identity()
     assert identity["version"] == "sts2-run-survival-efficiency-v7"
     assert identity["spec"]["revival_reference_budget"] == 64
-    assert identity["revival_cost_schedule"] == (
-        "cap*min(revivals_used/revival_budget,1)"
-    )
+    assert identity["revival_cost_schedule"] == ("cap*min(revivals_used/revival_budget,1)")
     assert (
-        identity["spec"]["hp_loss_weight"]
-        + identity["spec"]["revival_cost_cap"]
-        + identity["spec"]["pace_budget"]
+        identity["spec"]["hp_loss_weight"] + identity["spec"]["revival_cost_cap"] + identity["spec"]["pace_budget"]
     ) == pytest.approx(0.99)
     calculator = RevivalEfficiencyRewardCalculator(
         maximum_episode_steps=512,
@@ -243,6 +242,65 @@ def test_preheat_reward_uses_exact_hp_loss_and_revival_counters() -> None:
     assert costly.reward < ordinary.reward
     assert costly.revivals_used_delta == 1
     assert costly.player_hp_lost_delta == 60
+
+
+def test_reward_v8_exports_revival_fact_without_pricing_it_twice() -> None:
+    identity = absolute_death_price_reward_identity()
+    assert identity["version"] == "sts2-run-survival-efficiency-v8"
+    assert identity["base"]["version"] == "sts2-task-reward-v5"
+    assert identity["revival_pricing"] == ("learner_absolute_lambda_times_transition_delta")
+    assert "fingerprint" not in identity
+    assert "fingerprint_sha256" not in identity
+
+    calculator = AbsoluteDeathPriceRewardCalculator(
+        objective="run",
+        maximum_episode_steps=512,
+    )
+    without_revival = calculator.evaluate(
+        _result(step=0, revival_budget=64),
+        _result(step=1, revival_budget=64),
+    )
+    with_revival = calculator.evaluate(
+        _result(step=0, revival_budget=64),
+        _result(
+            step=1,
+            revival_budget=64,
+            revivals_used=1,
+            revivals_used_delta=1,
+        ),
+    )
+    assert with_revival.revivals_used_delta == 1
+    assert with_revival.revival_penalty == 0.0
+    assert with_revival.reward == pytest.approx(without_revival.reward)
+
+
+def test_reward_v8_uses_the_larger_terminal_outcome_margin() -> None:
+    calculator = AbsoluteDeathPriceRewardCalculator(
+        objective="run",
+        maximum_episode_steps=512,
+    )
+    victory = calculator.evaluate(
+        _result(step=0, revival_budget=64),
+        _result(
+            step=1,
+            floor=46,
+            revival_budget=64,
+            terminated=True,
+            run_result="victory",
+        ),
+    )
+    defeat = calculator.evaluate(
+        _result(step=0, revival_budget=64),
+        _result(
+            step=1,
+            revival_budget=64,
+            terminated=True,
+            run_result="defeat",
+        ),
+    )
+    assert victory.terminal_reward == 2.0
+    assert defeat.terminal_reward == -2.0
+    assert victory.discount == defeat.discount == 0.0
 
 
 def test_healing_does_not_erase_exact_hp_loss_cost() -> None:
@@ -284,10 +342,7 @@ def test_full_run_preheat_combines_forward_progress_with_run_scoped_costs() -> N
     assert reward.revival_penalty < 0.0
     assert reward.pace_penalty < 0.0
     assert reward.reward == pytest.approx(
-        reward.progress_reward
-        + reward.hp_loss_penalty
-        + reward.revival_penalty
-        + reward.pace_penalty
+        reward.progress_reward + reward.hp_loss_penalty + reward.revival_penalty + reward.pace_penalty
     )
 
 
@@ -373,9 +428,7 @@ def test_relic_consumption_fact_uses_native_used_state_not_hp_heuristics() -> No
             "relics": [{"id": "RELIC.LIZARD_TAIL", "is_used_up": True}],
         }
     }
-    assert derive_transition_facts(before, after).relics_used == (
-        "RELIC.LIZARD_TAIL",
-    )
+    assert derive_transition_facts(before, after).relics_used == ("RELIC.LIZARD_TAIL",)
     after["player"]["relics"] = []  # type: ignore[index]
     assert derive_transition_facts(before, after).relics_used == ()
 
@@ -399,6 +452,7 @@ def test_terminated_transition_without_canonical_reason_is_rejected() -> None:
             terminated=True,
             terminal_reason=None,
         )
+
 
 def test_explicit_combat_victory_reason_precedes_missing_terminal_player_hp() -> None:
     facts = derive_transition_facts(
@@ -507,8 +561,7 @@ def test_outcome_first_ordering_survives_the_durable_floor_clock() -> None:
     secondary_bundle_bound = 0.99
 
     assert discounted_gap > secondary_bundle_bound, (
-        f"floor-clock ordering violated: {discounted_gap:.4f} <= "
-        f"{secondary_bundle_bound}"
+        f"floor-clock ordering violated: {discounted_gap:.4f} <= " f"{secondary_bundle_bound}"
     )
     # And with margin: the gap must not sit within 10% of the bound, so
     # future cost additions cannot silently invert outcome ordering.

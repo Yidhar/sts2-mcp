@@ -42,6 +42,30 @@ TASK_REWARD_SPEC: Final = TaskRewardSpec()
 
 
 @dataclass(frozen=True, slots=True)
+class AbsoluteDeathPriceTaskRewardSpec:
+    """Outcome scale for the absolute-death-price hybrid course.
+
+    This is intentionally a separate reward identity rather than a mutation of
+    the archived v4/v7 lineages.  The larger terminal margin is verified in
+    durable-floor discounted Q space against every course's maximum secondary
+    cost span.
+    """
+
+    version: str = field(default="sts2-task-reward-v5", init=False)
+    discount: float = field(default=0.997, init=False)
+    success_reward: float = field(default=2.0, init=False)
+    failure_reward: float = field(default=-2.0, init=False)
+    deadlock_reward: float = field(default=-2.0, init=False)
+    horizon_reward: float = field(default=-2.0, init=False)
+    run_progress_reward_weight: float = field(default=0.50, init=False)
+    act1_success_act: int = field(default=2, init=False)
+    fallback_run_floor_cap: float = field(default=60.0, init=False)
+
+
+ABSOLUTE_DEATH_PRICE_TASK_REWARD_SPEC: Final = AbsoluteDeathPriceTaskRewardSpec()
+
+
+@dataclass(frozen=True, slots=True)
 class RevivalEfficiencyRewardSpec:
     """Bounded, undiscounted training-revival preference.
 
@@ -69,6 +93,25 @@ class RevivalEfficiencyRewardSpec:
 REVIVAL_EFFICIENCY_REWARD_SPEC: Final = RevivalEfficiencyRewardSpec()
 
 
+@dataclass(frozen=True, slots=True)
+class AbsoluteDeathPriceRewardSpec:
+    """Stable factual reward carried by hybrid transition v2.
+
+    Revival preference is deliberately absent here.  The transition exports
+    the exact counter delta and the Candidate-Q learner applies one absolute
+    price to every sample in an optimizer update.
+    """
+
+    version: str = field(default="sts2-run-survival-efficiency-v8", init=False)
+    required_discount: float = field(default=1.0, init=False)
+    hp_loss_weight: float = field(default=0.55, init=False)
+    pace_budget: float = field(default=0.04, init=False)
+    hp_loss_scale: float = field(default=80.0, init=False)
+
+
+ABSOLUTE_DEATH_PRICE_REWARD_SPEC: Final = AbsoluteDeathPriceRewardSpec()
+
+
 def task_reward_identity() -> dict[str, Any]:
     payload: dict[str, Any] = {
         "version": TASK_REWARD_SPEC.version,
@@ -86,9 +129,7 @@ def task_reward_identity() -> dict[str, Any]:
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     payload["fingerprint"] = serialized
-    payload["fingerprint_sha256"] = hashlib.sha256(
-        serialized.encode("utf-8")
-    ).hexdigest()
+    payload["fingerprint_sha256"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
     return payload
 
 
@@ -99,8 +140,7 @@ def revival_efficiency_reward_identity() -> dict[str, Any]:
         "spec": asdict(REVIVAL_EFFICIENCY_REWARD_SPEC),
         "revival_event_source": "observation._training.revivals_used exact counter",
         "revival_budget_source": (
-            "positive observation._training.revival_budget; otherwise "
-            "spec.revival_reference_budget"
+            "positive observation._training.revival_budget; otherwise " "spec.revival_reference_budget"
         ),
         "revival_cost_schedule": "cap*min(revivals_used/revival_budget,1)",
         "hp_loss_source": "observation._training.player_hp_lost exact counter",
@@ -109,9 +149,34 @@ def revival_efficiency_reward_identity() -> dict[str, Any]:
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     payload["fingerprint"] = serialized
-    payload["fingerprint_sha256"] = hashlib.sha256(
-        serialized.encode("utf-8")
-    ).hexdigest()
+    payload["fingerprint_sha256"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return payload
+
+
+def absolute_death_price_reward_identity() -> dict[str, Any]:
+    """Return the v8 factual-reward identity used by hybrid transition v2."""
+
+    task_spec = asdict(ABSOLUTE_DEATH_PRICE_TASK_REWARD_SPEC)
+    task_payload: dict[str, Any] = {
+        "version": ABSOLUTE_DEATH_PRICE_TASK_REWARD_SPEC.version,
+        "spec": task_spec,
+        "outcome_source": (
+            "environment_result.terminated+typed_transition.facts.combat_result+"
+            "typed_transition.facts.run_result+typed_transition.facts.terminal_reason+"
+            "observation.run.act"
+        ),
+        "progress_source": "positive_delta(observation.run.progress_or_floor)",
+    }
+    payload: dict[str, Any] = {
+        "version": ABSOLUTE_DEATH_PRICE_REWARD_SPEC.version,
+        "base": task_payload,
+        "spec": asdict(ABSOLUTE_DEATH_PRICE_REWARD_SPEC),
+        "revival_event_source": "observation._training.revivals_used exact counter",
+        "revival_pricing": "learner_absolute_lambda_times_transition_delta",
+        "hp_loss_source": "observation._training.player_hp_lost exact counter",
+        "ordering_check": "durable-floor-discounted-terminal-margin-v1",
+        "forbidden_shaping": "enemy_hp_delta+damage_dealt+cards_played",
+    }
     return payload
 
 
@@ -199,11 +264,7 @@ def _typed_terminal_result(result: EnvironmentResult, *, objective: TaskObjectiv
             raise ValueError("terminal task result has no typed transition facts")
         return "none"
     fact_name = "combat_result" if objective == "combat" else "run_result"
-    supported = (
-        {"none", "victory", "defeat", "escaped"}
-        if objective == "combat"
-        else {"none", "victory", "defeat"}
-    )
+    supported = {"none", "victory", "defeat", "escaped"} if objective == "combat" else {"none", "victory", "defeat"}
     raw = transition.facts.get(fact_name)
     if not isinstance(raw, str) or raw not in supported or (result.terminated and raw == "none"):
         raise ValueError(f"typed {fact_name} is missing or unsupported")
@@ -237,7 +298,13 @@ class TaskReward:
 
 
 class TaskRewardCalculator:
-    def __init__(self, objective: TaskObjective, *, discount: float = 0.997) -> None:
+    def __init__(
+        self,
+        objective: TaskObjective,
+        *,
+        discount: float = 0.997,
+        spec: TaskRewardSpec | AbsoluteDeathPriceTaskRewardSpec = TASK_REWARD_SPEC,
+    ) -> None:
         if objective not in {"combat", "act1", "run"}:
             raise ValueError("objective must be combat, act1, or run")
         normalized_discount = float(discount)
@@ -245,6 +312,7 @@ class TaskRewardCalculator:
             raise ValueError("discount must be finite and in (0, 1]")
         self.objective = objective
         self.discount = normalized_discount
+        self.spec = spec
 
     def _outcome(
         self,
@@ -258,7 +326,7 @@ class TaskRewardCalculator:
         if horizon_exhausted:
             return "horizon"
         act, _, _ = _run_position(after.observation)
-        if self.objective == "act1" and act >= TASK_REWARD_SPEC.act1_success_act:
+        if self.objective == "act1" and act >= self.spec.act1_success_act:
             return "success"
         if not after.terminated:
             return "ongoing"
@@ -276,9 +344,7 @@ class TaskRewardCalculator:
         horizon_exhausted: bool = False,
     ) -> TaskReward:
         if after.truncated:
-            raise ValueError(
-                "transport/outcome-unknown truncation cannot become training data"
-            )
+            raise ValueError("transport/outcome-unknown truncation cannot become training data")
         outcome = self._outcome(
             after,
             deadlock=deadlock,
@@ -287,18 +353,16 @@ class TaskRewardCalculator:
         task_terminal = outcome != "ongoing"
         terminal_reward = {
             "ongoing": 0.0,
-            "success": TASK_REWARD_SPEC.success_reward,
-            "failure": TASK_REWARD_SPEC.failure_reward,
-            "deadlock": TASK_REWARD_SPEC.deadlock_reward,
-            "horizon": TASK_REWARD_SPEC.horizon_reward,
+            "success": self.spec.success_reward,
+            "failure": self.spec.failure_reward,
+            "deadlock": self.spec.deadlock_reward,
+            "horizon": self.spec.horizon_reward,
         }[outcome]
         progress_reward = 0.0
         if self.objective in {"act1", "run"}:
             before_progress = _run_position(before.observation)[2]
             after_progress = _run_position(after.observation)[2]
-            progress_reward = TASK_REWARD_SPEC.run_progress_reward_weight * max(
-                0.0, after_progress - before_progress
-            )
+            progress_reward = self.spec.run_progress_reward_weight * max(0.0, after_progress - before_progress)
         return TaskReward(
             reward=float(terminal_reward + progress_reward),
             discount=0.0 if task_terminal else self.discount,
@@ -376,13 +440,9 @@ class RevivalEfficiencyRewardCalculator:
                 revival_budget=before_revival_budget,
             )
         )
-        pace_penalty = -REVIVAL_EFFICIENCY_REWARD_SPEC.pace_budget / float(
-            self.maximum_episode_steps
-        )
+        pace_penalty = -REVIVAL_EFFICIENCY_REWARD_SPEC.pace_budget / float(self.maximum_episode_steps)
         return TaskReward(
-            reward=float(
-                base.reward + hp_loss_penalty + revival_penalty + pace_penalty
-            ),
+            reward=float(base.reward + hp_loss_penalty + revival_penalty + pace_penalty),
             discount=base.discount,
             terminal_reward=base.terminal_reward,
             potential_reward=base.potential_reward,
@@ -397,9 +457,102 @@ class RevivalEfficiencyRewardCalculator:
         )
 
 
+class AbsoluteDeathPriceRewardCalculator:
+    """V8 factual reward; revival price is owned by the hybrid learner.
+
+    The calculator still validates and exports the exact monotonic revival
+    delta.  Its scalar ``reward`` contains terminal/progress, bounded HP-loss,
+    and pace terms only, so factual replay can be repriced as ``lambda`` moves
+    without recollection.
+    """
+
+    def __init__(
+        self,
+        *,
+        maximum_episode_steps: int,
+        objective: TaskObjective = "combat",
+        discount: float = 1.0,
+    ) -> None:
+        if objective not in {"combat", "act1", "run"}:
+            raise ValueError("objective must be combat, act1, or run")
+        if isinstance(maximum_episode_steps, bool) or maximum_episode_steps <= 0:
+            raise ValueError("maximum_episode_steps must be a positive integer")
+        if float(discount) != ABSOLUTE_DEATH_PRICE_REWARD_SPEC.required_discount:
+            raise ValueError("absolute-death-price preheat requires discount=1")
+        self.maximum_episode_steps = int(maximum_episode_steps)
+        self.base = TaskRewardCalculator(
+            objective,
+            discount=discount,
+            spec=ABSOLUTE_DEATH_PRICE_TASK_REWARD_SPEC,
+        )
+
+    def evaluate(
+        self,
+        before: EnvironmentResult,
+        after: EnvironmentResult,
+        *,
+        deadlock: bool = False,
+        horizon_exhausted: bool = False,
+    ) -> TaskReward:
+        base = self.base.evaluate(
+            before,
+            after,
+            deadlock=deadlock,
+            horizon_exhausted=horizon_exhausted,
+        )
+        before_revivals = _training_counter(before.observation, "revivals_used")
+        after_revivals = _training_counter(after.observation, "revivals_used")
+        before_revival_budget = _training_revival_budget(before.observation)
+        after_revival_budget = _training_revival_budget(after.observation)
+        before_hp_lost = _training_counter(before.observation, "player_hp_lost")
+        after_hp_lost = _training_counter(after.observation, "player_hp_lost")
+        if after_revival_budget != before_revival_budget:
+            raise ValueError("training revival budget must remain constant within an episode")
+        if after_revivals < before_revivals or after_hp_lost < before_hp_lost:
+            raise ValueError("training efficiency counters must be monotonic")
+
+        raw_revival_delta = after_revivals - before_revivals
+        if not float(raw_revival_delta).is_integer():
+            raise ValueError("training revival delta must be an integer")
+        revivals_used_delta = int(raw_revival_delta)
+        player_hp_lost_delta = after_hp_lost - before_hp_lost
+        hp_loss_penalty = -ABSOLUTE_DEATH_PRICE_REWARD_SPEC.hp_loss_weight * (
+            _bounded_resource_score(
+                after_hp_lost,
+                ABSOLUTE_DEATH_PRICE_REWARD_SPEC.hp_loss_scale,
+            )
+            - _bounded_resource_score(
+                before_hp_lost,
+                ABSOLUTE_DEATH_PRICE_REWARD_SPEC.hp_loss_scale,
+            )
+        )
+        pace_penalty = -ABSOLUTE_DEATH_PRICE_REWARD_SPEC.pace_budget / float(self.maximum_episode_steps)
+        return TaskReward(
+            reward=float(base.reward + hp_loss_penalty + pace_penalty),
+            discount=base.discount,
+            terminal_reward=base.terminal_reward,
+            potential_reward=base.potential_reward,
+            task_terminal=base.task_terminal,
+            outcome=base.outcome,
+            # Explicitly zero: transition v2 carries the delta and learner v3
+            # applies the current absolute price inside the TD target.
+            revival_penalty=0.0,
+            pace_penalty=float(pace_penalty),
+            hp_loss_penalty=float(hp_loss_penalty),
+            progress_reward=base.progress_reward,
+            revivals_used_delta=revivals_used_delta,
+            player_hp_lost_delta=float(player_hp_lost_delta),
+        )
+
+
 __all__ = [
+    "ABSOLUTE_DEATH_PRICE_REWARD_SPEC",
+    "ABSOLUTE_DEATH_PRICE_TASK_REWARD_SPEC",
     "REVIVAL_EFFICIENCY_REWARD_SPEC",
     "TASK_REWARD_SPEC",
+    "AbsoluteDeathPriceRewardCalculator",
+    "AbsoluteDeathPriceRewardSpec",
+    "AbsoluteDeathPriceTaskRewardSpec",
     "RevivalEfficiencyRewardCalculator",
     "RevivalEfficiencyRewardSpec",
     "TaskObjective",
@@ -407,6 +560,7 @@ __all__ = [
     "TaskReward",
     "TaskRewardCalculator",
     "TaskRewardSpec",
+    "absolute_death_price_reward_identity",
     "revival_efficiency_reward_identity",
     "task_reward_identity",
 ]
