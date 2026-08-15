@@ -24,11 +24,15 @@ from .death_price import (
     death_price_course,
     validate_discounted_outcome_margin,
 )
-from .replay import DomainView, HybridRunReplay
+from .replay import DomainView, HybridRunReplay, HybridViewPair
 from .transitions import HybridRun, HybridStep, next_domain_index
 
 HYBRID_IQL_LEARNER_VERSION: Final = "sts2-hybrid-iql-awac-v1"
 HybridIQLForward: TypeAlias = tuple[Tensor, Tensor, Tensor, Tensor]
+
+
+class _NonFiniteForwardPass(FloatingPointError):
+    """A forward/target computation failed before any optimizer mutation."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +106,7 @@ class HybridIQLMetrics:
     maximum_policy_lag: int = 0
     target_syncs: int = 0
     last_target_sync_update: int = 0
+    forward_retries: int = 0
     domain_surface_counts: dict[str, int] = field(default_factory=dict)
 
     def as_mapping(self) -> dict[str, Any]:
@@ -292,6 +297,19 @@ class HybridIQLLearner:
         target_value: Tensor,
         factual_target: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        context = (
+            f"{step.control_domain}:{step.surface}:{step.branch} "
+            f"action={step.action_index} policy={step.policy_version}"
+        )
+        self._require_named_finite(
+            f"node inputs ({context})",
+            q=q,
+            value=value,
+            logits=logits,
+            target_q=target_q,
+            target_value=target_value,
+            factual_target=factual_target,
+        )
         executed_q = q[step.action_index]
         q_loss = torch.nn.functional.huber_loss(
             executed_q,
@@ -320,6 +338,15 @@ class HybridIQLLearner:
         actor_loss = -actor_weight * log_policy[step.action_index]
         probabilities = log_policy.exp()
         entropy = -(probabilities[legal] * log_policy[legal]).sum()
+        self._require_named_finite(
+            f"node losses ({context})",
+            q_loss=q_loss,
+            value_loss=value_loss,
+            actor_loss=actor_loss,
+            td_abs=(executed_q - factual_target).detach().abs(),
+            actor_weight=actor_weight,
+            entropy=entropy,
+        )
         return (
             q_loss,
             value_loss,
@@ -427,11 +454,22 @@ class HybridIQLLearner:
         if not all(bool(torch.isfinite(value).all().item()) for value in values):
             raise FloatingPointError(f"hybrid IQL produced non-finite {label}")
 
-    def update(self) -> dict[str, Any]:
-        pairs = self.replay.sample_pairs(self.config.run_batch_size)
-        if not pairs:
-            return self.as_mapping()
-        price = self.death_price.lambda_value
+    @staticmethod
+    def _require_named_finite(label: str, **values: Tensor) -> None:
+        nonfinite = [
+            name for name, value in values.items() if not bool(torch.isfinite(value).all().item())
+        ]
+        if nonfinite:
+            raise _NonFiniteForwardPass(
+                f"hybrid IQL produced non-finite {label}: {', '.join(nonfinite)}"
+            )
+
+    def _domain_losses(
+        self,
+        pairs: tuple[HybridViewPair, ...],
+        *,
+        price: float,
+    ) -> tuple[_DomainLoss, _DomainLoss, Tensor]:
         macro_rows = [self._macro_loss(pair.macro, lambda_value=price) for pair in pairs]
         combat_rows = [self._combat_loss(pair.combat, lambda_value=price) for pair in pairs]
 
@@ -459,18 +497,37 @@ class HybridIQLLearner:
             steps=sum(row.steps for row in combat_rows),
         )
         loss = 0.5 * (macro.total + combat.total)
-        self._require_finite(
-            "loss or target",
-            macro.total,
-            combat.total,
-            macro.q,
-            combat.q,
-            macro.value,
-            combat.value,
-            macro.actor,
-            combat.actor,
-            loss,
+        self._require_named_finite(
+            "domain reduction",
+            macro_total=macro.total,
+            combat_total=combat.total,
+            macro_q=macro.q,
+            combat_q=combat.q,
+            macro_value=macro.value,
+            combat_value=combat.value,
+            macro_actor=macro.actor,
+            combat_actor=combat.actor,
+            loss=loss,
         )
+        return macro, combat, loss
+
+    def update(self) -> dict[str, Any]:
+        pairs = self.replay.sample_pairs(self.config.run_batch_size)
+        if not pairs:
+            return self.as_mapping()
+        price = self.death_price.lambda_value
+        try:
+            macro, combat, loss = self._domain_losses(pairs, price=price)
+        except _NonFiniteForwardPass:
+            # The ROCm math-SDPA path produced a one-off non-finite forward on
+            # an otherwise exactly replayable finite batch. Recompute the same
+            # immutable views once. A deterministic bad batch still fails on
+            # the second pass before backward or optimizer mutation.
+            self.optimizer.zero_grad(set_to_none=True)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self.metrics.forward_retries += 1
+            macro, combat, loss = self._domain_losses(pairs, price=price)
 
         self.optimizer.zero_grad(set_to_none=True)
         if self.metrics.updates % self.config.gradient_diagnostics_interval == 0 and self._shared_parameters:

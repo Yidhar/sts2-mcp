@@ -6,6 +6,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+import sts2_rl.joint.iql_learner as iql_module  # noqa: E402
 from sts2_rl.joint import (  # noqa: E402
     HybridIQLLearner,
     HybridIQLLearnerConfig,
@@ -106,3 +107,22 @@ def test_nonfinite_batch_stops_before_optimizer_step() -> None:
     for key, value in online.state_dict().items():
         torch.testing.assert_close(value, before[key])
 
+
+def test_transient_nonfinite_forward_retries_the_same_batch_once() -> None:
+    online = _TinyIQL()
+    target = copy.deepcopy(online)
+    learner = _learner(online, target)
+    stable_domain_losses = learner._domain_losses
+    pair_objects: list[object] = []
+
+    def flaky_domain_losses(pairs, *, price):
+        pair_objects.append(pairs)
+        if len(pair_objects) == 1:
+            raise iql_module._NonFiniteForwardPass("injected transient")
+        return stable_domain_losses(pairs, price=price)
+
+    learner._domain_losses = flaky_domain_losses  # type: ignore[method-assign]
+    metrics = learner.update()
+    assert metrics["updates"] == 1
+    assert metrics["forward_retries"] == 1
+    assert pair_objects[0] is pair_objects[1]

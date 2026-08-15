@@ -32,6 +32,15 @@ published non-finite weights at update 271. The two collectors then failed to
 map the selected score to a native legal action. Finite loss/gradient/model
 boundaries are now explicit so a numerical failure stops before publication.
 
+The first isolation run later observed one non-finite forward at update 16.
+The saved model, optimizer, replay facts and pending runs were all finite, and
+the same checkpoint/RNG/batch completed successfully on three exact replays.
+This identifies a transient ROCm forward fault rather than a deterministic
+learning target. The learner therefore recomputes the **same immutable batch
+once**, before backward or optimizer mutation. A second failure remains fatal
+and reports the exact domain, surface, branch and first non-finite quantity.
+The retry count is telemetry, not another policy or reward mechanism.
+
 ## 2. Permanent control equations
 
 For one factual transition and its actual semantic successor:
@@ -121,4 +130,3 @@ Do not start another long lineage until one fixed-seed short run establishes:
 No MCTS or look-ahead search is introduced. The purpose of this change is to
 repair the supported-action learning target while keeping the factual online
 RL system model-free.
-

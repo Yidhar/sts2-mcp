@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Project live Hybrid Candidate-Q telemetry into the dashboard event schema."""
+"""Project live Hybrid control telemetry into the dashboard event schema."""
 
 from __future__ import annotations
 
@@ -180,7 +180,7 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
             "event": "run_start",
             "unix_s": _start_time(manifest, trainer_rows),
             "run_id": args.run_id,
-            "pipeline": "hybrid-double-q-v1",
+            "pipeline": manifest.get("algorithm", "hybrid-control"),
             "checkpoint_load": {
                 "mode": "exact_resume" if resumed_from else "model_init",
                 "parent_checkpoint": (
@@ -191,7 +191,7 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "source_policy_version": manifest.get("source_policy_version"),
             },
             "config": {
-                "profile": "hybrid-candidate-q-v1",
+                "profile": manifest.get("algorithm", "hybrid-control"),
                 "curriculum": {
                     "mode": args.curriculum_mode,
                     "revival_budget": args.revival_budget,
@@ -205,7 +205,13 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                     "collector_episode_capacity": args.collector_episode_capacity,
                     "maximum_pending_runs": args.maximum_pending_runs,
                 },
-                "model": {"architecture": "hybrid-domain-candidate-q-v1"},
+                "model": {
+                    "architecture": (
+                        "hybrid-domain-iql-v1"
+                        if manifest.get("algorithm") == "recurrent_iql_awac_v1"
+                        else "hybrid-domain-candidate-q-v1"
+                    )
+                },
             },
             "state": {
                 "environment_steps": source_environment_steps,
@@ -297,6 +303,7 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 ),
                 "hybrid_actor_gradient_norm": item.get("actor_gradient_norm"),
                 "hybrid_shared_gradient_cosine": item.get("shared_gradient_cosine"),
+                "hybrid_forward_retries": item.get("forward_retries", 0),
                 "hybrid_target_syncs": item.get("target_syncs"),
                 "hybrid_last_target_sync_update": item.get(
                     "last_target_sync_update"
