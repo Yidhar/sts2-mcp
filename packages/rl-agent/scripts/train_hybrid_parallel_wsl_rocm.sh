@@ -37,8 +37,8 @@ SIM_EXE="${STS2_HEADLESS_SIM_EXE:-$ARTIFACT_ROOT/dependencies/sts2-ai/STS2AI/ENV
   echo "[hybrid-par] final evaluation episodes must be non-negative" >&2
   exit 2
 }
-[[ "$STARTUP_EVALUATION_EPISODES" -gt 0 ]] || {
-  echo "[hybrid-par] startup held-out episodes must be positive" >&2
+[[ "$STARTUP_EVALUATION_EPISODES" -ge 0 ]] || {
+  echo "[hybrid-par] startup held-out episodes must be non-negative" >&2
   exit 2
 }
 [[ "$PERIODIC_EVALUATION_EPISODES" -gt 0 ]] || {
@@ -63,6 +63,10 @@ else
     exit 2
   }
   MODE_ARGS+=(--initialize-from "$INITIALIZE_FROM")
+fi
+if [[ "$STARTUP_EVALUATION_EPISODES" -eq 0 && -z "$RESUME" ]]; then
+  echo "[hybrid-par] model initialization requires a startup held-out evaluation" >&2
+  exit 2
 fi
 [[ -f "$SIM_EXE" ]] || { echo "[hybrid-par] HeadlessSim missing: $SIM_EXE" >&2; exit 2; }
 
@@ -159,20 +163,24 @@ done
 # The controller's held-out floor is a numeric part of the reward-v8
 # contract. Establish (or refresh, for exact continuation) that evidence while
 # the learner is idle, before producers can close the first 50-run block.
-STARTUP_EVALUATION="$RUN_ROOT/evaluation/startup"
-STARTUP_FROZEN_POLICY="$STARTUP_EVALUATION/frozen-policy.pt"
-mkdir -p "$STARTUP_EVALUATION"
-cp -f "$PUBLICATION" "$STARTUP_FROZEN_POLICY"
-echo "[hybrid-par] starting held-out support gate episodes=$STARTUP_EVALUATION_EPISODES"
-python scripts/run_hybrid_evaluation.py \
-  --config "$CONFIG" \
-  --champion "$CHAMPION" \
-  --model-path "$STARTUP_FROZEN_POLICY" \
-  --episodes "$STARTUP_EVALUATION_EPISODES" \
-  --metrics-out "$METRICS/evaluation.jsonl" \
-  --journal-directory "$DASHBOARD_RUN_ROOT" \
-  --device "$EVALUATION_DEVICE" \
-  --sim-exe "$SIM_EXE" >"$LOGS/evaluation-startup.log" 2>&1
+if [[ "$STARTUP_EVALUATION_EPISODES" -gt 0 ]]; then
+  STARTUP_EVALUATION="$RUN_ROOT/evaluation/startup"
+  STARTUP_FROZEN_POLICY="$STARTUP_EVALUATION/frozen-policy.pt"
+  mkdir -p "$STARTUP_EVALUATION"
+  cp -f "$PUBLICATION" "$STARTUP_FROZEN_POLICY"
+  echo "[hybrid-par] starting held-out support gate episodes=$STARTUP_EVALUATION_EPISODES"
+  python scripts/run_hybrid_evaluation.py \
+    --config "$CONFIG" \
+    --champion "$CHAMPION" \
+    --model-path "$STARTUP_FROZEN_POLICY" \
+    --episodes "$STARTUP_EVALUATION_EPISODES" \
+    --metrics-out "$METRICS/evaluation.jsonl" \
+    --journal-directory "$DASHBOARD_RUN_ROOT" \
+    --device "$EVALUATION_DEVICE" \
+    --sim-exe "$SIM_EXE" >"$LOGS/evaluation-startup.log" 2>&1
+else
+  echo "[hybrid-par] exact resume reuses restored held-out controller evidence"
+fi
 
 CURRENT_INGESTED="$(trainer_ingested_runs)"
 NEXT_PERIODIC_EVALUATION_RUN=$((

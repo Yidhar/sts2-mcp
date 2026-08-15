@@ -350,6 +350,8 @@ def test_parallel_launcher_establishes_heldout_floor_before_collection() -> None
     first_collector = source.index("python scripts/run_hybrid_collector.py")
     assert startup_evaluation < first_collector
     assert "STS2_HYBRID_STARTUP_EVALUATION_EPISODES:-16" in source
+    assert '[[ "$STARTUP_EVALUATION_EPISODES" -eq 0 && -z "$RESUME" ]]' in source
+    assert "exact resume reuses restored held-out controller evidence" in source
     assert '--metrics-out "$METRICS/evaluation.jsonl"' in source
 
 
