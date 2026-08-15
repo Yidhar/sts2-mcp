@@ -12,7 +12,7 @@ from sts2_rl.semantics.clock import decision_discount
 
 from .transitions import HybridRun, HybridStep
 
-HYBRID_AUTHORITY_VERSION: Final = "sts2-hybrid-authority-v1"
+HYBRID_AUTHORITY_VERSION: Final = "sts2-hybrid-authority-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +52,7 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
         self.policy_version = 0
         self._open_policy_version = 0
         self._open_encounter_id: int | None = None
+        self._open_revivals_delta = 0
         self._hybrid_steps: list[HybridStep] = []
         self._terminal_observed = False
         self._encounter_id = 0
@@ -102,18 +103,15 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
         self._terminal_observed = False
         self._encounter_id = 0
         self._was_in_combat = False
+        self._open_revivals_delta = 0
 
     def _activate_domain_epsilon(self, observation: Mapping[str, Any]) -> None:
         combat = observation.get("combat")
         domain: Literal["macro", "combat"] = (
-            "combat"
-            if isinstance(combat, Mapping) and combat.get("in_progress") is True
-            else "macro"
+            "combat" if isinstance(combat, Mapping) and combat.get("in_progress") is True else "macro"
         )
         self.epsilon = (
-            0.0
-            if self.evaluation_ownership
-            else self.exploration[domain].value(self.domain_decisions[domain])
+            0.0 if self.evaluation_ownership else self.exploration[domain].value(self.domain_decisions[domain])
         )
 
     def observe_observation(self, observation: Mapping[str, Any]) -> None:
@@ -123,7 +121,18 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
             self._encounter_id += 1
         self._was_in_combat = active
 
-    def observe_step(self, *, reward: float, floor: int | None, terminal: bool) -> None:
+    def observe_step(
+        self,
+        *,
+        reward: float,
+        floor: int | None,
+        terminal: bool,
+        revivals_delta: int = 0,
+    ) -> None:
+        if isinstance(revivals_delta, bool) or not isinstance(revivals_delta, int) or revivals_delta < 0:
+            raise ValueError("hybrid revivals_delta must be a non-negative integer")
+        if self._open is not None:
+            self._open_revivals_delta += revivals_delta
         super().observe_step(reward=reward, floor=floor, terminal=terminal)
         self._terminal_observed = self._terminal_observed or bool(terminal)
 
@@ -150,10 +159,9 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
             control_domain=control_domain,
         )
         self._open_policy_version = int(self.policy_version)
+        self._open_revivals_delta = 0
         assert control_domain is not None
-        self._open_encounter_id = (
-            self._encounter_id if control_domain == "combat" else None
-        )
+        self._open_encounter_id = self._encounter_id if control_domain == "combat" else None
         self.domain_decisions[control_domain] += 1
 
     def _close_open(
@@ -174,6 +182,7 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
                 snapshot=opened.snapshot,
                 action_index=opened.action_index,
                 reward=opened.reward_accumulator,
+                revivals_delta=self._open_revivals_delta,
                 discount=decision_discount(
                     floor_before=opened.floor,
                     floor_after=max(closing_floor, opened.floor),
@@ -191,6 +200,7 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
         )
         self._open = None
         self._open_encounter_id = None
+        self._open_revivals_delta = 0
 
     def finish_run(
         self,
@@ -204,6 +214,7 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
             self._episode_id = None
             self._hybrid_steps = []
             self._open = None
+            self._open_revivals_delta = 0
             self._pending_plan = None
             return None
         if not self._terminal_observed:
@@ -213,6 +224,7 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
             self._episode_id = None
             self._hybrid_steps = []
             self._open = None
+            self._open_revivals_delta = 0
             self._pending_plan = None
             return None
         self._close_open(terminal=True)
@@ -235,6 +247,7 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
         self.finish_run()
         self._terminal_observed = False
         self._open_encounter_id = None
+        self._open_revivals_delta = 0
         self._was_in_combat = False
 
     def set_epsilon(self, domain: Literal["macro", "combat"], value: float) -> None:
@@ -260,8 +273,7 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
             "policy_version": self.policy_version,
             "domain_decisions": dict(self.domain_decisions),
             "domain_epsilon": {
-                domain: schedule.value(self.domain_decisions[domain])
-                for domain, schedule in self.exploration.items()
+                domain: schedule.value(self.domain_decisions[domain]) for domain, schedule in self.exploration.items()
             },
             "recorded_steps": len(self._hybrid_steps),
             "last_decline": self.last_executor_failure,

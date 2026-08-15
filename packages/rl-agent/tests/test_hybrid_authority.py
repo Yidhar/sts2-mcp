@@ -52,10 +52,16 @@ def test_hybrid_authority_records_only_factual_terminal_runs() -> None:
         snapshot=_snapshot(candidate_count=2),
         valid=np.ones(2, dtype=np.bool_),
     )
-    authority.observe_step(reward=1.0, floor=7, terminal=True)
+    authority.observe_step(
+        reward=1.0,
+        revivals_delta=2,
+        floor=7,
+        terminal=True,
+    )
     run = authority.finish_run(environment_steps=17)
     assert run is not None
     assert run.steps[-1].terminal is True
+    assert run.steps[-1].revivals_delta == 2
     assert run.environment_steps == 17
 
 
@@ -89,9 +95,7 @@ def test_infrastructure_discard_cannot_leak_a_partial_run() -> None:
 
 def test_domain_clocks_roundtrip_and_evaluation_forces_zero_epsilon() -> None:
     authority = _authority()
-    authority.load_exploration_state_dict(
-        {"domain_decisions": {"macro": 5, "combat": 8}, "policy_version": 12}
-    )
+    authority.load_exploration_state_dict({"domain_decisions": {"macro": 5, "combat": 8}, "policy_version": 12})
     assert authority.exploration_state_dict() == {
         "domain_decisions": {"macro": 5, "combat": 8},
         "policy_version": 12,
@@ -150,12 +154,15 @@ def test_semantic_targets_map_back_to_one_native_entry() -> None:
         combat_exploration=DomainExplorationSchedule(0.0, 0.0, 1),
     )
     authority.begin_episode("native-map")
-    assert authority.choose(
-        observation=_rest_observation(deck=deck),
-        semantic_actions=_REST_ACTIONS,
-        snapshot=_snapshot(candidate_count=2),
-        valid=np.ones(2, dtype=np.bool_),
-    ) == 1
+    assert (
+        authority.choose(
+            observation=_rest_observation(deck=deck),
+            semantic_actions=_REST_ACTIONS,
+            snapshot=_snapshot(candidate_count=2),
+            valid=np.ones(2, dtype=np.bool_),
+        )
+        == 1
+    )
     assert authority.last_native_q_values is not None
     np.testing.assert_allclose(
         authority.last_native_q_values,
@@ -167,9 +174,7 @@ def test_publication_reload_does_not_rewind_domain_clocks() -> None:
     authority = _authority()
     authority.domain_decisions.update({"macro": 11, "combat": 13})
     authority.policy_version = 9
-    authority.load_exploration_state_dict(
-        {"domain_decisions": {"macro": 5, "combat": 8}, "policy_version": 4}
-    )
+    authority.load_exploration_state_dict({"domain_decisions": {"macro": 5, "combat": 8}, "policy_version": 4})
     assert authority.exploration_state_dict() == {
         "domain_decisions": {"macro": 11, "combat": 13},
         "policy_version": 9,

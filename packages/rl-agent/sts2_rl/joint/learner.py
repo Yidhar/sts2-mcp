@@ -17,11 +17,16 @@ from typing import Any, Final
 import torch
 from torch import Tensor, nn
 
+from .death_price import (
+    AbsoluteDeathPriceController,
+    DeathPriceEpisodeOutcome,
+    death_price_course,
+    validate_discounted_outcome_margin,
+)
 from .replay import DomainView, HybridRunReplay
 from .transitions import HybridRun, HybridStep, next_domain_index
 
-HYBRID_Q_LEARNER_VERSION: Final = "sts2-hybrid-double-q-v2"
-_PREVIOUS_HYBRID_Q_LEARNER_VERSION: Final = "sts2-hybrid-double-q-v1"
+HYBRID_Q_LEARNER_VERSION: Final = "sts2-hybrid-double-q-v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,14 +39,18 @@ class HybridQConfig:
     run_batch_size: int = 4
     combat_n_step: int = 8
     gradient_diagnostics_interval: int = 50
+    revival_budget: int = 64
 
     def __post_init__(self) -> None:
-        if min(
-            self.target_update_interval,
-            self.run_batch_size,
-            self.combat_n_step,
-            self.gradient_diagnostics_interval,
-        ) <= 0:
+        if (
+            min(
+                self.target_update_interval,
+                self.run_batch_size,
+                self.combat_n_step,
+                self.gradient_diagnostics_interval,
+            )
+            <= 0
+        ):
             raise ValueError("hybrid Q integer bounds must be positive")
         for name in (
             "learning_rate",
@@ -52,6 +61,7 @@ class HybridQConfig:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"hybrid Q {name} must be positive and finite")
+        death_price_course(self.revival_budget)
 
 
 @dataclass(slots=True)
@@ -102,6 +112,9 @@ class HybridQLearner:
         self.forward_target = forward_target
         self.initial_state = initial_state
         self.config = config or HybridQConfig()
+        course = death_price_course(self.config.revival_budget)
+        validate_discounted_outcome_margin(course)
+        self.death_price = AbsoluteDeathPriceController(course)
         local_tokens = (
             "macro_stream",
             "combat_stream",
@@ -120,8 +133,7 @@ class HybridQLearner:
             groups.append(
                 {
                     "params": shared,
-                    "lr": self.config.learning_rate
-                    * self.config.shared_learning_rate_scale,
+                    "lr": self.config.learning_rate * self.config.shared_learning_rate_scale,
                 }
             )
         self.optimizer = torch.optim.AdamW(groups)
@@ -147,11 +159,7 @@ class HybridQLearner:
             allow_unused=True,
         )
         parts = [
-            (
-                torch.zeros_like(parameter).reshape(-1)
-                if gradient is None
-                else gradient.detach().reshape(-1)
-            )
+            (torch.zeros_like(parameter).reshape(-1) if gradient is None else gradient.detach().reshape(-1))
             for parameter, gradient in zip(parameters, gradients, strict=True)
         ]
         if not parts:
@@ -162,9 +170,7 @@ class HybridQLearner:
     def _masked_argmax(q_values: Tensor, step: HybridStep) -> int:
         count = len(step.snapshot.action_mask)
         q = q_values[:count]
-        mask = torch.tensor(
-            step.snapshot.action_mask.tolist(), dtype=torch.bool, device=q.device
-        )
+        mask = torch.tensor(step.snapshot.action_mask.tolist(), dtype=torch.bool, device=q.device)
         return int(q.masked_fill(~mask, float("-inf")).argmax().item())
 
     def _prefix_states(self, view: DomainView) -> tuple[Tensor, Tensor]:
@@ -179,9 +185,7 @@ class HybridQLearner:
     def _state_before(self, run: HybridRun, index: int) -> tuple[Tensor, Tensor]:
         """Reconstruct the exact sparse memory prefix for one graph node."""
 
-        macro_prefix = tuple(
-            candidate for candidate in run.indices("macro") if candidate < index
-        )
+        macro_prefix = tuple(candidate for candidate in run.indices("macro") if candidate < index)
         if run.steps[index].control_domain == "combat":
             encounter = run.steps[index].encounter_id
             combat_prefix = tuple(
@@ -197,9 +201,7 @@ class HybridQLearner:
         with torch.no_grad():
             for prefix_index in prefix:
                 _, state = self.forward_online(run.steps[prefix_index], state)
-                _, target_state = self.forward_target(
-                    run.steps[prefix_index], target_state
-                )
+                _, target_state = self.forward_target(run.steps[prefix_index], target_state)
         return state.detach(), target_state.detach()
 
     def _states_and_q(
@@ -251,18 +253,26 @@ class HybridQLearner:
         run: HybridRun,
         start: int,
         stop_exclusive: int,
+        *,
+        lambda_value: float = 0.0,
     ) -> tuple[float, float]:
         value = 0.0
         weight = 1.0
         for index in range(start, stop_exclusive):
             step = run.steps[index]
-            value += weight * step.reward
+            value += weight * (step.reward - float(lambda_value) * step.revivals_delta)
             weight *= step.discount
             if weight == 0.0:
                 break
         return value, weight
 
-    def _macro_loss(self, view: DomainView) -> tuple[Tensor, Tensor, int]:
+    def _macro_loss(
+        self,
+        view: DomainView,
+        *,
+        lambda_value: float | None = None,
+    ) -> tuple[Tensor, Tensor, int]:
+        price = self.death_price.lambda_value if lambda_value is None else lambda_value
         online_q, target_q, _, _ = self._states_and_q(view)
         losses: list[Tensor] = []
         errors: list[Tensor] = []
@@ -271,18 +281,19 @@ class HybridQLearner:
             step = run.steps[index]
             successor = next_domain_index(run, index, "macro")
             stop = successor if successor is not None else len(run.steps)
-            factual, discount = self._edge(run, index, stop)
-            target = torch.as_tensor(
-                factual, dtype=online_q[index].dtype, device=online_q[index].device
+            factual, discount = self._edge(
+                run,
+                index,
+                stop,
+                lambda_value=price,
             )
+            target = torch.as_tensor(factual, dtype=online_q[index].dtype, device=online_q[index].device)
             if successor is not None and discount != 0.0:
                 if successor in online_q:
                     # The sparse macro view already reconstructed this exact
                     # successor under current weights. Reuse it instead of
                     # replaying the whole run prefix once per learned node.
-                    selected = self._masked_argmax(
-                        online_q[successor].detach(), run.steps[successor]
-                    )
+                    selected = self._masked_argmax(online_q[successor].detach(), run.steps[successor])
                     bootstrap = target_q[successor][selected].detach()
                 else:
                     # A successor beyond the sampled suffix still needs one
@@ -297,14 +308,16 @@ class HybridQLearner:
                 target = target + discount * bootstrap
             executed = online_q[index][step.action_index]
             errors.append((executed - target).detach().abs())
-            losses.append(
-                torch.nn.functional.huber_loss(
-                    executed, target, delta=self.config.huber_delta
-                )
-            )
+            losses.append(torch.nn.functional.huber_loss(executed, target, delta=self.config.huber_delta))
         return torch.stack(losses).mean(), torch.stack(errors).mean(), len(losses)
 
-    def _combat_loss(self, view: DomainView) -> tuple[Tensor, Tensor, int]:
+    def _combat_loss(
+        self,
+        view: DomainView,
+        *,
+        lambda_value: float | None = None,
+    ) -> tuple[Tensor, Tensor, int]:
+        price = self.death_price.lambda_value if lambda_value is None else lambda_value
         online_q, target_q, _, _ = self._states_and_q(view)
         losses: list[Tensor] = []
         errors: list[Tensor] = []
@@ -326,15 +339,16 @@ class HybridQLearner:
                 if combat_seen >= self.config.combat_n_step:
                     break
             successor = cursor
-            factual, discount = self._edge(run, index, successor)
-            target = torch.as_tensor(
-                factual, dtype=online_q[index].dtype, device=online_q[index].device
+            factual, discount = self._edge(
+                run,
+                index,
+                successor,
+                lambda_value=price,
             )
+            target = torch.as_tensor(factual, dtype=online_q[index].dtype, device=online_q[index].device)
             if successor < len(run.steps) and discount != 0.0:
                 if successor in target_q and successor > index:
-                    selected = self._masked_argmax(
-                        online_q[successor].detach(), run.steps[successor]
-                    )
+                    selected = self._masked_argmax(online_q[successor].detach(), run.steps[successor])
                     bootstrap = target_q[successor][selected].detach()
                 else:
                     # Current encounter prefix + macro prefix has already been
@@ -350,27 +364,23 @@ class HybridQLearner:
                 target = target + discount * bootstrap
             executed = online_q[index][run.steps[index].action_index]
             errors.append((executed - target).detach().abs())
-            losses.append(
-                torch.nn.functional.huber_loss(
-                    executed, target, delta=self.config.huber_delta
-                )
-            )
+            losses.append(torch.nn.functional.huber_loss(executed, target, delta=self.config.huber_delta))
         return torch.stack(losses).mean(), torch.stack(errors).mean(), len(losses)
 
     def update(self) -> dict[str, Any]:
         pairs = self.replay.sample_pairs(self.config.run_batch_size)
         if not pairs:
-            return self.metrics.as_mapping()
-        macro_rows = [self._macro_loss(pair.macro) for pair in pairs]
-        combat_rows = [self._combat_loss(pair.combat) for pair in pairs]
+            return self.as_mapping()
+        # One immutable price snapshot per optimizer update keeps every sample
+        # in this balanced macro/combat batch on the same scalar target.
+        lambda_value = self.death_price.lambda_value
+        macro_rows = [self._macro_loss(pair.macro, lambda_value=lambda_value) for pair in pairs]
+        combat_rows = [self._combat_loss(pair.combat, lambda_value=lambda_value) for pair in pairs]
         macro_loss = torch.stack([row[0] for row in macro_rows]).mean()
         combat_loss = torch.stack([row[0] for row in combat_rows]).mean()
         loss = 0.5 * (macro_loss + combat_loss)
         self.optimizer.zero_grad(set_to_none=True)
-        if (
-            self.metrics.updates % self.config.gradient_diagnostics_interval == 0
-            and self._shared_parameters
-        ):
+        if self.metrics.updates % self.config.gradient_diagnostics_interval == 0 and self._shared_parameters:
             macro_gradient = self._gradient_vector(
                 macro_loss,
                 self._shared_parameters,
@@ -391,9 +401,7 @@ class HybridQLearner:
             self.metrics.combat_shared_gradient_norm = float(combat_norm.item())
             self.metrics.shared_gradient_cosine = float(cosine.item())
         loss.backward()  # type: ignore[no-untyped-call]
-        gradient_norm = torch.nn.utils.clip_grad_norm_(
-            self._parameters, self.config.gradient_clip_norm
-        )
+        gradient_norm = torch.nn.utils.clip_grad_norm_(self._parameters, self.config.gradient_clip_norm)
         self.optimizer.step()
 
         self.metrics.updates += 1
@@ -402,12 +410,8 @@ class HybridQLearner:
         self.metrics.macro_loss = float(macro_loss.detach().item())
         self.metrics.combat_loss = float(combat_loss.detach().item())
         self.metrics.loss = float(loss.detach().item())
-        self.metrics.macro_td_abs = float(
-            torch.stack([row[1] for row in macro_rows]).mean().item()
-        )
-        self.metrics.combat_td_abs = float(
-            torch.stack([row[1] for row in combat_rows]).mean().item()
-        )
+        self.metrics.macro_td_abs = float(torch.stack([row[1] for row in macro_rows]).mean().item())
+        self.metrics.combat_td_abs = float(torch.stack([row[1] for row in combat_rows]).mean().item())
         self.metrics.gradient_norm = float(gradient_norm)
         policy_lags = [
             max(0, self.metrics.updates - int(view.run.steps[index].policy_version))
@@ -415,24 +419,67 @@ class HybridQLearner:
             for view in (pair.macro, pair.combat)
             for index in view.learn_indices
         ]
-        self.metrics.mean_policy_lag = (
-            sum(policy_lags) / len(policy_lags) if policy_lags else 0.0
-        )
+        self.metrics.mean_policy_lag = sum(policy_lags) / len(policy_lags) if policy_lags else 0.0
         self.metrics.maximum_policy_lag = max(policy_lags, default=0)
         for pair in pairs:
             for view in (pair.macro, pair.combat):
                 for index in view.learn_indices:
                     step = view.run.steps[index]
                     key = f"{view.domain}:{step.surface}:{step.branch}"
-                    self.metrics.domain_surface_counts[key] = (
-                        self.metrics.domain_surface_counts.get(key, 0) + 1
-                    )
-        if (
-            self.metrics.updates - self.metrics.last_target_sync_update
-            >= self.config.target_update_interval
-        ):
+                    self.metrics.domain_surface_counts[key] = self.metrics.domain_surface_counts.get(key, 0) + 1
+        if self.metrics.updates - self.metrics.last_target_sync_update >= self.config.target_update_interval:
             self.sync_target()
-        return self.metrics.as_mapping()
+        return self.as_mapping()
+
+    def observe_episode_outcome(
+        self,
+        *,
+        act1_cleared: bool,
+        run_success: bool,
+        act1_revivals: int | None,
+        run_revivals: int,
+    ) -> bool:
+        """Feed one factual run result to the successful-outcome ratchet."""
+
+        return self.death_price.observe_episode(
+            DeathPriceEpisodeOutcome(
+                act1_cleared=act1_cleared,
+                run_success=run_success,
+                act1_revivals=act1_revivals,
+                run_revivals=run_revivals,
+            )
+        )
+
+    def initialize_death_price(self, value: float) -> None:
+        """Carry only the scalar price across a model-init course boundary."""
+
+        inherited = float(value)
+        if not math.isfinite(inherited) or inherited < 0.0:
+            raise ValueError("inherited death price must be finite and non-negative")
+        inherited = min(inherited, self.death_price.course.lambda_max)
+        self.death_price = AbsoluteDeathPriceController(
+            self.death_price.course,
+            initial_lambda=inherited,
+        )
+
+    def observe_heldout(
+        self,
+        *,
+        act1_rate: float,
+        run_rate: float,
+        policy_version: int,
+    ) -> None:
+        self.death_price.observe_heldout(
+            act1_rate=act1_rate,
+            run_rate=run_rate,
+            policy_version=policy_version,
+        )
+
+    def as_mapping(self) -> dict[str, Any]:
+        return {
+            **self.metrics.as_mapping(),
+            "death_price": self.death_price.as_mapping(),
+        }
 
     def sync_target(self) -> None:
         """Copy online weights to the target on the learner-update clock."""
@@ -447,38 +494,26 @@ class HybridQLearner:
             "config": asdict(self.config),
             "optimizer": self.optimizer.state_dict(),
             "metrics": self.metrics.as_mapping(),
+            "death_price": self.death_price.state_dict(),
         }
 
     def load_state_dict(
         self,
         state: dict[str, Any],
-        *,
-        migrate_target_schedule: bool = False,
     ) -> None:
         version = state.get("version")
-        accepted_versions = {HYBRID_Q_LEARNER_VERSION}
-        if migrate_target_schedule:
-            accepted_versions.add(_PREVIOUS_HYBRID_Q_LEARNER_VERSION)
-        if version not in accepted_versions:
+        if version != HYBRID_Q_LEARNER_VERSION:
             raise ValueError("hybrid learner state version differs")
         source_config = dict(state.get("config", {}))
         destination_config = asdict(self.config)
-        if migrate_target_schedule:
-            source_without_schedule = dict(source_config)
-            destination_without_schedule = dict(destination_config)
-            source_without_schedule.pop("target_update_interval", None)
-            destination_without_schedule.pop("target_update_interval", None)
-            if source_without_schedule != destination_without_schedule:
-                raise ValueError(
-                    "hybrid learner config differs beyond target schedule"
-                )
-        elif source_config != destination_config:
+        if source_config != destination_config:
             raise ValueError("hybrid learner config differs")
         self.optimizer.load_state_dict(state["optimizer"])
         metrics = dict(state["metrics"])
         metrics.pop("version", None)
         metrics.setdefault("last_target_sync_update", 0)
         self.metrics = HybridQMetrics(**metrics)
+        self.death_price.load_state_dict(dict(state["death_price"]))
 
 
 __all__ = [

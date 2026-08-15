@@ -8,11 +8,18 @@ from sts2_rl.joint import HybridRun, HybridRunReplay, HybridStep  # noqa: E402
 from tests.test_macro_q_learner import _snapshot  # noqa: E402
 
 
-def _step(domain: str, *, encounter: int | None = None, terminal: bool = False) -> HybridStep:
+def _step(
+    domain: str,
+    *,
+    encounter: int | None = None,
+    terminal: bool = False,
+    revivals_delta: int = 0,
+) -> HybridStep:
     return HybridStep(
         snapshot=_snapshot(),
         action_index=0,
         reward=1.0,
+        revivals_delta=revivals_delta,
         discount=0.0 if terminal else 0.9,
         terminal=terminal,
         surface="combat_card" if domain == "combat" else "map",
@@ -27,10 +34,10 @@ def _run(run_id: str = "run") -> HybridRun:
         run_id=run_id,
         environment_steps=12,
         steps=(
-            _step("macro"),       # 0
+            _step("macro"),  # 0
             _step("combat", encounter=1),  # 1
             _step("combat", encounter=1),  # 2
-            _step("macro"),       # 3 clears tactical memory
+            _step("macro"),  # 3 clears tactical memory
             _step("combat", encounter=2),  # 4
             _step("combat", encounter=2),  # 5
             _step("macro", terminal=True),  # 6
@@ -42,6 +49,7 @@ def test_replay_stores_one_run_and_returns_balanced_views() -> None:
     replay = HybridRunReplay(capacity_runs=4, macro_unroll=8, combat_unroll=8, seed=4)
     run = _run()
     replay.put(run)
+    assert replay.runs == (run,)
     pair = replay.sample_pairs(1)[0]
     assert pair.macro.run is run
     assert pair.combat.run is run
@@ -72,10 +80,7 @@ def test_combat_view_never_stitches_encounters() -> None:
             index
             for index in range(anchor)
             if _run().steps[index].control_domain == "macro"
-            or (
-                _run().steps[index].control_domain == "combat"
-                and _run().steps[index].encounter_id == encounter
-            )
+            or (_run().steps[index].control_domain == "combat" and _run().steps[index].encounter_id == encounter)
         )
 
 

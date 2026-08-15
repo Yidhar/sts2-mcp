@@ -57,9 +57,7 @@ def test_balanced_update_gives_executed_q_a_direct_gradient() -> None:
     assert metrics["macro_steps"] > 0
     assert metrics["combat_steps"] > 0
     assert not torch.equal(before, online.bias.detach())
-    assert metrics["loss"] == pytest.approx(
-        0.5 * (metrics["macro_loss"] + metrics["combat_loss"])
-    )
+    assert metrics["loss"] == pytest.approx(0.5 * (metrics["macro_loss"] + metrics["combat_loss"]))
     assert metrics["macro_shared_gradient_norm"] > 0.0
     assert metrics["combat_shared_gradient_norm"] > 0.0
     assert -1.0 <= metrics["shared_gradient_cosine"] <= 1.0
@@ -140,7 +138,7 @@ def test_target_sync_uses_elapsed_learner_updates_from_last_sync() -> None:
     assert learner.metrics.last_target_sync_update == 7
 
 
-def test_reviewed_target_schedule_migration_preserves_optimizer_and_updates() -> None:
+def test_v8_learner_state_roundtrip_preserves_death_price_controller() -> None:
     online = _TinyQ()
     target = copy.deepcopy(online)
     replay = HybridRunReplay(capacity_runs=4, macro_unroll=2, combat_unroll=2)
@@ -151,26 +149,34 @@ def test_reviewed_target_schedule_migration_preserves_optimizer_and_updates() ->
         forward_online=_forward(online),
         forward_target=_forward(target),
         initial_state=lambda: torch.zeros((1, 2)),
-        config=HybridQConfig(target_update_interval=200),
+        config=HybridQConfig(target_update_interval=25, revival_budget=64),
     )
+    source.observe_heldout(act1_rate=0.8, run_rate=0.25, policy_version=0)
+    for _ in range(50):
+        source.observe_episode_outcome(
+            act1_cleared=True,
+            run_success=False,
+            act1_revivals=10,
+            run_revivals=30,
+        )
     state = source.state_dict()
-    state["version"] = "sts2-hybrid-double-q-v1"
-    state["metrics"].pop("last_target_sync_update", None)
 
-    migrated_online = copy.deepcopy(online)
-    migrated_target = copy.deepcopy(target)
-    migrated = HybridQLearner(
-        online_model=migrated_online,
-        target_model=migrated_target,
+    restored_online = copy.deepcopy(online)
+    restored_target = copy.deepcopy(target)
+    restored = HybridQLearner(
+        online_model=restored_online,
+        target_model=restored_target,
         replay=replay,
-        forward_online=_forward(migrated_online),
-        forward_target=_forward(migrated_target),
+        forward_online=_forward(restored_online),
+        forward_target=_forward(restored_target),
         initial_state=lambda: torch.zeros((1, 2)),
-        config=HybridQConfig(target_update_interval=25),
+        config=HybridQConfig(target_update_interval=25, revival_budget=64),
     )
-    migrated.load_state_dict(state, migrate_target_schedule=True)
-    assert migrated.metrics.updates == source.metrics.updates
-    assert migrated.config.target_update_interval == 25
+    restored.load_state_dict(state)
+    assert restored.metrics.updates == source.metrics.updates
+    assert restored.death_price.as_mapping() == source.death_price.as_mapping()
 
-    with pytest.raises(ValueError):
-        migrated.load_state_dict(state)
+    previous = copy.deepcopy(state)
+    previous["version"] = "sts2-hybrid-double-q-v2"
+    with pytest.raises(ValueError, match="version differs"):
+        restored.load_state_dict(previous)

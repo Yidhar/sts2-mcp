@@ -16,14 +16,17 @@ from typing import Final, Literal
 
 from sts2_rl.encoding import EncodedDecisionSnapshot
 
-HYBRID_TRANSITION_VERSION: Final = "sts2-hybrid-transition-v1"
+HYBRID_TRANSITION_VERSION: Final = "sts2-hybrid-transition-v2"
 
 
 @dataclass(frozen=True, slots=True)
 class HybridStep:
     snapshot: EncodedDecisionSnapshot
     action_index: int
+    # Stable factual reward.  Transition v2 explicitly excludes revival
+    # preference; learner v3 applies one absolute price to ``revivals_delta``.
     reward: float
+    revivals_delta: int
     discount: float
     terminal: bool
     surface: str
@@ -46,6 +49,8 @@ class HybridStep:
             raise ValueError("hybrid step executed an action the mask forbids")
         if not math.isfinite(self.reward):
             raise ValueError("hybrid step reward must be finite")
+        if isinstance(self.revivals_delta, bool) or not isinstance(self.revivals_delta, int) or self.revivals_delta < 0:
+            raise ValueError("hybrid step revivals_delta must be a non-negative integer")
         if not math.isfinite(self.discount) or not 0.0 <= self.discount <= 1.0:
             raise ValueError("hybrid step discount must be in [0, 1]")
         if self.terminal and self.discount != 0.0:
@@ -64,6 +69,8 @@ class HybridStep:
             raise ValueError("hybrid behavior_epsilon must be in [0, 1]")
         if isinstance(self.policy_version, bool) or self.policy_version < 0:
             raise ValueError("hybrid policy_version must be non-negative")
+        if self.version != HYBRID_TRANSITION_VERSION:
+            raise ValueError("hybrid step transition version differs")
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,13 +93,11 @@ class HybridRun:
             raise ValueError("hybrid run must end at the factual run terminal")
         if any(step.terminal for step in self.steps[:-1]):
             raise ValueError("terminal hybrid step must be final")
+        if any(step.version != HYBRID_TRANSITION_VERSION for step in self.steps):
+            raise ValueError("hybrid run contains an incompatible transition")
 
     def indices(self, domain: Literal["macro", "combat"]) -> tuple[int, ...]:
-        return tuple(
-            index
-            for index, step in enumerate(self.steps)
-            if step.control_domain == domain
-        )
+        return tuple(index for index, step in enumerate(self.steps) if step.control_domain == domain)
 
     @property
     def macro_steps(self) -> int:

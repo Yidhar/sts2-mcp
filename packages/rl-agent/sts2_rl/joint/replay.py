@@ -8,9 +8,9 @@ from typing import Any, Final, Literal
 
 import numpy as np
 
-from .transitions import HybridRun
+from .transitions import HYBRID_TRANSITION_VERSION, HybridRun
 
-HYBRID_REPLAY_VERSION: Final = "sts2-hybrid-run-replay-v3"
+HYBRID_REPLAY_VERSION: Final = "sts2-hybrid-run-replay-v4"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +61,11 @@ class HybridRunReplay:
 
     def __len__(self) -> int:
         return len(self._runs)
+
+    @property
+    def runs(self) -> tuple[HybridRun, ...]:
+        """Return immutable factual runs without serializing replay state."""
+        return tuple(self._runs)
 
     @property
     def total_steps(self) -> int:
@@ -222,6 +227,12 @@ class HybridRunReplay:
         runs = tuple(state.get("runs", ()))
         if len(runs) > self.capacity_runs or not all(isinstance(run, HybridRun) for run in runs):
             raise ValueError("hybrid replay runs are invalid")
+        if any(
+            getattr(step, "version", None) != HYBRID_TRANSITION_VERSION
+            for run in runs
+            for step in run.steps
+        ):
+            raise ValueError("hybrid replay transition version differs")
         self._runs = list(runs)
         self._put_count = int(state.get("put_count", len(runs)))
         self._sample_counts = {

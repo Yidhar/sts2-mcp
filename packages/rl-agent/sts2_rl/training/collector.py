@@ -4768,6 +4768,7 @@ class GroundedCollector:
                 _macro_run = next_state.observation.get("run")
                 self.macro_authority.observe_step(
                     reward=float(breakdown.reward),
+                    revivals_delta=int(breakdown.revivals_used_delta),
                     floor=(
                         _macro_run.get("floor")
                         if isinstance(_macro_run, Mapping)

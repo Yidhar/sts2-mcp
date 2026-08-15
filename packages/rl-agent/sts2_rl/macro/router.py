@@ -137,9 +137,21 @@ class JoinedCollectionAuthority:
                 self.combat.close_encounter(snapshot, bridge_value)
         return override
 
-    def observe_step(self, *, reward: float, floor: int | None, terminal: bool) -> None:
+    def observe_step(
+        self,
+        *,
+        reward: float,
+        floor: int | None,
+        terminal: bool,
+        revivals_delta: int = 0,
+    ) -> None:
         for authority in self.authorities:
-            authority.observe_step(reward=reward, floor=floor, terminal=terminal)
+            authority.observe_step(
+                reward=reward,
+                floor=floor,
+                terminal=terminal,
+                revivals_delta=revivals_delta,
+            )
 
     def finish_episodes(
         self,

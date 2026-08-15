@@ -212,9 +212,17 @@ class MacroCollectionAuthority:
             self._auto_counter += 1
             self.begin_episode(f"macro-auto-{self._auto_counter}")
 
-    def observe_step(self, *, reward: float, floor: int | None, terminal: bool) -> None:
+    def observe_step(
+        self,
+        *,
+        reward: float,
+        floor: int | None,
+        terminal: bool,
+        revivals_delta: int = 0,
+    ) -> None:
         """Accumulate factual reward between macro decisions."""
 
+        del revivals_delta  # Isolated stage-two replay already owns its reward.
         self._ensure_episode()
 
         if self._open is not None and math.isfinite(reward):
