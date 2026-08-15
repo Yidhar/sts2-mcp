@@ -1,6 +1,8 @@
 # Hybrid Domain Fusion Candidate-Q v1
 
-Status: implemented experimental successor to the isolated Stage-2 arms.
+Status: factual/model topology retained; the Double-Q control objective was
+retired after the production fallback condition fired. Its active successor is
+`hybrid-recurrent-iql-awac-v1.md`.
 
 This document supersedes the independent-control-trunk ownership described in
 `semantic-decision-graph-reset-v1.md` §7 for the new hybrid lineage.  The old
@@ -123,7 +125,7 @@ Hearthstone type-target taxonomy, hero isolation, or compute recipe. STS2 is
 single-player, has a much longer semantic horizon, and already exposes atomic
 legal candidates. Candidate-Q plus factual run views is our design.
 
-## 7. Permanent mechanism set
+## 7. Original mechanism set and successor boundary
 
 - factual grounded embeddings and relation bindings;
 - atomic semantic legal candidates;
@@ -131,8 +133,9 @@ legal candidates. Candidate-Q plus factual run views is our design.
 - branch-balanced domain exploration;
 - slow run memory and encounter-local combat memory;
 - shallow shared joint core;
-- online/target Double-Q;
-- Huber loss and target network;
+- online/target Double-Q (retired from active control after unsupported
+  candidate peaks appeared; see the IQL/AWAC successor);
+- Huber loss and target network (retained for Q regression in the successor);
 - run-balanced macro/combat replay views;
 - one scalar reward contract.
 

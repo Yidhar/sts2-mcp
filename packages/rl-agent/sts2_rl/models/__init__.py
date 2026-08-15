@@ -26,9 +26,17 @@ from .hybrid_candidate_q import (
     HybridDomainCandidateQModel,
     initialize_hybrid_from_grounded,
 )
+from .hybrid_iql import (
+    HYBRID_IQL_MODEL_VERSION,
+    HybridDomainIQLModel,
+    HybridIQLConfig,
+    HybridIQLOutput,
+    initialize_iql_from_candidate_q,
+)
 
 __all__ = [
     "HYBRID_CANDIDATE_Q_VERSION",
+    "HYBRID_IQL_MODEL_VERSION",
     "MACRO_ECONOMIC_SURFACE_CARD_REWARD",
     "MACRO_ECONOMIC_SURFACE_NONE",
     "MACRO_ECONOMIC_SURFACE_REMOVAL_SELECTION",
@@ -45,9 +53,13 @@ __all__ = [
     "HybridCandidateQConfig",
     "HybridCandidateQOutput",
     "HybridDomainCandidateQModel",
+    "HybridDomainIQLModel",
+    "HybridIQLConfig",
+    "HybridIQLOutput",
     "RecurrentCandidateModel",
     "RecurrentCandidateOutput",
     "WorldEncoding",
     "WorldTokenBatch",
     "initialize_hybrid_from_grounded",
+    "initialize_iql_from_candidate_q",
 ]

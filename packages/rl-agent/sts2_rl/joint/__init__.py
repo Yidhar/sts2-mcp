@@ -21,6 +21,13 @@ from .learner import (
     HybridQLearner,
     HybridQMetrics,
 )
+from .iql_learner import (
+    HYBRID_IQL_LEARNER_VERSION,
+    HybridIQLForward,
+    HybridIQLLearner,
+    HybridIQLLearnerConfig,
+    HybridIQLMetrics,
+)
 from .replay import (
     HYBRID_REPLAY_VERSION,
     DomainView,
@@ -39,6 +46,7 @@ __all__ = [
     "DEATH_PRICE_COURSE_VERSION",
     "HYBRID_AUTHORITY_VERSION",
     "HYBRID_Q_LEARNER_VERSION",
+    "HYBRID_IQL_LEARNER_VERSION",
     "HYBRID_REPLAY_VERSION",
     "HYBRID_TRANSITION_VERSION",
     "AbsoluteDeathPriceController",
@@ -51,6 +59,10 @@ __all__ = [
     "HybridQConfig",
     "HybridQLearner",
     "HybridQMetrics",
+    "HybridIQLForward",
+    "HybridIQLLearner",
+    "HybridIQLLearnerConfig",
+    "HybridIQLMetrics",
     "HybridRun",
     "HybridRunReplay",
     "HybridStep",

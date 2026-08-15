@@ -3,10 +3,10 @@
 Status: accepted written case for the first reward successor to hybrid
 Candidate-Q v1.
 
-This document changes the scalar task target, not the optimizer family.  The
-controller remains one legal-candidate Double-Q model trained by one Huber
-loss.  It adds no Rest/Smith rule, operation-specific CE label, actor loss,
-search policy, or preference head.
+This document owns the scalar task target, not the optimizer family. It was
+first implemented with Candidate Double-Q; the later production fallback to
+recurrent IQL/AWAC leaves this reward contract unchanged. The death price adds
+no Rest/Smith rule, operation-specific label or search policy.
 
 ## 1. Written case
 
@@ -62,16 +62,18 @@ r_effective = r_task_without_revival - lambda * revivals_delta
 budget.  Replay stores the factual `revivals_delta`; the learner applies the
 current price when constructing a target.
 
-### 1.3 Why this is not a second loss
+### 1.3 Why this is not a second preference channel
 
-The only optimization objective remains:
+In the original Candidate-Q implementation the fitting equation was:
 
 ```text
 Huber(Q_online(s, executed_legal_action), DoubleQ_target)
 ```
 
-The price changes what return the model is asked to predict.  It does not add
-a preference regularizer, action label, imitation path, or extra model head.
+The IQL successor instead uses the same priced scalar inside
+`r + gamma * V_target(next_state)`. The price still changes what return the
+critic is asked to predict; it does not add a preference regularizer,
+operation label or imitation sidecar.
 
 ## 2. Three-part control design
 
