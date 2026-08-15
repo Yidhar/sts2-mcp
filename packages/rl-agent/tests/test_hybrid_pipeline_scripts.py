@@ -277,6 +277,14 @@ def test_hybrid_evaluation_is_greedy_and_does_not_write_replay() -> None:
     assert '"event": "hybrid_evaluation_started"' in source
 
 
+def test_hybrid_evaluation_retains_other_policies_and_replaces_same_policy() -> None:
+    source = (SCRIPT_ROOT / "run_hybrid_evaluation.py").read_text(encoding="utf-8")
+    assert "def _retained_evaluation_rows(" in source
+    assert 'row.get("policy_version") == replacing_policy_version' in source
+    assert "for retained in retained_evaluations:" in source
+    assert 'metrics.write(json.dumps(retained) + "\\n")' in source
+
+
 def test_parallel_launcher_runs_final_heldout_after_clean_training() -> None:
     source = (SCRIPT_ROOT / "train_hybrid_parallel_wsl_rocm.sh").read_text(
         encoding="utf-8"
@@ -404,6 +412,62 @@ def test_dashboard_waits_for_current_policy_evaluation_not_old_summary(
     assert progress["policy_version"] == 440
     assert progress["completed_episodes"] == 0
     assert progress["evaluation_episodes"] == 16
+    historical = [row for row in events if row["event"] == "evaluation"]
+    assert [row["policy_version"] for row in historical] == [240]
+
+
+def test_dashboard_projects_evaluation_history_at_each_policy_step(
+    tmp_path: Path,
+) -> None:
+    bridge = _script("run_hybrid_dashboard_bridge.py")
+    run_root = tmp_path / "evaluation-history"
+    (run_root / "launcher").mkdir(parents=True)
+    (run_root / "status").mkdir()
+    (run_root / "launcher" / "launch.json").write_text("{}", encoding="utf-8")
+    (run_root / "status" / "trainer.json").write_text(
+        json.dumps({"state": "complete"}), encoding="utf-8"
+    )
+    for policy, environment_steps in ((240, 139_035), (440, 277_507)):
+        _append(
+            run_root / "metrics" / "trainer.jsonl",
+            {
+                "event": "hybrid_update",
+                "ingested_runs": policy - 40,
+                "environment_steps": environment_steps,
+                "learner": {"updates": policy},
+                "replay": {},
+            },
+        )
+        _append(
+            run_root / "metrics" / "evaluation.jsonl",
+            {
+                "event": "hybrid_evaluation_summary",
+                "policy_version": policy,
+                "episodes": 16,
+                "wins": 5 if policy == 240 else 9,
+                "act1_clears": 14 if policy == 240 else 15,
+                "act3_reaches": 11,
+            },
+        )
+    args = SimpleNamespace(
+        run_root=str(run_root),
+        lineage="hybrid-parallel",
+        run_id="run-evaluation-history",
+        target_runs=400,
+        collector_episode_capacity=220,
+        collector_count=2,
+        collector_device="cuda",
+        maximum_pending_runs=2,
+        revival_budget=64,
+        final_evaluation_episodes=16,
+        curriculum_mode="hybrid-completion-preheat",
+    )
+
+    events = bridge._projection(args)
+
+    evaluations = [row for row in events if row["event"] == "evaluation"]
+    assert [row["policy_version"] for row in evaluations] == [240, 440]
+    assert [row["environment_steps"] for row in evaluations] == [139_035, 277_507]
 
 
 def test_hybrid_checkpoint_uses_streaming_serialization() -> None:

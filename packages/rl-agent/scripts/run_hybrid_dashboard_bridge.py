@@ -160,6 +160,20 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
     )
     source_updates = int(manifest.get("source_learner_updates", 0) or 0)
     learner_updates = int(learner.get("updates", source_updates) or source_updates)
+    environment_steps_by_policy: dict[int, int] = {}
+    for row in trainer_rows:
+        row_learner = row.get("learner")
+        if not isinstance(row_learner, dict):
+            continue
+        row_policy = row_learner.get("updates")
+        row_environment_steps = row.get("environment_steps")
+        if (
+            isinstance(row_policy, int)
+            and not isinstance(row_policy, bool)
+            and isinstance(row_environment_steps, int)
+            and not isinstance(row_environment_steps, bool)
+        ):
+            environment_steps_by_policy[row_policy] = row_environment_steps
     events: list[dict[str, Any]] = [
         {
             "event": "run_start",
@@ -283,14 +297,20 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
         for row in evaluation_rows
         if row.get("policy_version") == current_policy_version
     ]
-    evaluation_summary = next(
-        (
-            row
-            for row in reversed(current_evaluation_rows)
-            if row.get("event") == "hybrid_evaluation_summary"
-        ),
-        None,
-    )
+    evaluation_summaries_by_policy: dict[int, dict[str, Any]] = {}
+    for row in evaluation_rows:
+        row_policy = row.get("policy_version")
+        if (
+            row.get("event") == "hybrid_evaluation_summary"
+            and isinstance(row_policy, int)
+            and not isinstance(row_policy, bool)
+        ):
+            evaluation_summaries_by_policy[row_policy] = row
+    evaluation_summaries = [
+        evaluation_summaries_by_policy[policy]
+        for policy in sorted(evaluation_summaries_by_policy)
+    ]
+    evaluation_summary = evaluation_summaries_by_policy.get(current_policy_version)
     evaluation_started = next(
         (
             row
@@ -359,7 +379,17 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 ),
             }
         )
-    if evaluation_summary is not None:
+    for evaluation_summary in evaluation_summaries:
+        evaluation_policy = int(evaluation_summary.get("policy_version", 0) or 0)
+        evaluation_environment_steps = environment_steps_by_policy.get(
+            evaluation_policy,
+            int(evaluation_summary.get("environment_steps", environment_steps) or 0),
+        )
+        policy_evaluation_rows = [
+            row
+            for row in evaluation_rows
+            if row.get("policy_version") == evaluation_policy
+        ]
         evaluation_count = int(evaluation_summary.get("episodes", 0) or 0)
         evaluation_wins = int(
             evaluation_summary.get(
@@ -391,7 +421,7 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "evaluation_gate": evaluation_summary.get("policy_version"),
                 "gate_kind": "validation",
                 "data_partition": "validation",
-                "environment_steps": environment_steps,
+                "environment_steps": evaluation_environment_steps,
                 "policy_version": evaluation_summary.get("policy_version"),
                 "episodes": evaluation_count,
                 "successful_run_count": evaluation_wins,
@@ -414,7 +444,7 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                     max(
                         (
                             int(row.get("max_floor", 0) or 0)
-                            for row in evaluation_rows
+                            for row in policy_evaluation_rows
                             if row.get("event") == "hybrid_evaluation_episode"
                         ),
                         default=0,

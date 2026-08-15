@@ -37,6 +37,29 @@ from sts2_rl.training.trajectory import TrajectoryJournal
 HYBRID_PUBLICATION = "sts2-hybrid-publication-v1"
 
 
+def _retained_evaluation_rows(
+    path: Path, *, replacing_policy_version: int
+) -> list[dict[str, Any]]:
+    """Keep completed history while replacing a rerun of one policy."""
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    retained: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        if row.get("policy_version") == replacing_policy_version:
+            continue
+        retained.append(row)
+    return retained
+
+
 def _simulator_provenance(config: Any) -> dict[str, Any]:
     """Return the established journal provenance for the active backend."""
 
@@ -170,6 +193,9 @@ def main() -> int:
         output = Path(args.metrics_out)
         output.parent.mkdir(parents=True, exist_ok=True)
         policy_version = int(publication.get("policy_version", 0))
+        retained_evaluations = _retained_evaluation_rows(
+            output, replacing_policy_version=policy_version
+        )
         journal_directory = Path(args.journal_directory)
         journal_directory.mkdir(parents=True, exist_ok=True)
         journal_path = journal_directory / f"evaluation-step-{policy_version:09d}.jsonl"
@@ -181,6 +207,8 @@ def main() -> int:
             output.open("w", encoding="utf-8") as metrics,
             TrajectoryJournal(journal_path) as journal,
         ):
+            for retained in retained_evaluations:
+                metrics.write(json.dumps(retained) + "\n")
             journal.write_episode_boundary(
                 {
                     "event": "evaluation_started",
