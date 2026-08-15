@@ -324,6 +324,17 @@ def _project_learner(event: JsonDict) -> tuple[JsonDict, JsonDict]:
         "hybrid_last_target_sync_update": event.get(
             "hybrid_last_target_sync_update"
         ),
+        "hybrid_death_price_lambda": event.get("hybrid_death_price_lambda"),
+        "hybrid_death_price_statistic": event.get("hybrid_death_price_statistic"),
+        "hybrid_death_price_target": event.get("hybrid_death_price_target"),
+        "hybrid_death_price_act1_ema": event.get("hybrid_death_price_act1_ema"),
+        "hybrid_death_price_run_ema": event.get("hybrid_death_price_run_ema"),
+        "hybrid_death_price_freeze_reason": event.get(
+            "hybrid_death_price_freeze_reason"
+        ),
+        "hybrid_death_price_support_successes": event.get(
+            "hybrid_death_price_support_successes"
+        ),
     }
     latest = {
         **point,

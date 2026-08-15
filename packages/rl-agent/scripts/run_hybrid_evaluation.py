@@ -20,6 +20,10 @@ from typing import Any
 
 import torch
 
+from sts2_baseline import (
+    AbsoluteDeathPriceRewardCalculator,
+    absolute_death_price_reward_identity,
+)
 from sts2_env.headless_sim_bridge_client import resolve_headless_sim_exe
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots
 from sts2_rl.joint import HybridCollectionAuthority
@@ -34,7 +38,7 @@ from sts2_rl.training import (
 from sts2_rl.training.seeding import held_out_evaluation_seeds
 from sts2_rl.training.trajectory import TrajectoryJournal
 
-HYBRID_PUBLICATION = "sts2-hybrid-publication-v1"
+HYBRID_PUBLICATION = "sts2-hybrid-publication-v2"
 
 
 def _retained_evaluation_rows(
@@ -83,6 +87,14 @@ def _summary(
 ) -> dict[str, Any]:
     floors = sorted(int(row["max_floor"]) for row in rows)
     standard = dict(summarize_evaluation(episode_metrics, objective=objective))
+    act1_revivals = [
+        int(row["act1_revivals"])
+        for row in rows
+        if row["act1_cleared"] and row.get("act1_revivals") is not None
+    ]
+    successful_revivals = [
+        int(row["revivals_used"]) for row in rows if row["run_won"]
+    ]
     return {
         **standard,
         # Keep the compact aliases consumed by archived hybrid dashboard
@@ -97,6 +109,14 @@ def _summary(
             sum(int(row["revivals_used"]) for row in rows) / len(rows)
             if rows
             else 0.0
+        ),
+        "mean_act1_revivals_on_clear": (
+            sum(act1_revivals) / len(act1_revivals) if act1_revivals else None
+        ),
+        "mean_revivals_on_success": (
+            sum(successful_revivals) / len(successful_revivals)
+            if successful_revivals
+            else None
         ),
     }
 
@@ -130,6 +150,11 @@ def main() -> int:
     simulator_provenance = _simulator_provenance(config)
     resources = build_training_resources(config)
     try:
+        resources.collector.reward_calculator = AbsoluteDeathPriceRewardCalculator(
+            objective=config.curriculum.reward_objective,
+            discount=config.optimization.discount,
+            maximum_episode_steps=config.environment.max_episode_steps,
+        )
         champion_state = torch.load(
             Path(args.champion) / "network.pt",
             map_location=resources.device,
@@ -163,6 +188,8 @@ def main() -> int:
             raise ValueError("evaluation input is not a hybrid publication")
         if publication.get("model_config") != model.hybrid_config.as_mapping():
             raise ValueError("evaluation publication model config differs")
+        if publication.get("reward_identity") != absolute_death_price_reward_identity():
+            raise ValueError("evaluation publication reward identity differs")
         model.load_state_dict(dict(publication["online"]), strict=True)
         model.eval()
 
@@ -299,6 +326,11 @@ def main() -> int:
                     "max_floor": int(episode.metrics.max_floor),
                     "steps": int(episode.metrics.steps),
                     "revivals_used": int(episode.metrics.revivals_used),
+                    "act1_revivals": (
+                        int(episode.metrics.act_revival_counts[0])
+                        if episode.metrics.act_revival_counts
+                        else None
+                    ),
                     "player_hp_lost": float(episode.metrics.player_hp_lost),
                     "deadlocked": bool(episode.metrics.deadlocked),
                     "combat_progress_stalled": bool(
@@ -324,6 +356,7 @@ def main() -> int:
                     episode_metrics=collected_metrics,
                     objective=resources.collector.objective,
                 ),
+                "death_price": publication.get("death_price"),
             }
             metrics.write(json.dumps(summary) + "\n")
         print(json.dumps(summary, indent=2))

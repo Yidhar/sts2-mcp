@@ -2,8 +2,9 @@
 set -euo pipefail
 
 # Stage-4-style Hybrid pipeline: one ROCm learner, multiple CPU HeadlessSim
-# producers and one small shared spool. A continuation restores the complete
-# learner checkpoint; producer processes and their seed streams are fresh.
+# producers and one small shared spool. Exact continuation restores the full
+# learner state; a reward/budget course boundary explicitly model-initializes
+# network weights and starts with fresh optimizer, replay, counters and RNG.
 
 PACKAGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 ARTIFACT_ROOT="${STS2_ARTIFACT_ROOT:?set STS2_ARTIFACT_ROOT}"
@@ -12,7 +13,8 @@ RUN_RELATIVE="${RUN_ROOT#"$ARTIFACT_ROOT/hybrid_runs/"}"
 DASHBOARD_RUN_ROOT="${STS2_HYBRID_DASHBOARD_RUN_ROOT:-$ARTIFACT_ROOT/runs/$RUN_RELATIVE}"
 CONFIG="${STS2_HYBRID_CONFIG:?set STS2_HYBRID_CONFIG}"
 CHAMPION="${STS2_HYBRID_CHAMPION:?set STS2_HYBRID_CHAMPION}"
-RESUME="${STS2_HYBRID_RESUME:?set STS2_HYBRID_RESUME}"
+RESUME="${STS2_HYBRID_RESUME:-}"
+INITIALIZE_FROM="${STS2_HYBRID_INITIALIZE_FROM:-}"
 LINEAGE_ID="${STS2_HYBRID_LINEAGE_ID:?set STS2_HYBRID_LINEAGE_ID}"
 PIPELINE_ID="${STS2_HYBRID_PIPELINE_ID:-$LINEAGE_ID}"
 COLLECTORS="${STS2_HYBRID_COLLECTORS:-2}"
@@ -23,6 +25,9 @@ MAXIMUM_PENDING="${STS2_HYBRID_MAXIMUM_PENDING_RUNS:-2}"
 SEED_BASE="${STS2_HYBRID_SEED_BASE:-6600000}"
 COLLECTOR_DEVICE="${STS2_HYBRID_COLLECTOR_DEVICE:-cuda}"
 FINAL_EVALUATION_EPISODES="${STS2_HYBRID_FINAL_EVALUATION_EPISODES:-16}"
+STARTUP_EVALUATION_EPISODES="${STS2_HYBRID_STARTUP_EVALUATION_EPISODES:-16}"
+PERIODIC_EVALUATION_EPISODES="${STS2_HYBRID_PERIODIC_EVALUATION_EPISODES:-16}"
+PERIODIC_EVALUATION_RUN_INTERVAL="${STS2_HYBRID_PERIODIC_EVALUATION_RUN_INTERVAL:-50}"
 EVALUATION_DEVICE="${STS2_HYBRID_EVALUATION_DEVICE:-cuda}"
 VENV_DIR="${VENV_DIR:-$ARTIFACT_ROOT/environments/wsl-rocm}"
 SIM_EXE="${STS2_HEADLESS_SIM_EXE:-$ARTIFACT_ROOT/dependencies/sts2-ai/STS2AI/ENV/Sim/HeadlessSim/bin/Release/net9.0/HeadlessSim.exe}"
@@ -32,7 +37,33 @@ SIM_EXE="${STS2_HEADLESS_SIM_EXE:-$ARTIFACT_ROOT/dependencies/sts2-ai/STS2AI/ENV
   echo "[hybrid-par] final evaluation episodes must be non-negative" >&2
   exit 2
 }
-[[ -f "$RESUME" ]] || { echo "[hybrid-par] resume checkpoint missing: $RESUME" >&2; exit 2; }
+[[ "$STARTUP_EVALUATION_EPISODES" -gt 0 ]] || {
+  echo "[hybrid-par] startup held-out episodes must be positive" >&2
+  exit 2
+}
+[[ "$PERIODIC_EVALUATION_EPISODES" -gt 0 ]] || {
+  echo "[hybrid-par] periodic held-out episodes must be positive" >&2
+  exit 2
+}
+[[ "$PERIODIC_EVALUATION_RUN_INTERVAL" -gt 0 ]] || {
+  echo "[hybrid-par] periodic held-out run interval must be positive" >&2
+  exit 2
+}
+if [[ -n "$RESUME" && -n "$INITIALIZE_FROM" ]] || [[ -z "$RESUME" && -z "$INITIALIZE_FROM" ]]; then
+  echo "[hybrid-par] set exactly one of STS2_HYBRID_RESUME or STS2_HYBRID_INITIALIZE_FROM" >&2
+  exit 2
+fi
+MODE_ARGS=()
+if [[ -n "$RESUME" ]]; then
+  [[ -f "$RESUME" ]] || { echo "[hybrid-par] resume checkpoint missing: $RESUME" >&2; exit 2; }
+  MODE_ARGS+=(--resume "$RESUME")
+else
+  [[ -f "$INITIALIZE_FROM" || -d "$INITIALIZE_FROM" ]] || {
+    echo "[hybrid-par] model initialization source missing: $INITIALIZE_FROM" >&2
+    exit 2
+  }
+  MODE_ARGS+=(--initialize-from "$INITIALIZE_FROM")
+fi
 [[ -f "$SIM_EXE" ]] || { echo "[hybrid-par] HeadlessSim missing: $SIM_EXE" >&2; exit 2; }
 
 export VIRTUAL_ENV="$VENV_DIR"
@@ -63,17 +94,26 @@ PRODUCER_ARGS=()
 for index in $(seq 0 $((COLLECTORS - 1))); do
   PRODUCER_ARGS+=(--producer-id "collector-$index")
 done
-MIGRATION_ARGS=()
-if [[ "${STS2_HYBRID_MIGRATE_TARGET_SCHEDULE:-0}" == "1" ]]; then
-  MIGRATION_ARGS+=(--migrate-target-schedule)
-fi
-
 PIDS=()
 COLLECTOR_PIDS=()
 cleanup() {
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
 }
 trap cleanup EXIT INT TERM
+
+trainer_ingested_runs() {
+  python - "$STATUS/trainer.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    print(int(payload.get("ingested_runs", 0)))
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    print(0)
+PY
+}
 
 OMP_NUM_THREADS="${STS2_HYBRID_TRAINER_OMP:-4}" \
 MKL_NUM_THREADS="${STS2_HYBRID_TRAINER_OMP:-4}" \
@@ -88,7 +128,7 @@ python scripts/run_hybrid_trainer.py \
   --lineage-id "$LINEAGE_ID" \
   --pipeline-id "$PIPELINE_ID" \
   "${PRODUCER_ARGS[@]}" \
-  --resume "$RESUME" \
+  "${MODE_ARGS[@]}" \
   --stop-after-runs "$TARGET_RUNS" \
   --updates-per-run "${STS2_HYBRID_UPDATES_PER_RUN:-1}" \
   --ingest-batch-runs "${STS2_HYBRID_INGEST_BATCH_RUNS:-2}" \
@@ -99,7 +139,6 @@ python scripts/run_hybrid_trainer.py \
   --maximum-view-reuse "${STS2_HYBRID_MAXIMUM_VIEW_REUSE:-8}" \
   --maximum-pending-runs "$MAXIMUM_PENDING" \
   --target-update-interval "${STS2_HYBRID_TARGET_UPDATE_INTERVAL:-25}" \
-  "${MIGRATION_ARGS[@]}" \
   --save-interval-runs "${STS2_HYBRID_SAVE_INTERVAL_RUNS:-5}" \
   --publication-interval-runs 1 \
   --device cuda >"$LOGS/trainer.log" 2>&1 &
@@ -116,6 +155,31 @@ for _ in $(seq 1 "$PUBLICATION_WAIT_SECONDS"); do
   sleep 1
 done
 [[ -f "$PUBLICATION" ]] || { echo "[hybrid-par] trainer publication timed out" >&2; exit 1; }
+
+# The controller's held-out floor is a numeric part of the reward-v8
+# contract. Establish (or refresh, for exact continuation) that evidence while
+# the learner is idle, before producers can close the first 50-run block.
+STARTUP_EVALUATION="$RUN_ROOT/evaluation/startup"
+STARTUP_FROZEN_POLICY="$STARTUP_EVALUATION/frozen-policy.pt"
+mkdir -p "$STARTUP_EVALUATION"
+cp -f "$PUBLICATION" "$STARTUP_FROZEN_POLICY"
+echo "[hybrid-par] starting held-out support gate episodes=$STARTUP_EVALUATION_EPISODES"
+python scripts/run_hybrid_evaluation.py \
+  --config "$CONFIG" \
+  --champion "$CHAMPION" \
+  --model-path "$STARTUP_FROZEN_POLICY" \
+  --episodes "$STARTUP_EVALUATION_EPISODES" \
+  --metrics-out "$METRICS/evaluation.jsonl" \
+  --journal-directory "$DASHBOARD_RUN_ROOT" \
+  --device "$EVALUATION_DEVICE" \
+  --sim-exe "$SIM_EXE" >"$LOGS/evaluation-startup.log" 2>&1
+
+CURRENT_INGESTED="$(trainer_ingested_runs)"
+NEXT_PERIODIC_EVALUATION_RUN=$((
+  (CURRENT_INGESTED / PERIODIC_EVALUATION_RUN_INTERVAL + 1)
+  * PERIODIC_EVALUATION_RUN_INTERVAL
+))
+PERIODIC_EVALUATION_PID=""
 
 for index in $(seq 0 $((COLLECTORS - 1))); do
   producer="collector-$index"
@@ -149,6 +213,43 @@ while kill -0 "$TRAINER_PID" 2>/dev/null; do
       exit 1
     fi
   done
+  if [[ -n "$PERIODIC_EVALUATION_PID" ]] \
+    && ! kill -0 "$PERIODIC_EVALUATION_PID" 2>/dev/null; then
+    set +e
+    wait "$PERIODIC_EVALUATION_PID"
+    evaluation_status=$?
+    set -e
+    if [[ "$evaluation_status" -ne 0 ]]; then
+      echo "[hybrid-par] periodic held-out evaluation failed; lambda remains frozen until fresh evidence arrives" >&2
+    fi
+    PERIODIC_EVALUATION_PID=""
+  fi
+  current_ingested="$(trainer_ingested_runs)"
+  if [[ -z "$PERIODIC_EVALUATION_PID" ]] \
+    && [[ "$current_ingested" -ge "$NEXT_PERIODIC_EVALUATION_RUN" ]] \
+    && [[ "$current_ingested" -lt "$TARGET_RUNS" ]]; then
+    while [[ "$NEXT_PERIODIC_EVALUATION_RUN" -le "$current_ingested" ]]; do
+      NEXT_PERIODIC_EVALUATION_RUN=$((
+        NEXT_PERIODIC_EVALUATION_RUN + PERIODIC_EVALUATION_RUN_INTERVAL
+      ))
+    done
+    PERIODIC_EVALUATION="$RUN_ROOT/evaluation/periodic-run-$current_ingested"
+    PERIODIC_FROZEN_POLICY="$PERIODIC_EVALUATION/frozen-policy.pt"
+    mkdir -p "$PERIODIC_EVALUATION"
+    cp -f "$PUBLICATION" "$PERIODIC_FROZEN_POLICY"
+    echo "[hybrid-par] starting periodic held-out evaluation at ingested=$current_ingested episodes=$PERIODIC_EVALUATION_EPISODES"
+    python scripts/run_hybrid_evaluation.py \
+      --config "$CONFIG" \
+      --champion "$CHAMPION" \
+      --model-path "$PERIODIC_FROZEN_POLICY" \
+      --episodes "$PERIODIC_EVALUATION_EPISODES" \
+      --metrics-out "$METRICS/evaluation.jsonl" \
+      --journal-directory "$DASHBOARD_RUN_ROOT" \
+      --device "$EVALUATION_DEVICE" \
+      --sim-exe "$SIM_EXE" >"$LOGS/evaluation-periodic-run-$current_ingested.log" 2>&1 &
+    PERIODIC_EVALUATION_PID=$!
+    PIDS+=("$PERIODIC_EVALUATION_PID")
+  fi
   sleep 2
 done
 set +e
@@ -162,6 +263,16 @@ done
 for collector_pid in "${COLLECTOR_PIDS[@]}"; do
   wait "$collector_pid" 2>/dev/null || true
 done
+if [[ -n "$PERIODIC_EVALUATION_PID" ]]; then
+  set +e
+  wait "$PERIODIC_EVALUATION_PID"
+  evaluation_status=$?
+  set -e
+  if [[ "$evaluation_status" -ne 0 ]]; then
+    echo "[hybrid-par] final in-flight periodic held-out evaluation failed" >&2
+  fi
+  PERIODIC_EVALUATION_PID=""
+fi
 COLLECTOR_PIDS=()
 PIDS=()
 [[ "$status" -eq 0 ]] || exit "$status"

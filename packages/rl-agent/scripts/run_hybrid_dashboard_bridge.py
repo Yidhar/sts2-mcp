@@ -150,7 +150,8 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
         _read_json(path) for path in sorted((run_root / "status").glob("collector-*.json"))
     ]
     latest = trainer_rows[-1] if trainer_rows else {}
-    learner = latest.get("learner") if isinstance(latest.get("learner"), dict) else {}
+    learner_raw = latest.get("learner")
+    learner: dict[str, Any] = learner_raw if isinstance(learner_raw, dict) else {}
     resumed_from = int(manifest.get("resumed_from_ingested_runs", 0) or 0)
     ingested = int(latest.get("ingested_runs", resumed_from) or resumed_from)
     source_environment_steps = int(manifest.get("source_environment_steps", 0) or 0)
@@ -244,6 +245,7 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "producer_id": row.get("producer_id"),
                 "max_floor": row.get("max_floor"),
                 "revivals_used": row.get("revivals_used"),
+                "act1_revivals": row.get("act1_revivals"),
                 "steps": row.get("steps"),
                 "terminal_reason": row.get("terminal_reason"),
                 "run_won": row.get("run_won"),
@@ -253,8 +255,16 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
     for row in trainer_rows:
         if row.get("event") != "hybrid_update":
             continue
-        item = row.get("learner") if isinstance(row.get("learner"), dict) else {}
-        item_replay = row.get("replay") if isinstance(row.get("replay"), dict) else {}
+        item_raw = row.get("learner")
+        item: dict[str, Any] = item_raw if isinstance(item_raw, dict) else {}
+        death_price_raw = item.get("death_price")
+        death_price: dict[str, Any] = (
+            death_price_raw if isinstance(death_price_raw, dict) else {}
+        )
+        item_replay_raw = row.get("replay")
+        item_replay: dict[str, Any] = (
+            item_replay_raw if isinstance(item_replay_raw, dict) else {}
+        )
         events.append(
             {
                 "event": "learner_update",
@@ -273,6 +283,25 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "hybrid_target_syncs": item.get("target_syncs"),
                 "hybrid_last_target_sync_update": item.get(
                     "last_target_sync_update"
+                ),
+                "hybrid_death_price_lambda": death_price.get("lambda_value"),
+                "hybrid_death_price_statistic": death_price.get("active_statistic"),
+                "hybrid_death_price_act1_ema": death_price.get("act1_ema"),
+                "hybrid_death_price_run_ema": death_price.get("run_ema"),
+                "hybrid_death_price_target": (
+                    death_price.get("course", {}).get(
+                        "act1_target"
+                        if death_price.get("active_statistic") == "act1"
+                        else "run_target"
+                    )
+                    if isinstance(death_price.get("course"), dict)
+                    else None
+                ),
+                "hybrid_death_price_freeze_reason": death_price.get(
+                    "freeze_reason"
+                ),
+                "hybrid_death_price_support_successes": death_price.get(
+                    "last_support_successes"
                 ),
                 "rollout_queue": {
                     "size": int(row.get("spool_pending", pending) or 0),

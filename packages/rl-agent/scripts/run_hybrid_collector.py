@@ -16,6 +16,10 @@ from typing import Any
 
 import torch
 
+from sts2_baseline import (
+    AbsoluteDeathPriceRewardCalculator,
+    absolute_death_price_reward_identity,
+)
 from sts2_env.headless_sim_bridge_client import HeadlessSimError
 from sts2_rl.backends.headless import HeadlessRecoverableProtocolError
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots
@@ -24,8 +28,8 @@ from sts2_rl.macro import load_trunk_state
 from sts2_rl.models import HybridCandidateQConfig, HybridDomainCandidateQModel
 from sts2_rl.training import build_backend, build_training_resources, load_training_config
 
-HYBRID_SPOOL_ENVELOPE = "sts2-hybrid-spool-envelope-v1"
-HYBRID_PUBLICATION = "sts2-hybrid-publication-v1"
+HYBRID_SPOOL_ENVELOPE = "sts2-hybrid-spool-envelope-v2"
+HYBRID_PUBLICATION = "sts2-hybrid-publication-v2"
 _RECOVERABLE_BACKEND_ERRORS = (HeadlessRecoverableProtocolError, HeadlessSimError)
 _MAX_BACKEND_RESTARTS = 20
 
@@ -61,8 +65,14 @@ def _episode_summary(
         "reset_seed": int(episode.metrics.reset_seed),
         "steps": int(episode.metrics.steps),
         "run_won": bool(episode.metrics.run_won),
+        "act1_cleared": bool(episode.metrics.act1_cleared),
         "max_floor": int(episode.metrics.max_floor),
         "revivals_used": int(episode.metrics.revivals_used),
+        "act1_revivals": (
+            int(episode.metrics.act_revival_counts[0])
+            if episode.metrics.act_revival_counts
+            else None
+        ),
         "terminal_reason": episode.metrics.terminal_reason,
     }
 
@@ -133,8 +143,15 @@ def main() -> int:
             "candidate_effect_head",
             "selection_delta_head",
         )
+
         def build_resources() -> Any:
             built = build_training_resources(config)
+            # Transition v2 stores stable reward facts before revival pricing.
+            built.collector.reward_calculator = AbsoluteDeathPriceRewardCalculator(
+                objective=config.curriculum.reward_objective,
+                discount=config.optimization.discount,
+                maximum_episode_steps=config.environment.max_episode_steps,
+            )
             for legacy_model in (built.model, built.collector_model):
                 load_trunk_state(
                     legacy_model,
@@ -175,6 +192,8 @@ def main() -> int:
                 raise ValueError("collector publication is not a hybrid publication")
             if payload.get("model_config") != model.hybrid_config.as_mapping():
                 raise ValueError("collector publication model config differs")
+            if payload.get("reward_identity") != absolute_death_price_reward_identity():
+                raise ValueError("collector publication reward identity differs")
             online = payload.get("online")
             if not isinstance(online, Mapping):
                 raise ValueError("hybrid publication has no online model")

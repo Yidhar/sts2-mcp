@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
 SCRIPT_ROOT = Path(__file__).resolve().parents[1] / "scripts"
 
 
@@ -33,9 +35,7 @@ def test_parallel_dashboard_uses_learner_acknowledgement_order(tmp_path: Path) -
         json.dumps({"created_at": "2026-08-13T12:00:00+08:00"}),
         encoding="utf-8",
     )
-    (run_root / "status" / "trainer.json").write_text(
-        json.dumps({"state": "running"}), encoding="utf-8"
-    )
+    (run_root / "status" / "trainer.json").write_text(json.dumps({"state": "running"}), encoding="utf-8")
     # Diagnostic completion order differs from durable trainer ingest order.
     _append(
         run_root / "metrics" / "collector-0.jsonl",
@@ -63,12 +63,24 @@ def test_parallel_dashboard_uses_learner_acknowledgement_order(tmp_path: Path) -
                     "steps": 100,
                     "max_floor": 5,
                     "revivals_used": 1,
+                    "act1_revivals": 1,
                     "terminal_reason": "run_defeat",
                     "run_won": False,
                 },
                 "spool_pending": pending,
                 "spool_capacity": 2,
-                "learner": {"updates": ingested},
+                "learner": {
+                    "updates": ingested,
+                    "death_price": {
+                        "lambda_value": 0.01 + ingested * 0.001,
+                        "active_statistic": "act1",
+                        "act1_ema": 5.0,
+                        "run_ema": None,
+                        "freeze_reason": "none",
+                        "last_support_successes": 12,
+                        "course": {"act1_target": 4.0, "run_target": 16.0},
+                    },
+                },
                 "replay": {},
             },
         )
@@ -89,10 +101,14 @@ def test_parallel_dashboard_uses_learner_acknowledgement_order(tmp_path: Path) -
     episodes = [row for row in events if row["event"] == "train_episode"]
     assert [row["producer_id"] for row in episodes] == ["collector-0", "collector-1"]
     assert [row["reset_seed"] for row in episodes] == [10, 20]
+    assert [row["act1_revivals"] for row in episodes] == [1, 1]
     assert events[0]["config"]["runtime"]["collector_workers"] == 2
     assert events[0]["config"]["runtime"]["collector_device"] == "cuda"
     updates = [row for row in events if row["event"] == "learner_update"]
     assert [row["rollout_queue"]["size"] for row in updates] == [1, 0]
+    assert updates[-1]["hybrid_death_price_lambda"] == pytest.approx(0.012)
+    assert updates[-1]["hybrid_death_price_target"] == 4.0
+    assert updates[-1]["hybrid_death_price_support_successes"] == 12
 
 
 def test_parallel_dashboard_resume_starts_at_checkpoint_counters(tmp_path: Path) -> None:
@@ -111,9 +127,7 @@ def test_parallel_dashboard_resume_starts_at_checkpoint_counters(tmp_path: Path)
         ),
         encoding="utf-8",
     )
-    (run_root / "status" / "trainer.json").write_text(
-        json.dumps({"state": "running"}), encoding="utf-8"
-    )
+    (run_root / "status" / "trainer.json").write_text(json.dumps({"state": "running"}), encoding="utf-8")
     _append(
         run_root / "metrics" / "trainer.jsonl",
         {
@@ -157,23 +171,48 @@ def test_parallel_dashboard_resume_starts_at_checkpoint_counters(tmp_path: Path)
 
 
 def test_parallel_launcher_defaults_to_two_collectors_and_one_update() -> None:
-    script = (SCRIPT_ROOT / "train_hybrid_parallel_wsl_rocm.sh").read_text(
-        encoding="utf-8"
-    )
+    script = (SCRIPT_ROOT / "train_hybrid_parallel_wsl_rocm.sh").read_text(encoding="utf-8")
     assert 'COLLECTORS="${STS2_HYBRID_COLLECTORS:-2}"' in script
     assert '--updates-per-run "${STS2_HYBRID_UPDATES_PER_RUN:-1}"' in script
     assert '--ingest-batch-runs "${STS2_HYBRID_INGEST_BATCH_RUNS:-2}"' in script
     assert '--target-update-interval "${STS2_HYBRID_TARGET_UPDATE_INTERVAL:-25}"' in script
     assert "target-sync-every-runs" not in script
-    assert 'MIGRATION_ARGS+=(--migrate-target-schedule)' in script
+    assert "--migrate-target-schedule" not in script
+    assert 'INITIALIZE_FROM="${STS2_HYBRID_INITIALIZE_FROM:-}"' in script
+    assert 'MODE_ARGS+=(--initialize-from "$INITIALIZE_FROM")' in script
+    assert 'MODE_ARGS+=(--resume "$RESUME")' in script
     assert 'COLLECTOR_DEVICE="${STS2_HYBRID_COLLECTOR_DEVICE:-cuda}"' in script
     assert 'COLLECTOR_START_EPISODE="${STS2_HYBRID_COLLECTOR_START_EPISODE:-0}"' in script
-    assert "--producer-id \"collector-$index\"" in script
+    assert '--producer-id "collector-$index"' in script
     assert '--start-episode-index "$COLLECTOR_START_EPISODE"' in script
     assert 'COLLECTOR_PIDS+=("$!")' in script
     assert "exited while learner was running" in script
     assert 'rm -f "$PUBLICATION"' in script
     assert 'PUBLICATION_WAIT_SECONDS="${STS2_HYBRID_PUBLICATION_WAIT_SECONDS:-600}"' in script
+
+
+def test_parallel_launcher_refreshes_heldout_gate_every_control_block() -> None:
+    script = (SCRIPT_ROOT / "train_hybrid_parallel_wsl_rocm.sh").read_text(encoding="utf-8")
+    assert "STS2_HYBRID_PERIODIC_EVALUATION_RUN_INTERVAL:-50" in script
+    assert "STS2_HYBRID_PERIODIC_EVALUATION_EPISODES:-16" in script
+    assert 'PERIODIC_EVALUATION="$RUN_ROOT/evaluation/periodic-run-$current_ingested"' in script
+    assert 'cp -f "$PUBLICATION" "$PERIODIC_FROZEN_POLICY"' in script
+    assert "PERIODIC_EVALUATION_PID=$!" in script
+    assert '[[ -z "$PERIODIC_EVALUATION_PID" ]]' in script
+    assert "lambda remains frozen until fresh evidence arrives" in script
+
+
+def test_v8_q_calibration_preserves_early_update_debt_and_disables_dropout() -> None:
+    source = (SCRIPT_ROOT / "run_hybrid_trainer.py").read_text(encoding="utf-8")
+    assert "runs = replay.runs" in source
+    assert "online.eval()" in source
+    assert "target.eval()" in source
+    assert "online.train(online_was_training)" in source
+    assert "target.train(target_was_training)" in source
+    assert "pending_learner_updates += args.updates_per_run * len(accepted)" in source
+    assert "while pending_learner_updates > 0:" in source
+    assert "pending_learner_updates -= 1" in source
+    assert '"pending_learner_updates": pending_learner_updates' in source
 
 
 def test_parallel_dashboard_surfaces_collector_failure(tmp_path: Path) -> None:
@@ -182,9 +221,7 @@ def test_parallel_dashboard_surfaces_collector_failure(tmp_path: Path) -> None:
     (run_root / "launcher").mkdir(parents=True)
     (run_root / "status").mkdir()
     (run_root / "launcher" / "launch.json").write_text("{}", encoding="utf-8")
-    (run_root / "status" / "trainer.json").write_text(
-        json.dumps({"state": "running"}), encoding="utf-8"
-    )
+    (run_root / "status" / "trainer.json").write_text(json.dumps({"state": "running"}), encoding="utf-8")
     (run_root / "status" / "collector-0.json").write_text(
         json.dumps(
             {
@@ -251,8 +288,8 @@ def test_exact_resume_republishes_without_rewriting_the_replay_checkpoint() -> N
     loop = source.index("        spool = Path(args.spool)", startup)
     block = source[startup:loop]
     assert "publish()" in block
-    assert "if schedule_migration is not None:\n                save()" in block
     assert "else:\n            save()" in block
+    assert "schedule_migration" not in source
 
 
 def test_trainer_discards_uncheckpointed_metric_tail_before_resume() -> None:
@@ -286,16 +323,23 @@ def test_hybrid_evaluation_retains_other_policies_and_replaces_same_policy() -> 
 
 
 def test_parallel_launcher_runs_final_heldout_after_clean_training() -> None:
-    source = (SCRIPT_ROOT / "train_hybrid_parallel_wsl_rocm.sh").read_text(
-        encoding="utf-8"
-    )
+    source = (SCRIPT_ROOT / "train_hybrid_parallel_wsl_rocm.sh").read_text(encoding="utf-8")
     trainer_exit = source.index('[[ "$status" -eq 0 ]] || exit "$status"')
-    evaluation = source.index("python scripts/run_hybrid_evaluation.py")
+    evaluation = source.rindex("python scripts/run_hybrid_evaluation.py")
     assert trainer_exit < evaluation
-    assert 'STS2_HYBRID_FINAL_EVALUATION_EPISODES:-16' in source
+    assert "STS2_HYBRID_FINAL_EVALUATION_EPISODES:-16" in source
     assert 'cp -f "$PUBLICATION" "$FROZEN_POLICY"' in source
     assert '--metrics-out "$METRICS/evaluation.jsonl"' in source
     assert '--journal-directory "$DASHBOARD_RUN_ROOT"' in source
+
+
+def test_parallel_launcher_establishes_heldout_floor_before_collection() -> None:
+    source = (SCRIPT_ROOT / "train_hybrid_parallel_wsl_rocm.sh").read_text(encoding="utf-8")
+    startup_evaluation = source.index("python scripts/run_hybrid_evaluation.py")
+    first_collector = source.index("python scripts/run_hybrid_collector.py")
+    assert startup_evaluation < first_collector
+    assert "STS2_HYBRID_STARTUP_EVALUATION_EPISODES:-16" in source
+    assert '--metrics-out "$METRICS/evaluation.jsonl"' in source
 
 
 def test_parallel_dashboard_preserves_standard_hybrid_evaluation_fields(
@@ -306,9 +350,7 @@ def test_parallel_dashboard_preserves_standard_hybrid_evaluation_fields(
     (run_root / "launcher").mkdir(parents=True)
     (run_root / "status").mkdir()
     (run_root / "launcher" / "launch.json").write_text("{}", encoding="utf-8")
-    (run_root / "status" / "trainer.json").write_text(
-        json.dumps({"state": "complete"}), encoding="utf-8"
-    )
+    (run_root / "status" / "trainer.json").write_text(json.dumps({"state": "complete"}), encoding="utf-8")
     _append(
         run_root / "metrics" / "trainer.jsonl",
         {
@@ -335,6 +377,8 @@ def test_parallel_dashboard_preserves_standard_hybrid_evaluation_fields(
             "mean_max_floor": 39.4375,
             "maximum_floor": 46,
             "mean_revivals_used": 51.3125,
+            "mean_act1_revivals_on_clear": 7.25,
+            "mean_revivals_on_success": 38.5,
             "mean_player_hp_lost": 900.0,
             "deadlock_rate": 0.0,
         },
@@ -351,14 +395,14 @@ def test_parallel_dashboard_preserves_standard_hybrid_evaluation_fields(
         revival_budget=64,
         curriculum_mode="hybrid-completion-preheat",
     )
-    evaluation = next(
-        row for row in bridge._projection(args) if row["event"] == "evaluation"
-    )
+    evaluation = next(row for row in bridge._projection(args) if row["event"] == "evaluation")
     assert evaluation["act1_clear_count"] == 14
     assert evaluation["act3_reach_count"] == 11
     assert evaluation["act3_reach_rate"] == 11 / 16
     assert evaluation["successful_run_count"] == 5
     assert evaluation["mean_player_hp_lost"] == 900.0
+    assert evaluation["mean_act1_revivals_on_clear"] == 7.25
+    assert evaluation["mean_revivals_on_success"] == 38.5
 
 
 def test_dashboard_waits_for_current_policy_evaluation_not_old_summary(
@@ -369,9 +413,7 @@ def test_dashboard_waits_for_current_policy_evaluation_not_old_summary(
     (run_root / "launcher").mkdir(parents=True)
     (run_root / "status").mkdir()
     (run_root / "launcher" / "launch.json").write_text("{}", encoding="utf-8")
-    (run_root / "status" / "trainer.json").write_text(
-        json.dumps({"state": "complete"}), encoding="utf-8"
-    )
+    (run_root / "status" / "trainer.json").write_text(json.dumps({"state": "complete"}), encoding="utf-8")
     _append(
         run_root / "metrics" / "trainer.jsonl",
         {
@@ -424,9 +466,7 @@ def test_dashboard_projects_evaluation_history_at_each_policy_step(
     (run_root / "launcher").mkdir(parents=True)
     (run_root / "status").mkdir()
     (run_root / "launcher" / "launch.json").write_text("{}", encoding="utf-8")
-    (run_root / "status" / "trainer.json").write_text(
-        json.dumps({"state": "complete"}), encoding="utf-8"
-    )
+    (run_root / "status" / "trainer.json").write_text(json.dumps({"state": "complete"}), encoding="utf-8")
     for policy, environment_steps in ((240, 139_035), (440, 277_507)):
         _append(
             run_root / "metrics" / "trainer.jsonl",
@@ -476,27 +516,20 @@ def test_hybrid_checkpoint_uses_streaming_serialization() -> None:
 
 
 def test_windows_supervisor_marks_native_wsl_exit() -> None:
-    source = (SCRIPT_ROOT / "run_hybrid_parallel_windows.ps1").read_text(
-        encoding="utf-8"
-    )
+    source = (SCRIPT_ROOT / "run_hybrid_parallel_windows.ps1").read_text(encoding="utf-8")
     assert 'state = "interrupted"' in source
     assert 'error = "native_wsl_exit:$exitCode"' in source
 
 
 def test_dashboard_replaces_abandoned_tail_after_in_place_resume() -> None:
     bridge = _script("run_hybrid_dashboard_bridge.py")
-    rows = [
-        {"event": "hybrid_update", "ingested_runs": value}
-        for value in (44, 45, 46, 47, 46, 47, 48)
-    ]
+    rows = [{"event": "hybrid_update", "ingested_runs": value} for value in (44, 45, 46, 47, 46, 47, 48)]
     canonical = bridge._canonical_trainer_rows(rows)
     assert [row["ingested_runs"] for row in canonical] == [44, 45, 46, 47, 48]
 
 
 def test_dashboard_reads_hybrid_evaluation_summary() -> None:
-    source = (SCRIPT_ROOT / "run_hybrid_dashboard_bridge.py").read_text(
-        encoding="utf-8"
-    )
+    source = (SCRIPT_ROOT / "run_hybrid_dashboard_bridge.py").read_text(encoding="utf-8")
     assert 'run_root / "metrics" / "evaluation.jsonl"' in source
     assert '"event": "evaluation"' in source
     assert '"hybrid_target_syncs": item.get("target_syncs")' in source
