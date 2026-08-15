@@ -636,6 +636,12 @@ class MacroCollectionAuthority:
         # singleton or epsilon-explored one.  Replay sees the same sequence.
         values = self._q_values(snapshot)
         self.last_q_values = values.detach().float().cpu().numpy().copy()
+        if not bool(np.isfinite(self.last_q_values).all()):
+            finite = int(np.count_nonzero(np.isfinite(self.last_q_values)))
+            raise FloatingPointError(
+                "semantic controller published non-finite control scores: "
+                f"finite={finite}/{self.last_q_values.size}"
+            )
         # Publish the greedy legal value of this OWNED decision — the max over
         # the executable candidates' Q under the live recurrent state — no
         # matter which action the epsilon draw below actually executes.

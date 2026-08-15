@@ -279,6 +279,23 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "hybrid_combat_loss": item.get("combat_loss"),
                 "hybrid_macro_td_abs": item.get("macro_td_abs"),
                 "hybrid_combat_td_abs": item.get("combat_td_abs"),
+                "hybrid_macro_q_loss": item.get("macro_q_loss"),
+                "hybrid_combat_q_loss": item.get("combat_q_loss"),
+                "hybrid_macro_value_loss": item.get("macro_value_loss"),
+                "hybrid_combat_value_loss": item.get("combat_value_loss"),
+                "hybrid_macro_actor_loss": item.get("macro_actor_loss"),
+                "hybrid_combat_actor_loss": item.get("combat_actor_loss"),
+                "hybrid_policy_entropy": item.get("mean_policy_entropy"),
+                "hybrid_mean_advantage_weight": item.get(
+                    "mean_advantage_weight"
+                ),
+                "hybrid_maximum_advantage_weight": item.get(
+                    "maximum_advantage_weight"
+                ),
+                "hybrid_critic_gradient_norm": item.get(
+                    "critic_gradient_norm"
+                ),
+                "hybrid_actor_gradient_norm": item.get("actor_gradient_norm"),
                 "hybrid_shared_gradient_cosine": item.get("shared_gradient_cosine"),
                 "hybrid_target_syncs": item.get("target_syncs"),
                 "hybrid_last_target_sync_update": item.get(

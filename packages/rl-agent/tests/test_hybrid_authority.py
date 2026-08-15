@@ -130,6 +130,29 @@ def test_hybrid_authority_publishes_candidate_q_for_exclusive_collector() -> Non
     )
 
 
+def test_hybrid_authority_reports_nonfinite_control_scores_at_the_source() -> None:
+    authority = HybridCollectionAuthority(
+        forward_q=lambda snapshot, hidden: (
+            torch.tensor([0.0, float("nan")])[: len(snapshot.action_mask)],
+            hidden,
+        ),
+        initial_state=lambda: None,
+        epsilon=0.0,
+        evaluation_ownership=True,
+    )
+    authority.begin_episode("nonfinite")
+    with pytest.raises(
+        FloatingPointError,
+        match=r"non-finite control scores: finite=1/2",
+    ):
+        authority.choose(
+            observation=_rest_observation(),
+            semantic_actions=_REST_ACTIONS,
+            snapshot=_snapshot(candidate_count=2),
+            valid=np.ones(2, dtype=np.bool_),
+        )
+
+
 def test_semantic_targets_map_back_to_one_native_entry() -> None:
     deck = [
         {

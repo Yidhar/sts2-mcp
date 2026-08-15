@@ -319,6 +319,21 @@ def _project_learner(event: JsonDict) -> tuple[JsonDict, JsonDict]:
         "hybrid_combat_loss": event.get("hybrid_combat_loss"),
         "hybrid_macro_td_abs": event.get("hybrid_macro_td_abs"),
         "hybrid_combat_td_abs": event.get("hybrid_combat_td_abs"),
+        "hybrid_macro_q_loss": event.get("hybrid_macro_q_loss"),
+        "hybrid_combat_q_loss": event.get("hybrid_combat_q_loss"),
+        "hybrid_macro_value_loss": event.get("hybrid_macro_value_loss"),
+        "hybrid_combat_value_loss": event.get("hybrid_combat_value_loss"),
+        "hybrid_macro_actor_loss": event.get("hybrid_macro_actor_loss"),
+        "hybrid_combat_actor_loss": event.get("hybrid_combat_actor_loss"),
+        "hybrid_policy_entropy": event.get("hybrid_policy_entropy"),
+        "hybrid_mean_advantage_weight": event.get(
+            "hybrid_mean_advantage_weight"
+        ),
+        "hybrid_maximum_advantage_weight": event.get(
+            "hybrid_maximum_advantage_weight"
+        ),
+        "hybrid_critic_gradient_norm": event.get("hybrid_critic_gradient_norm"),
+        "hybrid_actor_gradient_norm": event.get("hybrid_actor_gradient_norm"),
         "hybrid_shared_gradient_cosine": event.get("hybrid_shared_gradient_cosine"),
         "hybrid_target_syncs": event.get("hybrid_target_syncs"),
         "hybrid_last_target_sync_update": event.get(

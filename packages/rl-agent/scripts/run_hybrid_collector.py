@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect complete mixed-domain runs for the hybrid Candidate-Q learner."""
+"""Collect complete mixed-domain runs for the hybrid IQL/AWAC learner."""
 
 from __future__ import annotations
 
@@ -25,11 +25,11 @@ from sts2_rl.backends.headless import HeadlessRecoverableProtocolError
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots
 from sts2_rl.joint import DomainExplorationSchedule, HybridCollectionAuthority
 from sts2_rl.macro import load_trunk_state
-from sts2_rl.models import HybridCandidateQConfig, HybridDomainCandidateQModel
+from sts2_rl.models import HybridDomainIQLModel, HybridIQLConfig
 from sts2_rl.training import build_backend, build_training_resources, load_training_config
 
 HYBRID_SPOOL_ENVELOPE = "sts2-hybrid-spool-envelope-v2"
-HYBRID_PUBLICATION = "sts2-hybrid-publication-v2"
+HYBRID_PUBLICATION = "sts2-hybrid-publication-v3"
 _RECOVERABLE_BACKEND_ERRORS = (HeadlessRecoverableProtocolError, HeadlessSimError)
 _MAX_BACKEND_RESTARTS = 20
 
@@ -161,8 +161,8 @@ def main() -> int:
             return built
 
         resources = build_resources()
-        model = HybridDomainCandidateQModel(
-            HybridCandidateQConfig(config.model.to_model_config())
+        model = HybridDomainIQLModel(
+            HybridIQLConfig(config.model.to_model_config())
         ).to(resources.device)
         model_path = Path(args.model_path)
         if not model_path.is_file():
@@ -190,13 +190,24 @@ def main() -> int:
                 return False
             if not isinstance(payload, Mapping) or payload.get("format") != HYBRID_PUBLICATION:
                 raise ValueError("collector publication is not a hybrid publication")
-            if payload.get("model_config") != model.hybrid_config.as_mapping():
+            if payload.get("model_config") != model.iql_config.as_mapping():
                 raise ValueError("collector publication model config differs")
             if payload.get("reward_identity") != absolute_death_price_reward_identity():
                 raise ValueError("collector publication reward identity differs")
             online = payload.get("online")
             if not isinstance(online, Mapping):
                 raise ValueError("hybrid publication has no online model")
+            bad = [
+                name
+                for name, value in online.items()
+                if torch.is_tensor(value)
+                and value.is_floating_point()
+                and not bool(torch.isfinite(value).all().item())
+            ]
+            if bad:
+                if initial or model_mtime == 0:
+                    raise FloatingPointError("initial hybrid IQL publication is non-finite")
+                return False
             model.load_state_dict(dict(online), strict=True)
             model.eval()
             model_mtime = mtime
@@ -216,7 +227,7 @@ def main() -> int:
                 hidden = model.initial_state(1, device=resources.device)
             with torch.no_grad():
                 output = model(encoded, hidden, validate=False)
-            return output.q_values[0], output.recurrent_state.detach()
+            return output.policy_logits[0], output.recurrent_state.detach()
 
         macro_schedule = DomainExplorationSchedule(
             start=config.curriculum.epsilon_start,

@@ -1,0 +1,37 @@
+# Short isolation course for the recurrent IQL/AWAC hybrid successor.
+#
+# The factual environment and reward-v8 death-price contract are unchanged.
+# The model is initialized from the last healthy Candidate-Q policy, while
+# optimizer, replay, target clock and actor/value heads start a new lineage.
+
+[optimization]
+learning_rate = 0.0001
+
+[transaction_learning]
+enabled = false
+
+[failure_credit]
+mode = "disabled"
+
+[rollout]
+deterministic_probe_interval_episodes = 0
+deterministic_probe_environment_steps = []
+
+[episodic_learning]
+enabled = false
+
+[curriculum]
+revival_budget = 64
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 100000
+
+[runtime]
+rocm_sdpa_backend = "math"
+seed = 6600000
+log_dir = "runs/hybrid-iql-v1-reward-v8-budget64-isolation"
+checkpoint_dir = "checkpoints/hybrid-iql-v1-reward-v8-budget64-isolation"
+evaluation_steps = []
+early_evaluation_steps = []
+final_audit_steps = []
+evaluation_liveness_guard_enabled = false

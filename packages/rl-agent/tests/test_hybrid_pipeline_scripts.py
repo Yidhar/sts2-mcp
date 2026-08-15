@@ -278,6 +278,17 @@ def test_trainer_publication_uses_unique_atomic_replacement() -> None:
     source = (SCRIPT_ROOT / "run_hybrid_trainer.py").read_text(encoding="utf-8")
     assert "uuid.uuid4().hex" in source
     assert "os.replace(publication_temporary, publication)" in source
+    assert "require_finite_model(online" in source
+
+
+def test_iql_collection_and_evaluation_are_owned_by_policy_logits() -> None:
+    collector = (SCRIPT_ROOT / "run_hybrid_collector.py").read_text(encoding="utf-8")
+    evaluation = (SCRIPT_ROOT / "run_hybrid_evaluation.py").read_text(encoding="utf-8")
+    trainer = (SCRIPT_ROOT / "run_hybrid_trainer.py").read_text(encoding="utf-8")
+    assert "return output.policy_logits[0]" in collector
+    assert "return output.policy_logits[0]" in evaluation
+    assert '"control_scores": "policy_logits"' in trainer
+    assert "initial hybrid IQL publication is non-finite" in collector
 
 
 def test_exact_resume_republishes_without_rewriting_the_replay_checkpoint() -> None:

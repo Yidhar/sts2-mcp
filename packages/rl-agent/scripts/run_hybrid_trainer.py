@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified hybrid candidate-Q trainer over spooled complete factual runs."""
+"""Unified recurrent hybrid IQL/AWAC trainer over complete factual runs."""
 
 from __future__ import annotations
 
@@ -21,19 +21,26 @@ import torch
 
 from sts2_baseline import absolute_death_price_reward_identity
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots
-from sts2_rl.joint import HybridQConfig, HybridQLearner, HybridRun, HybridRunReplay
+from sts2_rl.joint import (
+    HybridIQLLearner,
+    HybridIQLLearnerConfig,
+    HybridRun,
+    HybridRunReplay,
+)
 from sts2_rl.models import (
-    HybridCandidateQConfig,
-    HybridDomainCandidateQModel,
-    initialize_hybrid_from_grounded,
+    HybridDomainIQLModel,
+    HybridIQLConfig,
+    initialize_iql_from_candidate_q,
 )
 from sts2_rl.training import load_training_config
 from sts2_rl.training.sdpa import configure_rocm_sdpa_backend
 
-HYBRID_TRAINING_STATE = "sts2-hybrid-training-state-v2"
+HYBRID_TRAINING_STATE = "sts2-hybrid-training-state-v3"
+_CANDIDATE_Q_TRAINING_STATE = "sts2-hybrid-training-state-v2"
 _PREVIOUS_HYBRID_TRAINING_STATE = "sts2-hybrid-training-state-v1"
 HYBRID_SPOOL_ENVELOPE = "sts2-hybrid-spool-envelope-v2"
-HYBRID_PUBLICATION = "sts2-hybrid-publication-v2"
+HYBRID_PUBLICATION = "sts2-hybrid-publication-v3"
+_CANDIDATE_Q_PUBLICATION = "sts2-hybrid-publication-v2"
 _PREVIOUS_HYBRID_PUBLICATION = "sts2-hybrid-publication-v1"
 _Q_SCALE_CALIBRATION_THRESHOLD = 0.05
 
@@ -130,8 +137,11 @@ def _source_death_price(source: Mapping[str, Any]) -> float | None:
     return None
 
 
-def _forward(model: HybridDomainCandidateQModel, encoder: Any, device: torch.device) -> Any:
-    def call(step: Any, hidden: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+def _forward(model: HybridDomainIQLModel, encoder: Any, device: torch.device) -> Any:
+    def call(
+        step: Any,
+        hidden: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         encoded = collate_encoded_snapshots(
             (step.snapshot,),
             expected_config=encoder.config,
@@ -141,7 +151,12 @@ def _forward(model: HybridDomainCandidateQModel, encoder: Any, device: torch.dev
         if hidden is None:
             hidden = model.initial_state(1, device=device)
         output = model(encoded, hidden, validate=False)
-        return output.q_values[0], output.recurrent_state
+        return (
+            output.q_values[0],
+            output.state_value[0],
+            output.policy_logits[0],
+            output.recurrent_state,
+        )
 
     return call
 
@@ -224,8 +239,8 @@ def main() -> int:
 
         encoder = GroundedObservationEncoder(encoder_config)
         grounded_config = config.model.to_model_config()
-        hybrid_config = HybridCandidateQConfig(grounded_config)
-        online = HybridDomainCandidateQModel(hybrid_config).to(device)
+        hybrid_config = HybridIQLConfig(grounded_config)
+        online = HybridDomainIQLModel(hybrid_config).to(device)
         target = copy.deepcopy(online).to(device)
         replay = HybridRunReplay(
             capacity_runs=args.replay_runs,
@@ -234,14 +249,14 @@ def main() -> int:
             maximum_view_reuse=args.maximum_view_reuse,
             seed=config.runtime.seed,
         )
-        learner = HybridQLearner(
+        learner = HybridIQLLearner(
             online_model=online,
             target_model=target,
             replay=replay,
             forward_online=_forward(online, encoder, device),
             forward_target=_forward(target, encoder, device),
             initial_state=lambda: online.initial_state(1, device=device),
-            config=HybridQConfig(
+            config=HybridIQLLearnerConfig(
                 learning_rate=config.optimization.learning_rate,
                 run_batch_size=args.run_batch_size,
                 target_update_interval=args.target_update_interval,
@@ -302,23 +317,54 @@ def main() -> int:
                 and state.get("format")
                 in {
                     HYBRID_PUBLICATION,
+                    _CANDIDATE_Q_PUBLICATION,
                     _PREVIOUS_HYBRID_PUBLICATION,
                     HYBRID_TRAINING_STATE,
+                    _CANDIDATE_Q_TRAINING_STATE,
                     _PREVIOUS_HYBRID_TRAINING_STATE,
                 }
                 else state
             )
             if not isinstance(source_state, Mapping):
                 raise ValueError("hybrid initialization has no model state")
-            initialize_hybrid_from_grounded(online, dict(source_state))
+            source_format = state.get("format") if isinstance(state, Mapping) else None
+            if source_format == HYBRID_PUBLICATION:
+                if state.get("model_config") != hybrid_config.as_mapping():
+                    raise ValueError("IQL model-init source config differs")
+                online.load_state_dict(dict(source_state), strict=True)
+            elif source_format == _CANDIDATE_Q_PUBLICATION:
+                initialize_iql_from_candidate_q(online, dict(source_state))
+            else:
+                raise ValueError(
+                    "hybrid IQL model-init requires a finite Candidate-Q or IQL publication"
+                )
             target.load_state_dict(online.state_dict(), strict=True)
+            # Candidate-Q v8 parents already completed their one-time scalar
+            # calibration.  IQL inherits that Q scale; its V head starts on
+            # the same offset and is fitted by the expectile objective.
+            q_scale_calibrated = True
             inherited_price = _source_death_price(state)
             if inherited_price is not None:
                 learner.initialize_death_price(inherited_price)
             elif revival_budget not in {0, 64}:
                 raise ValueError("a tighter death-price course requires a v8 source lambda")
 
+        def require_finite_model(model: torch.nn.Module, *, label: str) -> None:
+            bad = [
+                name
+                for name, value in model.state_dict().items()
+                if value.is_floating_point() and not bool(torch.isfinite(value).all().item())
+            ]
+            if bad:
+                raise FloatingPointError(
+                    f"{label} contains non-finite model tensors: {', '.join(bad[:8])}"
+                )
+
         def publish() -> None:
+            # The preceding production failure published NaN weights and then
+            # killed both collectors.  A publication is now a finite model
+            # boundary, not a best-effort serialization point.
+            require_finite_model(online, label="hybrid IQL publication")
             publication = Path(args.publication)
             publication.parent.mkdir(parents=True, exist_ok=True)
             # A fixed ``network.pt.tmp`` is not safe once collectors reload in
@@ -336,6 +382,7 @@ def main() -> int:
                         "reward_identity": reward_identity,
                         "online": online.state_dict(),
                         "policy_version": int(learner.metrics.updates),
+                        "control_scores": "policy_logits",
                         "domain_decisions": dict(domain_decisions),
                         "death_price": learner.death_price.as_mapping(),
                     },
@@ -346,6 +393,8 @@ def main() -> int:
                 publication_temporary.unlink(missing_ok=True)
 
         def save() -> None:
+            require_finite_model(online, label="hybrid IQL checkpoint online model")
+            require_finite_model(target, label="hybrid IQL checkpoint target model")
             checkpoint = Path(args.checkpoint_out)
             checkpoint.parent.mkdir(parents=True, exist_ok=True)
             temporary = checkpoint.with_suffix(checkpoint.suffix + ".tmp")
@@ -451,7 +500,7 @@ def main() -> int:
                 with torch.no_grad():
                     for run, index in sampled_steps:
                         online_state, _ = learner._state_before(run, index)
-                        values, _ = learner.forward_online(run.steps[index], online_state)
+                        values, _, _, _ = learner.forward_online(run.steps[index], online_state)
                         count = len(run.steps[index].snapshot.action_mask)
                         legal = values[:count]
                         mask = torch.tensor(
@@ -476,6 +525,10 @@ def main() -> int:
                         if not isinstance(final_layer, torch.nn.Linear):
                             raise TypeError("hybrid Candidate-Q final layer is not linear")
                         final_layer.bias.add_(delta)
+                        value_final = model.state_value_head[-1]
+                        if not isinstance(value_final, torch.nn.Linear):
+                            raise TypeError("hybrid IQL value head final layer is not linear")
+                        value_final.bias.add_(delta)
             return {
                 "event": "hybrid_q_scale_calibration",
                 "unix_s": time.time(),

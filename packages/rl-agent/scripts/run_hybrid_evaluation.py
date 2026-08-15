@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Greedy held-out evaluation for one frozen Hybrid Candidate-Q publication.
+"""Greedy held-out evaluation for one frozen hybrid IQL/AWAC publication.
 
 This process has no spool and no learner.  It uses the fixed odd held-out seed
 prefix, forces both domain exploration schedules to zero through evaluation
@@ -28,7 +28,7 @@ from sts2_env.headless_sim_bridge_client import resolve_headless_sim_exe
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots
 from sts2_rl.joint import HybridCollectionAuthority
 from sts2_rl.macro import load_trunk_state
-from sts2_rl.models import HybridCandidateQConfig, HybridDomainCandidateQModel
+from sts2_rl.models import HybridDomainIQLModel, HybridIQLConfig
 from sts2_rl.simulator_identity import verify_headless_simulator
 from sts2_rl.training import (
     build_training_resources,
@@ -38,7 +38,7 @@ from sts2_rl.training import (
 from sts2_rl.training.seeding import held_out_evaluation_seeds
 from sts2_rl.training.trajectory import TrajectoryJournal
 
-HYBRID_PUBLICATION = "sts2-hybrid-publication-v2"
+HYBRID_PUBLICATION = "sts2-hybrid-publication-v3"
 
 
 def _retained_evaluation_rows(
@@ -127,6 +127,13 @@ def main() -> int:
     parser.add_argument("--champion", required=True)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--episodes", type=int, default=16)
+    parser.add_argument(
+        "--seed",
+        dest="evaluation_seeds",
+        action="append",
+        type=int,
+        help="evaluate this exact seed; repeat to reproduce a small fixed set",
+    )
     parser.add_argument("--metrics-out", required=True)
     parser.add_argument(
         "--journal-directory",
@@ -178,15 +185,15 @@ def main() -> int:
                 tolerated_groups=legacy_head_groups,
             )
 
-        model = HybridDomainCandidateQModel(
-            HybridCandidateQConfig(config.model.to_model_config())
+        model = HybridDomainIQLModel(
+            HybridIQLConfig(config.model.to_model_config())
         ).to(resources.device)
         publication = torch.load(
             Path(args.model_path), map_location=resources.device, weights_only=True
         )
         if not isinstance(publication, Mapping) or publication.get("format") != HYBRID_PUBLICATION:
             raise ValueError("evaluation input is not a hybrid publication")
-        if publication.get("model_config") != model.hybrid_config.as_mapping():
+        if publication.get("model_config") != model.iql_config.as_mapping():
             raise ValueError("evaluation publication model config differs")
         if publication.get("reward_identity") != absolute_death_price_reward_identity():
             raise ValueError("evaluation publication reward identity differs")
@@ -204,7 +211,7 @@ def main() -> int:
                 hidden = model.initial_state(1, device=resources.device)
             with torch.no_grad():
                 output = model(encoded, hidden, validate=False)
-            return output.q_values[0], output.recurrent_state.detach()
+            return output.policy_logits[0], output.recurrent_state.detach()
 
         authority = HybridCollectionAuthority(
             forward_q=forward,
@@ -214,7 +221,11 @@ def main() -> int:
             evaluation_ownership=True,
         )
         resources.collector.macro_authority = authority
-        seeds = held_out_evaluation_seeds(config.runtime.seed, args.episodes)
+        seeds = (
+            tuple(args.evaluation_seeds)
+            if args.evaluation_seeds
+            else held_out_evaluation_seeds(config.runtime.seed, args.episodes)
+        )
         rows: list[dict[str, Any]] = []
         collected_metrics: list[Any] = []
         output = Path(args.metrics_out)

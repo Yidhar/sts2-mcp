@@ -3608,8 +3608,16 @@ class GroundedCollector:
                     )
                 legal = np.flatnonzero(valid & np.isfinite(q_values))
                 if legal.size == 0 or selected not in legal:
+                    selected_value = (
+                        float(q_values[selected])
+                        if 0 <= selected < q_values.size
+                        else None
+                    )
                     raise CollectionProtocolError(
-                        "exclusive authority did not map its choice to native Q"
+                        "exclusive authority did not map its choice to native scores: "
+                        f"selected={selected}, selected_score={selected_value}, "
+                        f"valid={int(np.count_nonzero(valid))}, "
+                        f"finite_valid={int(legal.size)}"
                     )
                 shifted = q_values.astype(np.float64, copy=True)
                 shifted[legal] -= float(np.max(shifted[legal]))
