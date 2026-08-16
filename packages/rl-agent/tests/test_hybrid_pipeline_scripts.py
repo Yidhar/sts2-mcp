@@ -551,6 +551,7 @@ def test_dashboard_reads_hybrid_evaluation_summary() -> None:
     assert '"hybrid_last_target_update": item.get("last_target_update")' in source
     assert 'row.get("event") == "hybrid_evaluation_started"' in source
     assert 'state == "complete" and not evaluation_in_progress' in source
+    assert 'startswith(\n                            "recurrent_iql_awac_"' in source
 
 
 def test_monitor_projects_hybrid_target_update_clock() -> None:

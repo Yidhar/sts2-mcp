@@ -208,7 +208,9 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "model": {
                     "architecture": (
                         "hybrid-domain-iql-v1"
-                        if manifest.get("algorithm") == "recurrent_iql_awac_v1"
+                        if str(manifest.get("algorithm", "")).startswith(
+                            "recurrent_iql_awac_"
+                        )
                         else "hybrid-domain-candidate-q-v1"
                     )
                 },
