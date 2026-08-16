@@ -1,0 +1,39 @@
+# Hybrid IQL/AWAC v2 factual-support isolation.
+#
+# The learned objective remains one recurrent IQL/AWAC loss over reward v8.
+# Collection supplies branch-balanced factual trials on sparse multi-branch
+# macro surfaces; replay balances those surface/branch anchors and rejects
+# views more than 32 learner versions old.  The target model follows the
+# online critic smoothly after every optimizer update.
+
+[optimization]
+learning_rate = 0.0001
+
+[transaction_learning]
+enabled = false
+
+[failure_credit]
+mode = "disabled"
+
+[rollout]
+deterministic_probe_interval_episodes = 0
+deterministic_probe_environment_steps = []
+
+[episodic_learning]
+enabled = false
+
+[curriculum]
+revival_budget = 64
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 100000
+
+[runtime]
+rocm_sdpa_backend = "math"
+seed = 6700000
+log_dir = "runs/hybrid-iql-v2-reward-v8-budget64-factual-support"
+checkpoint_dir = "checkpoints/hybrid-iql-v2-reward-v8-budget64-factual-support"
+evaluation_steps = []
+early_evaluation_steps = []
+final_audit_steps = []
+evaluation_liveness_guard_enabled = false

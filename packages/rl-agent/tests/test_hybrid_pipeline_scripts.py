@@ -175,7 +175,8 @@ def test_parallel_launcher_defaults_to_two_collectors_and_one_update() -> None:
     assert 'COLLECTORS="${STS2_HYBRID_COLLECTORS:-2}"' in script
     assert '--updates-per-run "${STS2_HYBRID_UPDATES_PER_RUN:-1}"' in script
     assert '--ingest-batch-runs "${STS2_HYBRID_INGEST_BATCH_RUNS:-2}"' in script
-    assert '--target-update-interval "${STS2_HYBRID_TARGET_UPDATE_INTERVAL:-25}"' in script
+    assert '--target-update-tau "${STS2_HYBRID_TARGET_UPDATE_TAU:-0.02}"' in script
+    assert '--maximum-policy-lag "${STS2_HYBRID_MAXIMUM_POLICY_LAG:-32}"' in script
     assert "target-sync-every-runs" not in script
     assert "--migrate-target-schedule" not in script
     assert 'INITIALIZE_FROM="${STS2_HYBRID_INITIALIZE_FROM:-}"' in script
@@ -546,12 +547,13 @@ def test_dashboard_reads_hybrid_evaluation_summary() -> None:
     assert 'run_root / "metrics" / "evaluation.jsonl"' in source
     assert '"event": "evaluation"' in source
     assert '"hybrid_target_syncs": item.get("target_syncs")' in source
-    assert '"hybrid_last_target_sync_update": item.get(' in source
+    assert '"hybrid_target_updates": item.get("target_updates")' in source
+    assert '"hybrid_last_target_update": item.get("last_target_update")' in source
     assert 'row.get("event") == "hybrid_evaluation_started"' in source
     assert 'state == "complete" and not evaluation_in_progress' in source
 
 
-def test_monitor_projects_hybrid_target_sync_clock() -> None:
+def test_monitor_projects_hybrid_target_update_clock() -> None:
     from sts2_rl.monitoring import _project_learner
 
     point, latest = _project_learner(
@@ -559,12 +561,16 @@ def test_monitor_projects_hybrid_target_sync_clock() -> None:
             "event": "learner_update",
             "policy_version": 164,
             "hybrid_target_syncs": 2,
-            "hybrid_last_target_sync_update": 164,
+            "hybrid_last_target_sync_update": 150,
+            "hybrid_target_updates": 164,
+            "hybrid_last_target_update": 164,
         }
     )
     for projected in (point, latest):
         assert projected["hybrid_target_syncs"] == 2
-        assert projected["hybrid_last_target_sync_update"] == 164
+        assert projected["hybrid_last_target_sync_update"] == 150
+        assert projected["hybrid_target_updates"] == 164
+        assert projected["hybrid_last_target_update"] == 164
 
 
 def test_dashboard_tail_replacement_preserves_non_update_rows() -> None:

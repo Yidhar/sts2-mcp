@@ -141,8 +141,9 @@ python scripts/run_hybrid_trainer.py \
   --macro-unroll "${STS2_HYBRID_MACRO_UNROLL:-8}" \
   --combat-unroll "${STS2_HYBRID_COMBAT_UNROLL:-32}" \
   --maximum-view-reuse "${STS2_HYBRID_MAXIMUM_VIEW_REUSE:-8}" \
+  --maximum-policy-lag "${STS2_HYBRID_MAXIMUM_POLICY_LAG:-32}" \
   --maximum-pending-runs "$MAXIMUM_PENDING" \
-  --target-update-interval "${STS2_HYBRID_TARGET_UPDATE_INTERVAL:-25}" \
+  --target-update-tau "${STS2_HYBRID_TARGET_UPDATE_TAU:-0.02}" \
   --save-interval-runs "${STS2_HYBRID_SAVE_INTERVAL_RUNS:-5}" \
   --publication-interval-runs 1 \
   --device cuda >"$LOGS/trainer.log" 2>&1 &

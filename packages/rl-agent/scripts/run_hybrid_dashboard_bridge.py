@@ -307,9 +307,22 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "hybrid_actor_gradient_norm": item.get("actor_gradient_norm"),
                 "hybrid_shared_gradient_cosine": item.get("shared_gradient_cosine"),
                 "hybrid_forward_retries": item.get("forward_retries", 0),
+                # Keep the hard-sync clock for completed v1 lineages while
+                # v2 reports the per-update Polyak clock below.
                 "hybrid_target_syncs": item.get("target_syncs"),
                 "hybrid_last_target_sync_update": item.get(
                     "last_target_sync_update"
+                ),
+                "hybrid_target_updates": item.get("target_updates"),
+                "hybrid_last_target_update": item.get("last_target_update"),
+                "hybrid_replay_stale_macro_anchors": item_replay.get(
+                    "stale_macro_anchors"
+                ),
+                "hybrid_replay_stale_combat_anchors": item_replay.get(
+                    "stale_combat_anchors"
+                ),
+                "hybrid_replay_macro_anchor_counts": item_replay.get(
+                    "macro_anchor_counts"
                 ),
                 "hybrid_death_price_lambda": death_price.get("lambda_value"),
                 "hybrid_death_price_statistic": death_price.get("active_statistic"),

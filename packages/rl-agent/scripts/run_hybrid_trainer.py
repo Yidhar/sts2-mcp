@@ -35,7 +35,7 @@ from sts2_rl.models import (
 from sts2_rl.training import load_training_config
 from sts2_rl.training.sdpa import configure_rocm_sdpa_backend
 
-HYBRID_TRAINING_STATE = "sts2-hybrid-training-state-v3"
+HYBRID_TRAINING_STATE = "sts2-hybrid-training-state-v4"
 _CANDIDATE_Q_TRAINING_STATE = "sts2-hybrid-training-state-v2"
 _PREVIOUS_HYBRID_TRAINING_STATE = "sts2-hybrid-training-state-v1"
 HYBRID_SPOOL_ENVELOPE = "sts2-hybrid-spool-envelope-v2"
@@ -201,10 +201,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--macro-unroll", type=int, default=8)
     parser.add_argument("--combat-unroll", type=int, default=32)
     parser.add_argument("--maximum-view-reuse", type=int, default=8)
+    parser.add_argument("--maximum-policy-lag", type=int, default=32)
     parser.add_argument("--save-interval-runs", type=int, default=10)
     parser.add_argument("--publication-interval-runs", type=int, default=1)
     parser.add_argument("--maximum-pending-runs", type=int, default=2)
-    parser.add_argument("--target-update-interval", type=int, default=25)
+    parser.add_argument("--target-update-tau", type=float, default=0.02)
     parser.add_argument("--device", default="auto")
     return parser.parse_args()
 
@@ -247,6 +248,7 @@ def main() -> int:
             macro_unroll=args.macro_unroll,
             combat_unroll=args.combat_unroll,
             maximum_view_reuse=args.maximum_view_reuse,
+            maximum_policy_lag=args.maximum_policy_lag,
             seed=config.runtime.seed,
         )
         learner = HybridIQLLearner(
@@ -259,7 +261,7 @@ def main() -> int:
             config=HybridIQLLearnerConfig(
                 learning_rate=config.optimization.learning_rate,
                 run_batch_size=args.run_batch_size,
-                target_update_interval=args.target_update_interval,
+                target_update_tau=args.target_update_tau,
                 revival_budget=revival_budget,
             ),
         )
