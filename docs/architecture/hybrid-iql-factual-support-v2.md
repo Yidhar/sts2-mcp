@@ -104,5 +104,9 @@ single aggregate loss:
 4. do success revivals stop rising without reviving deadlock or the combat
    `end_turn` regression.
 
+The held-out seed namespace remains the v1 namespace; collection receives a
+new launcher seed range.  Gate comparisons are therefore paired rather than
+confounded by a new map set.
+
 Only after this evidence is visible should the death-price controller be made
 faster or the run extended into a long course.
