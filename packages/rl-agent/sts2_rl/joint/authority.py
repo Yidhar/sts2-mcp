@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Literal
 
 from sts2_rl.macro.authority import MacroCollectionAuthority
 from sts2_rl.semantics.clock import decision_discount
+from sts2_rl.semantics.forward import ForwardDecision, SemanticCandidate
 
 from .transitions import HybridRun, HybridStep
 
-HYBRID_AUTHORITY_VERSION: Final = "sts2-hybrid-authority-v2"
+HYBRID_AUTHORITY_VERSION: Final = "sts2-hybrid-authority-v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +21,25 @@ class DomainExplorationSchedule:
     start: float = 0.15
     end: float = 0.05
     decay_decisions: int = 100_000
+
+    def value(self, decisions: int) -> float:
+        progress = min(max(int(decisions), 0) / max(self.decay_decisions, 1), 1.0)
+        return float(self.start + (self.end - self.start) * progress)
+
+
+@dataclass(frozen=True, slots=True)
+class FactualCoverageSchedule:
+    """Temporary branch support for sparse strategic macro surfaces.
+
+    This schedule changes only which legal factual action collection executes.
+    It never enters model logits, replay rewards, learner targets, or held-out
+    evaluation.  A surface qualifies generically when it exposes more than
+    one semantic branch; no operation receives a preferred label.
+    """
+
+    start: float = 0.50
+    end: float = 0.20
+    decay_decisions: int = 50_000
 
     def value(self, decisions: int) -> float:
         progress = min(max(int(decisions), 0) / max(self.decay_decisions, 1), 1.0)
@@ -40,6 +60,7 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
         *args: Any,
         macro_exploration: DomainExplorationSchedule | None = None,
         combat_exploration: DomainExplorationSchedule | None = None,
+        factual_coverage: FactualCoverageSchedule | None = None,
         **kwargs: Any,
     ) -> None:
         kwargs["control_domain"] = "joint"
@@ -48,6 +69,7 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
             "macro": macro_exploration or DomainExplorationSchedule(),
             "combat": combat_exploration or DomainExplorationSchedule(),
         }
+        self.factual_coverage = factual_coverage or FactualCoverageSchedule()
         self.domain_decisions = {"macro": 0, "combat": 0}
         self.policy_version = 0
         self._open_policy_version = 0
@@ -57,6 +79,9 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
         self._terminal_observed = False
         self._encounter_id = 0
         self._was_in_combat = False
+        self._coverage_eligible_decisions = 0
+        self._coverage_exploratory_decisions = 0
+        self._coverage_branch_counts: dict[str, int] = {}
 
     @property
     def exclusive_control(self) -> bool:
@@ -104,6 +129,9 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
         self._encounter_id = 0
         self._was_in_combat = False
         self._open_revivals_delta = 0
+        self._coverage_eligible_decisions = 0
+        self._coverage_exploratory_decisions = 0
+        self._coverage_branch_counts = {}
 
     def _activate_domain_epsilon(self, observation: Mapping[str, Any]) -> None:
         combat = observation.get("combat")
@@ -113,6 +141,46 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
         self.epsilon = (
             0.0 if self.evaluation_ownership else self.exploration[domain].value(self.domain_decisions[domain])
         )
+
+    def _prepare_semantic_exploration(
+        self,
+        *,
+        observation: Mapping[str, Any],
+        decision: ForwardDecision,
+        candidates: Sequence[SemanticCandidate],
+        control_domain: Literal["macro", "combat"],
+    ) -> None:
+        del observation
+        if self.evaluation_ownership or control_domain != "macro" or decision.surface == "selection":
+            return
+        branches = {candidate.branch for candidate in candidates}
+        if len(branches) <= 1:
+            return
+        self._coverage_eligible_decisions += 1
+        floor = self.factual_coverage.value(self.domain_decisions["macro"])
+        if floor > self.epsilon:
+            self.epsilon = floor
+
+    def _record_semantic_choice(
+        self,
+        *,
+        observation: Mapping[str, Any],
+        decision: ForwardDecision,
+        candidates: Sequence[SemanticCandidate],
+        selected_index: int,
+        control_domain: Literal["macro", "combat"],
+    ) -> None:
+        del observation
+        if self.evaluation_ownership or control_domain != "macro" or decision.surface == "selection":
+            return
+        branches = {candidate.branch for candidate in candidates}
+        if len(branches) <= 1:
+            return
+        branch = candidates[selected_index].branch
+        key = f"{decision.surface}:{branch}"
+        self._coverage_branch_counts[key] = self._coverage_branch_counts.get(key, 0) + 1
+        if self.last_choice_exploratory:
+            self._coverage_exploratory_decisions += 1
 
     def observe_observation(self, observation: Mapping[str, Any]) -> None:
         combat = observation.get("combat")
@@ -276,6 +344,12 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
                 domain: schedule.value(self.domain_decisions[domain]) for domain, schedule in self.exploration.items()
             },
             "recorded_steps": len(self._hybrid_steps),
+            "factual_coverage": {
+                "epsilon": self.factual_coverage.value(self.domain_decisions["macro"]),
+                "eligible_decisions": self._coverage_eligible_decisions,
+                "exploratory_decisions": self._coverage_exploratory_decisions,
+                "branch_counts": dict(self._coverage_branch_counts),
+            },
             "last_decline": self.last_executor_failure,
         }
 
@@ -283,5 +357,6 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
 __all__ = [
     "HYBRID_AUTHORITY_VERSION",
     "DomainExplorationSchedule",
+    "FactualCoverageSchedule",
     "HybridCollectionAuthority",
 ]

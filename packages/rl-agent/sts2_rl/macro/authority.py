@@ -168,6 +168,7 @@ class MacroCollectionAuthority:
         # companion view maps the most recent semantic Q values back onto the
         # collector's native candidate indexes for diagnostics only.
         self.last_native_q_values: np.typing.NDArray[np.float32] | None = None
+        self.last_choice_exploratory = False
         self._hidden: Any = None
         self._episode_id: str | None = None
         self._steps: list[MacroStep] = []
@@ -193,6 +194,7 @@ class MacroCollectionAuthority:
         self.last_decision_value = None
         self.last_q_values = None
         self.last_native_q_values = None
+        self.last_choice_exploratory = False
         self._hidden = self.initial_state()
         self._steps = []
         self._open = None
@@ -332,6 +334,7 @@ class MacroCollectionAuthority:
         self.last_decision_value = None
         self.last_q_values = None
         self.last_native_q_values = None
+        self.last_choice_exploratory = False
         self._activate_domain_epsilon(observation)
         if self._episode_replay_invalid:
             # A composite action changed recurrent state before its native
@@ -442,6 +445,12 @@ class MacroCollectionAuthority:
         if not executable:
             self.declined += 1
             return None
+        self._prepare_semantic_exploration(
+            observation=observation,
+            decision=decision,
+            candidates=executable,
+            control_domain=decision_domain,
+        )
         if self.control_domain == "combat" and self._awaiting_bridge:
             # Fail-closed (bridge doc §6): a new encounter is beginning but
             # the previous encounter's closing transition never captured its
@@ -502,6 +511,13 @@ class MacroCollectionAuthority:
             )
         self.last_native_q_values = mapped_native_q
         candidate = executable[semantic_index]
+        self._record_semantic_choice(
+            observation=observation,
+            decision=decision,
+            candidates=executable,
+            selected_index=semantic_index,
+            control_domain=decision_domain,
+        )
         if candidate.native_index is None:  # excluded above; keeps typing exact
             raise RuntimeError("executable semantic candidate has no native index")
         native_index = int(candidate.native_index)
@@ -547,6 +563,37 @@ class MacroCollectionAuthority:
         """Hook for a joint authority with independent domain clocks."""
 
         del observation
+
+    def _prepare_semantic_exploration(
+        self,
+        *,
+        observation: Mapping[str, Any],
+        decision: ForwardDecision,
+        candidates: Sequence[SemanticCandidate],
+        control_domain: Literal["macro", "combat"],
+    ) -> None:
+        """Allow a joint collector to adjust collection-only exploration.
+
+        The isolated authority has no surface-specific schedule.  The hybrid
+        successor overrides this hook to obtain factual support on sparse
+        multi-branch macro surfaces without changing policy logits, rewards,
+        or held-out evaluation.
+        """
+
+        del observation, decision, candidates, control_domain
+
+    def _record_semantic_choice(
+        self,
+        *,
+        observation: Mapping[str, Any],
+        decision: ForwardDecision,
+        candidates: Sequence[SemanticCandidate],
+        selected_index: int,
+        control_domain: Literal["macro", "combat"],
+    ) -> None:
+        """Diagnostic hook paired with :meth:`_prepare_semantic_exploration`."""
+
+        del observation, decision, candidates, selected_index, control_domain
 
     def _step_indices(
         self,
@@ -691,11 +738,13 @@ class MacroCollectionAuthority:
             max(float(values[index].item()) for index in range(len(candidates)))
         )
         if self._rng.random() < self.epsilon:
+            self.last_choice_exploratory = True
             # Branch-balanced: uniform branch, then uniform candidate inside.
             branches = sorted({candidate.branch for candidate in candidates})
             branch = branches[int(self._rng.integers(len(branches)))]
             pool = [index for index, item in enumerate(candidates) if item.branch == branch]
             return int(pool[int(self._rng.integers(len(pool)))])
+        self.last_choice_exploratory = False
         return max(
             range(len(candidates)),
             key=lambda index: float(values[index].item()),

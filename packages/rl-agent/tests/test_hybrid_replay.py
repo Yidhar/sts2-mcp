@@ -14,6 +14,9 @@ def _step(
     encounter: int | None = None,
     terminal: bool = False,
     revivals_delta: int = 0,
+    surface: str | None = None,
+    branch: str | None = None,
+    policy_version: int = 0,
 ) -> HybridStep:
     return HybridStep(
         snapshot=_snapshot(),
@@ -22,10 +25,11 @@ def _step(
         revivals_delta=revivals_delta,
         discount=0.0 if terminal else 0.9,
         terminal=terminal,
-        surface="combat_card" if domain == "combat" else "map",
-        branch="play" if domain == "combat" else "choose",
+        surface=surface or ("combat_card" if domain == "combat" else "map"),
+        branch=branch or ("play" if domain == "combat" else "choose"),
         control_domain=domain,  # type: ignore[arg-type]
         encounter_id=encounter,
+        policy_version=policy_version,
     )
 
 
@@ -122,3 +126,59 @@ def test_replay_state_roundtrip_preserves_freshness_budget() -> None:
     restored.load_state_dict(replay.state_dict())
     assert restored.metrics() == replay.metrics()
     assert restored.state_dict()["runs"][0].environment_steps == 12
+
+
+def test_macro_anchor_sampling_balances_surface_branches_within_a_run() -> None:
+    run = HybridRun(
+        run_id="surface-balanced",
+        steps=(
+            _step("macro", surface="map", branch="map"),
+            _step("macro", surface="reward", branch="take"),
+            _step("macro", surface="rest", branch="rest"),
+            _step("macro", surface="rest", branch="smith"),
+            _step("combat", encounter=1),
+            _step("combat", encounter=1),
+            _step("macro", terminal=True, surface="reward", branch="skip"),
+        ),
+    )
+    replay = HybridRunReplay(
+        capacity_runs=2,
+        macro_unroll=1,
+        combat_unroll=1,
+        maximum_view_reuse=3,
+        seed=3,
+    )
+    replay.put(run)
+    keys = [replay.sample_pairs(1)[0].macro.anchor_key for _ in range(5)]
+    assert set(keys) == {
+        "map:map",
+        "reward:skip",
+        "reward:take",
+        "rest:rest",
+        "rest:smith",
+    }
+    assert replay.metrics()["macro_anchor_counts"] == {
+        key: 1 for key in sorted(set(keys))
+    }
+
+
+def test_replay_rejects_policy_stale_anchors() -> None:
+    stale = HybridRun(
+        run_id="stale",
+        steps=(
+            _step("macro", policy_version=5),
+            _step("combat", encounter=1, policy_version=5),
+            _step("macro", terminal=True, policy_version=5),
+        ),
+    )
+    replay = HybridRunReplay(
+        capacity_runs=2,
+        macro_unroll=1,
+        combat_unroll=1,
+        maximum_policy_lag=10,
+    )
+    replay.put(stale)
+    assert replay.sample_pairs(1, current_policy_version=20) == ()
+    metrics = replay.metrics()
+    assert metrics["stale_macro_anchors"] == 2
+    assert metrics["stale_combat_anchors"] == 1

@@ -10,7 +10,7 @@ import numpy as np
 
 from .transitions import HYBRID_TRANSITION_VERSION, HybridRun
 
-HYBRID_REPLAY_VERSION: Final = "sts2-hybrid-run-replay-v4"
+HYBRID_REPLAY_VERSION: Final = "sts2-hybrid-run-replay-v5"
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +20,7 @@ class DomainView:
     prefix_indices: tuple[int, ...]
     learn_indices: tuple[int, ...]
     view_id: str
+    anchor_key: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,18 +47,28 @@ class HybridRunReplay:
         macro_unroll: int = 8,
         combat_unroll: int = 32,
         maximum_view_reuse: int = 8,
+        maximum_policy_lag: int = 32,
         seed: int = 0,
     ) -> None:
-        if min(capacity_runs, macro_unroll, combat_unroll, maximum_view_reuse) <= 0:
+        if min(
+            capacity_runs,
+            macro_unroll,
+            combat_unroll,
+            maximum_view_reuse,
+            maximum_policy_lag,
+        ) <= 0:
             raise ValueError("hybrid replay bounds must be positive")
         self.capacity_runs = int(capacity_runs)
         self.macro_unroll = int(macro_unroll)
         self.combat_unroll = int(combat_unroll)
         self.maximum_view_reuse = int(maximum_view_reuse)
+        self.maximum_policy_lag = int(maximum_policy_lag)
         self._runs: list[HybridRun] = []
         self._rng = np.random.default_rng(seed)
         self._put_count = 0
         self._sample_counts: dict[tuple[str, str, int], int] = {}
+        self._macro_anchor_counts: dict[str, int] = {}
+        self._last_policy_version: int | None = None
 
     def __len__(self) -> int:
         return len(self._runs)
@@ -93,12 +104,18 @@ class HybridRunReplay:
         run: HybridRun,
         domain: Literal["macro", "combat"],
         candidates: tuple[int, ...],
+        current_policy_version: int | None,
     ) -> int | None:
         available = tuple(
             anchor
             for anchor in candidates
             if self._sample_counts.get((run.run_id, domain, anchor), 0)
             < self.maximum_view_reuse
+            and self._policy_fresh(
+                run,
+                anchor,
+                current_policy_version=current_policy_version,
+            )
         )
         if not available:
             return None
@@ -113,24 +130,96 @@ class HybridRunReplay:
         )
         return int(least_used[int(self._rng.integers(len(least_used)))])
 
-    def _macro_view(self, run: HybridRun) -> DomainView | None:
-        indices = run.indices("macro")
-        anchor = self._fresh_anchor(run, "macro", indices)
+    def _policy_fresh(
+        self,
+        run: HybridRun,
+        anchor: int,
+        *,
+        current_policy_version: int | None,
+    ) -> bool:
+        if current_policy_version is None:
+            return True
+        lag = max(0, int(current_policy_version) - int(run.steps[anchor].policy_version))
+        return lag <= self.maximum_policy_lag
+
+    def _available_anchors(
+        self,
+        run: HybridRun,
+        domain: Literal["macro", "combat"],
+        *,
+        current_policy_version: int | None,
+    ) -> tuple[int, ...]:
+        return tuple(
+            anchor
+            for anchor in run.indices(domain)
+            if self._sample_counts.get((run.run_id, domain, anchor), 0)
+            < self.maximum_view_reuse
+            and self._policy_fresh(
+                run,
+                anchor,
+                current_policy_version=current_policy_version,
+            )
+        )
+
+    @staticmethod
+    def _macro_anchor_key(run: HybridRun, anchor: int) -> str:
+        step = run.steps[anchor]
+        return f"{step.surface}:{step.branch}"
+
+    def _macro_view(
+        self,
+        run: HybridRun,
+        *,
+        current_policy_version: int | None,
+    ) -> DomainView | None:
+        indices = self._available_anchors(
+            run,
+            "macro",
+            current_policy_version=current_policy_version,
+        )
+        if not indices:
+            return None
+        buckets: dict[str, list[int]] = {}
+        for index in indices:
+            buckets.setdefault(self._macro_anchor_key(run, index), []).append(index)
+        minimum = min(self._macro_anchor_counts.get(key, 0) for key in buckets)
+        least_sampled = sorted(
+            key for key in buckets if self._macro_anchor_counts.get(key, 0) == minimum
+        )
+        anchor_key = least_sampled[int(self._rng.integers(len(least_sampled)))]
+        anchor = self._fresh_anchor(
+            run,
+            "macro",
+            tuple(buckets[anchor_key]),
+            current_policy_version,
+        )
         if anchor is None:
             return None
-        anchor_position = indices.index(anchor)
-        learn = indices[anchor_position : anchor_position + self.macro_unroll]
+        domain_indices = run.indices("macro")
+        anchor_position = domain_indices.index(anchor)
+        learn = domain_indices[anchor_position : anchor_position + self.macro_unroll]
         return DomainView(
             run=run,
             domain="macro",
-            prefix_indices=indices[:anchor_position],
+            prefix_indices=domain_indices[:anchor_position],
             learn_indices=learn,
             view_id=f"{run.run_id}:macro:{anchor}",
+            anchor_key=anchor_key,
         )
 
-    def _combat_view(self, run: HybridRun) -> DomainView | None:
+    def _combat_view(
+        self,
+        run: HybridRun,
+        *,
+        current_policy_version: int | None,
+    ) -> DomainView | None:
         indices = run.indices("combat")
-        anchor = self._fresh_anchor(run, "combat", indices)
+        anchor = self._fresh_anchor(
+            run,
+            "combat",
+            indices,
+            current_policy_version,
+        )
         if anchor is None:
             return None
         encounter_id = run.steps[anchor].encounter_id
@@ -154,25 +243,34 @@ class HybridRunReplay:
             prefix_indices=prefix,
             learn_indices=learn,
             view_id=f"{run.run_id}:combat:{anchor}",
+            anchor_key="combat",
         )
 
-    def sample_pairs(self, count: int) -> tuple[HybridViewPair, ...]:
+    def sample_pairs(
+        self,
+        count: int,
+        *,
+        current_policy_version: int | None = None,
+    ) -> tuple[HybridViewPair, ...]:
         if count <= 0:
             raise ValueError("hybrid replay sample count must be positive")
+        if current_policy_version is not None and current_policy_version < 0:
+            raise ValueError("current policy version cannot be negative")
+        self._last_policy_version = current_policy_version
         eligible = [
             run
             for run in self._runs
             if run.macro_steps
             and run.combat_steps
-            and any(
-                self._sample_counts.get((run.run_id, "macro", anchor), 0)
-                < self.maximum_view_reuse
-                for anchor in run.indices("macro")
+            and self._available_anchors(
+                run,
+                "macro",
+                current_policy_version=current_policy_version,
             )
-            and any(
-                self._sample_counts.get((run.run_id, "combat", anchor), 0)
-                < self.maximum_view_reuse
-                for anchor in run.indices("combat")
+            and self._available_anchors(
+                run,
+                "combat",
+                current_policy_version=current_policy_version,
             )
         ]
         if not eligible:
@@ -183,14 +281,23 @@ class HybridRunReplay:
         pairs: list[HybridViewPair] = []
         for raw_index in np.atleast_1d(indices):
             run = eligible[int(raw_index)]
-            macro = self._macro_view(run)
-            combat = self._combat_view(run)
+            macro = self._macro_view(
+                run,
+                current_policy_version=current_policy_version,
+            )
+            combat = self._combat_view(
+                run,
+                current_policy_version=current_policy_version,
+            )
             if macro is None or combat is None:  # eligibility above owns this
                 continue
             for view in (macro, combat):
                 anchor = view.learn_indices[0]
                 key = (run.run_id, view.domain, anchor)
                 self._sample_counts[key] = self._sample_counts.get(key, 0) + 1
+            self._macro_anchor_counts[macro.anchor_key] = (
+                self._macro_anchor_counts.get(macro.anchor_key, 0) + 1
+            )
             pairs.append(HybridViewPair(run.run_id, macro, combat))
         return tuple(pairs)
 
@@ -201,10 +308,12 @@ class HybridRunReplay:
             "macro_unroll": self.macro_unroll,
             "combat_unroll": self.combat_unroll,
             "maximum_view_reuse": self.maximum_view_reuse,
+            "maximum_policy_lag": self.maximum_policy_lag,
             "runs": tuple(self._runs),
             "rng_state": copy.deepcopy(self._rng.bit_generator.state),
             "put_count": self._put_count,
             "sample_counts": dict(self._sample_counts),
+            "macro_anchor_counts": dict(self._macro_anchor_counts),
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -215,12 +324,14 @@ class HybridRunReplay:
             self.macro_unroll,
             self.combat_unroll,
             self.maximum_view_reuse,
+            self.maximum_policy_lag,
         )
         actual = (
             int(state.get("capacity_runs", -1)),
             int(state.get("macro_unroll", -1)),
             int(state.get("combat_unroll", -1)),
             int(state.get("maximum_view_reuse", -1)),
+            int(state.get("maximum_policy_lag", -1)),
         )
         if actual != expected:
             raise ValueError("hybrid replay shape differs")
@@ -239,10 +350,34 @@ class HybridRunReplay:
             tuple(key): int(value)
             for key, value in dict(state.get("sample_counts", {})).items()
         }
+        self._macro_anchor_counts = {
+            str(key): int(value)
+            for key, value in dict(state.get("macro_anchor_counts", {})).items()
+        }
         self._rng.bit_generator.state = copy.deepcopy(state["rng_state"])
 
-    def metrics(self) -> dict[str, int | float | str]:
+    def metrics(self) -> dict[str, Any]:
         samples = tuple(self._sample_counts.values())
+        stale_macro = 0
+        stale_combat = 0
+        if self._last_policy_version is not None:
+            for run in self._runs:
+                stale_macro += sum(
+                    not self._policy_fresh(
+                        run,
+                        index,
+                        current_policy_version=self._last_policy_version,
+                    )
+                    for index in run.indices("macro")
+                )
+                stale_combat += sum(
+                    not self._policy_fresh(
+                        run,
+                        index,
+                        current_policy_version=self._last_policy_version,
+                    )
+                    for index in run.indices("combat")
+                )
         return {
             "version": HYBRID_REPLAY_VERSION,
             "runs": len(self._runs),
@@ -253,7 +388,11 @@ class HybridRunReplay:
             "put_count": self._put_count,
             "maximum_view_reuse": max(samples, default=0),
             "configured_maximum_view_reuse": self.maximum_view_reuse,
+            "configured_maximum_policy_lag": self.maximum_policy_lag,
             "mean_view_reuse": sum(samples) / len(samples) if samples else 0.0,
+            "stale_macro_anchors": stale_macro,
+            "stale_combat_anchors": stale_combat,
+            "macro_anchor_counts": dict(sorted(self._macro_anchor_counts.items())),
         }
 
 

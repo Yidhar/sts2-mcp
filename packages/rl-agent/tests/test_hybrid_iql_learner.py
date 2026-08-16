@@ -52,7 +52,7 @@ def _learner(online: _TinyIQL, target: _TinyIQL) -> HybridIQLLearner:
         config=HybridIQLLearnerConfig(
             run_batch_size=1,
             combat_n_step=2,
-            target_update_interval=20,
+            target_update_tau=0.10,
             gradient_diagnostics_interval=1,
         ),
     )
@@ -126,3 +126,19 @@ def test_transient_nonfinite_forward_retries_the_same_batch_once() -> None:
     assert metrics["updates"] == 1
     assert metrics["forward_retries"] == 1
     assert pair_objects[0] is pair_objects[1]
+
+
+def test_iql_target_moves_smoothly_every_optimizer_update() -> None:
+    online = _TinyIQL()
+    target = copy.deepcopy(online)
+    learner = _learner(online, target)
+    with torch.no_grad():
+        before = target.candidate_q_head.weight.detach().clone()
+        online.candidate_q_head.weight.add_(1.0)
+    learner.update_target()
+    torch.testing.assert_close(
+        target.candidate_q_head.weight,
+        before + 0.10,
+    )
+    assert learner.metrics.target_updates == 1
+    assert learner.metrics.last_target_update == 0

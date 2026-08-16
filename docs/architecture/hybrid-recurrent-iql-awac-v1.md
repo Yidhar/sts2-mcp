@@ -98,6 +98,10 @@ current weights.
 
 ## 4. Behavior and exploration
 
+`hybrid-iql-factual-support-v2.md` supersedes the collection/replay details in
+this section after the first 100-run isolation exposed sparse macro branch
+starvation.  The learned objective below remains unchanged.
+
 Collection and greedy held-out evaluation use `policy_logits`, never Q argmax.
 Branch-balanced macro/combat epsilon remains collection-only. It provides
 support; it does not define learned preference. Legal masks remain the only

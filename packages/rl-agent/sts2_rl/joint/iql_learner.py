@@ -27,7 +27,7 @@ from .death_price import (
 from .replay import DomainView, HybridRunReplay, HybridViewPair
 from .transitions import HybridRun, HybridStep, next_domain_index
 
-HYBRID_IQL_LEARNER_VERSION: Final = "sts2-hybrid-iql-awac-v1"
+HYBRID_IQL_LEARNER_VERSION: Final = "sts2-hybrid-iql-awac-v2"
 HybridIQLForward: TypeAlias = tuple[Tensor, Tensor, Tensor, Tensor]
 
 
@@ -39,7 +39,7 @@ class _NonFiniteForwardPass(FloatingPointError):
 class HybridIQLLearnerConfig:
     learning_rate: float = 1.0e-4
     shared_learning_rate_scale: float = 0.5
-    target_update_interval: int = 25
+    target_update_tau: float = 0.02
     huber_delta: float = 1.0
     gradient_clip_norm: float = 1.0
     run_batch_size: int = 4
@@ -53,7 +53,6 @@ class HybridIQLLearnerConfig:
     def __post_init__(self) -> None:
         if (
             min(
-                self.target_update_interval,
                 self.run_batch_size,
                 self.combat_n_step,
                 self.gradient_diagnostics_interval,
@@ -68,10 +67,13 @@ class HybridIQLLearnerConfig:
             "gradient_clip_norm",
             "advantage_temperature",
             "maximum_advantage_weight",
+            "target_update_tau",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"hybrid IQL {name} must be positive and finite")
+        if self.target_update_tau > 1.0:
+            raise ValueError("hybrid IQL target_update_tau must be at most 1")
         if not math.isfinite(self.expectile) or not 0.5 < self.expectile < 1.0:
             raise ValueError("hybrid IQL expectile must be in (0.5, 1.0)")
         death_price_course(self.revival_budget)
@@ -104,8 +106,8 @@ class HybridIQLMetrics:
     shared_gradient_cosine: float = 0.0
     mean_policy_lag: float = 0.0
     maximum_policy_lag: int = 0
-    target_syncs: int = 0
-    last_target_sync_update: int = 0
+    target_updates: int = 0
+    last_target_update: int = 0
     forward_retries: int = 0
     domain_surface_counts: dict[str, int] = field(default_factory=dict)
 
@@ -512,7 +514,10 @@ class HybridIQLLearner:
         return macro, combat, loss
 
     def update(self) -> dict[str, Any]:
-        pairs = self.replay.sample_pairs(self.config.run_batch_size)
+        pairs = self.replay.sample_pairs(
+            self.config.run_batch_size,
+            current_policy_version=self.metrics.updates,
+        )
         if not pairs:
             return self.as_mapping()
         price = self.death_price.lambda_value
@@ -563,6 +568,7 @@ class HybridIQLLearner:
             raise FloatingPointError("hybrid IQL optimizer produced non-finite parameters")
 
         self.metrics.updates += 1
+        self.update_target()
         self.metrics.macro_steps += macro.steps
         self.metrics.combat_steps += combat.steps
         self.metrics.macro_loss = float(macro.total.detach().item())
@@ -599,8 +605,6 @@ class HybridIQLLearner:
                     step = view.run.steps[index]
                     key = f"{view.domain}:{step.surface}:{step.branch}"
                     self.metrics.domain_surface_counts[key] = self.metrics.domain_surface_counts.get(key, 0) + 1
-        if self.metrics.updates - self.metrics.last_target_sync_update >= self.config.target_update_interval:
-            self.sync_target()
         return self.as_mapping()
 
     def observe_episode_outcome(
@@ -639,10 +643,28 @@ class HybridIQLLearner:
     def as_mapping(self) -> dict[str, Any]:
         return {**self.metrics.as_mapping(), "death_price": self.death_price.as_mapping()}
 
-    def sync_target(self) -> None:
-        self.target_model.load_state_dict(self.online_model.state_dict(), strict=True)
-        self.metrics.target_syncs += 1
-        self.metrics.last_target_sync_update = self.metrics.updates
+    def update_target(self) -> None:
+        """Apply one smooth target update after every optimizer mutation."""
+
+        tau = self.config.target_update_tau
+        with torch.no_grad():
+            for target_parameter, online_parameter in zip(
+                self.target_model.parameters(),
+                self.online_model.parameters(),
+                strict=True,
+            ):
+                target_parameter.lerp_(online_parameter, tau)
+            for target_buffer, online_buffer in zip(
+                self.target_model.buffers(),
+                self.online_model.buffers(),
+                strict=True,
+            ):
+                if target_buffer.is_floating_point() or target_buffer.is_complex():
+                    target_buffer.lerp_(online_buffer, tau)
+                else:
+                    target_buffer.copy_(online_buffer)
+        self.metrics.target_updates += 1
+        self.metrics.last_target_update = self.metrics.updates
 
     def state_dict(self) -> dict[str, Any]:
         return {

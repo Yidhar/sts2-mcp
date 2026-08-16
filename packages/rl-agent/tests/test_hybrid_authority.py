@@ -9,6 +9,7 @@ torch = pytest.importorskip("torch")
 
 from sts2_rl.joint import (  # noqa: E402
     DomainExplorationSchedule,
+    FactualCoverageSchedule,
     HybridCollectionAuthority,
 )
 from tests.test_macro_authority import (  # noqa: E402
@@ -111,6 +112,52 @@ def test_domain_clocks_roundtrip_and_evaluation_forces_zero_epsilon() -> None:
     assert evaluation.epsilon == 0.0
 
 
+def test_sparse_multibranch_macro_surface_uses_collection_only_coverage_floor() -> None:
+    authority = _authority()
+    authority.begin_episode("coverage")
+    authority.choose(
+        observation=_rest_observation(),
+        semantic_actions=_REST_ACTIONS,
+        snapshot=_snapshot(candidate_count=2),
+        valid=np.ones(2, dtype=np.bool_),
+    )
+    assert authority.epsilon == pytest.approx(0.50)
+    coverage = authority.metrics()["factual_coverage"]
+    assert coverage["eligible_decisions"] == 1
+    assert sum(coverage["branch_counts"].values()) == 1
+
+    evaluation = _authority(evaluation=True)
+    evaluation.begin_episode("heldout-coverage")
+    evaluation.choose(
+        observation=_rest_observation(),
+        semantic_actions=_REST_ACTIONS,
+        snapshot=_snapshot(candidate_count=2),
+        valid=np.ones(2, dtype=np.bool_),
+    )
+    assert evaluation.epsilon == 0.0
+    assert evaluation.metrics()["factual_coverage"]["eligible_decisions"] == 0
+
+
+def test_factual_coverage_collects_the_non_greedy_rest_branch() -> None:
+    authority = _authority()
+    selected: list[int] = []
+    for episode in range(400):
+        authority.begin_episode(f"coverage-{episode}")
+        chosen = authority.choose(
+            observation=_rest_observation(),
+            semantic_actions=_REST_ACTIONS,
+            snapshot=_snapshot(candidate_count=2),
+            valid=np.ones(2, dtype=np.bool_),
+        )
+        assert chosen is not None
+        selected.append(chosen)
+    # Greedy always selects native index 1.  A 0.50 branch-balanced coverage
+    # floor should supply about 25% factual index-0 trials without preferring
+    # it in the learned policy or in held-out evaluation.
+    non_greedy = selected.count(0) / len(selected)
+    assert 0.18 <= non_greedy <= 0.32
+
+
 def test_hybrid_authority_publishes_candidate_q_for_exclusive_collector() -> None:
     authority = _authority()
     authority.begin_episode("q")
@@ -210,6 +257,7 @@ def test_semantic_targets_map_back_to_one_native_entry() -> None:
         epsilon=0.0,
         macro_exploration=DomainExplorationSchedule(0.0, 0.0, 1),
         combat_exploration=DomainExplorationSchedule(0.0, 0.0, 1),
+        factual_coverage=FactualCoverageSchedule(0.0, 0.0, 1),
     )
     authority.begin_episode("native-map")
     assert (

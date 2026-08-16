@@ -3,6 +3,7 @@
 from .authority import (
     HYBRID_AUTHORITY_VERSION,
     DomainExplorationSchedule,
+    FactualCoverageSchedule,
     HybridCollectionAuthority,
 )
 from .death_price import (
@@ -54,6 +55,7 @@ __all__ = [
     "DeathPriceEpisodeOutcome",
     "DeathPriceMetrics",
     "DomainExplorationSchedule",
+    "FactualCoverageSchedule",
     "DomainView",
     "HybridCollectionAuthority",
     "HybridQConfig",
