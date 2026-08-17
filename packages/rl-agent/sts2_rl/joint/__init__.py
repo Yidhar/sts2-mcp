@@ -16,18 +16,18 @@ from .death_price import (
     death_price_course,
     validate_discounted_outcome_margin,
 )
-from .learner import (
-    HYBRID_Q_LEARNER_VERSION,
-    HybridQConfig,
-    HybridQLearner,
-    HybridQMetrics,
-)
 from .iql_learner import (
     HYBRID_IQL_LEARNER_VERSION,
     HybridIQLForward,
     HybridIQLLearner,
     HybridIQLLearnerConfig,
     HybridIQLMetrics,
+)
+from .learner import (
+    HYBRID_Q_LEARNER_VERSION,
+    HybridQConfig,
+    HybridQLearner,
+    HybridQMetrics,
 )
 from .replay import (
     HYBRID_REPLAY_VERSION,
@@ -46,8 +46,8 @@ __all__ = [
     "DEATH_PRICE_CONTROLLER_VERSION",
     "DEATH_PRICE_COURSE_VERSION",
     "HYBRID_AUTHORITY_VERSION",
-    "HYBRID_Q_LEARNER_VERSION",
     "HYBRID_IQL_LEARNER_VERSION",
+    "HYBRID_Q_LEARNER_VERSION",
     "HYBRID_REPLAY_VERSION",
     "HYBRID_TRANSITION_VERSION",
     "AbsoluteDeathPriceController",
@@ -55,16 +55,16 @@ __all__ = [
     "DeathPriceEpisodeOutcome",
     "DeathPriceMetrics",
     "DomainExplorationSchedule",
-    "FactualCoverageSchedule",
     "DomainView",
+    "FactualCoverageSchedule",
     "HybridCollectionAuthority",
-    "HybridQConfig",
-    "HybridQLearner",
-    "HybridQMetrics",
     "HybridIQLForward",
     "HybridIQLLearner",
     "HybridIQLLearnerConfig",
     "HybridIQLMetrics",
+    "HybridQConfig",
+    "HybridQLearner",
+    "HybridQMetrics",
     "HybridRun",
     "HybridRunReplay",
     "HybridStep",

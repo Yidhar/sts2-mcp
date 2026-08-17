@@ -94,6 +94,40 @@ def test_awac_recovers_an_executed_action_from_tiny_policy_probability() -> None
     assert metrics["actor_gradient_norm"] > 0.0
 
 
+def test_strict_improvement_actor_does_not_clone_neutral_behavior() -> None:
+    online = _TinyIQL()
+    with torch.no_grad():
+        online.candidate_q_head.weight.zero_()
+        online.state_value_head.weight.zero_()
+        online.candidate_policy_head.weight[:, 0] = torch.tensor([-2.0, 0.5, 1.0])
+    target = copy.deepcopy(online)
+    learner = _learner(online, target)
+    before = online.candidate_policy_head.weight.detach().clone()
+
+    metrics = learner.update()
+
+    torch.testing.assert_close(online.candidate_policy_head.weight, before)
+    assert metrics["mean_advantage_weight"] == pytest.approx(0.0)
+    assert metrics["positive_advantage_fraction"] == pytest.approx(0.0)
+    assert metrics["actor_gradient_norm"] == pytest.approx(0.0)
+
+
+def test_strict_improvement_actor_weight_is_bounded() -> None:
+    online = _TinyIQL()
+    with torch.no_grad():
+        online.candidate_q_head.weight.fill_(100.0)
+        online.state_value_head.weight.zero_()
+    target = copy.deepcopy(online)
+    learner = _learner(online, target)
+
+    metrics = learner.update()
+
+    assert metrics["maximum_advantage_weight"] == pytest.approx(
+        learner.config.maximum_advantage_weight
+    )
+    assert metrics["positive_advantage_fraction"] == pytest.approx(1.0)
+
+
 def test_nonfinite_batch_stops_before_optimizer_step() -> None:
     online = _TinyIQL()
     target = copy.deepcopy(online)

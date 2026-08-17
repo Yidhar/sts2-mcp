@@ -1,6 +1,8 @@
 # Hybrid IQL factual support v2
 
-Status: implementation and short-isolation candidate.
+Status: completed isolation; actor/collection semantics superseded by
+`hybrid-iql-strict-improvement-v3.md` after the paired regression described
+there.  The replay freshness and smooth-target changes remain current.
 
 This document amends `hybrid-recurrent-iql-awac-v1.md`.  It does not add a
 second policy objective.  Q, expectile V and advantage-weighted actor CE remain

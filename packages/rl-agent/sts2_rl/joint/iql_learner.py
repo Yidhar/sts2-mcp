@@ -1,11 +1,11 @@
-"""Balanced recurrent IQL/AWAC learner for the mixed semantic graph.
+"""Balanced recurrent IQL strict-improvement learner for the semantic graph.
 
 This is the predefined successor to the hybrid Double-Q controller after the
 unsupported-candidate-max failure was observed in production.  Q bootstraps
 from a candidate-independent target value; no learner target contains an
-argmax over legal candidates.  The actor is fitted only to factual executed
-actions with an advantage-weighted cross-entropy derivative that remains
-non-zero even when its current probability is tiny.
+argmax over legal candidates.  The actor fits a factual executed action only
+after its target advantage is positive, with a cross-entropy derivative that
+remains non-zero even when its current probability is tiny.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from .death_price import (
 from .replay import DomainView, HybridRunReplay, HybridViewPair
 from .transitions import HybridRun, HybridStep, next_domain_index
 
-HYBRID_IQL_LEARNER_VERSION: Final = "sts2-hybrid-iql-awac-v2"
+HYBRID_IQL_LEARNER_VERSION: Final = "sts2-hybrid-iql-strict-improvement-v3"
 HybridIQLForward: TypeAlias = tuple[Tensor, Tensor, Tensor, Tensor]
 
 
@@ -97,6 +97,9 @@ class HybridIQLMetrics:
     combat_td_abs: float = 0.0
     mean_advantage_weight: float = 0.0
     maximum_advantage_weight: float = 0.0
+    macro_positive_advantage_fraction: float = 0.0
+    combat_positive_advantage_fraction: float = 0.0
+    positive_advantage_fraction: float = 0.0
     mean_policy_entropy: float = 0.0
     critic_gradient_norm: float = 0.0
     actor_gradient_norm: float = 0.0
@@ -123,12 +126,13 @@ class _DomainLoss:
     actor: Tensor
     td_abs: Tensor
     weights: Tensor
+    positive_advantages: Tensor
     entropies: Tensor
     steps: int
 
 
 class HybridIQLLearner:
-    """One IQL/AWAC algorithm over separately reduced macro/combat views."""
+    """One IQL strict-improvement algorithm over balanced domain views."""
 
     def __init__(
         self,
@@ -298,7 +302,7 @@ class HybridIQLLearner:
         target_q: Tensor,
         target_value: Tensor,
         factual_target: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         context = (
             f"{step.control_domain}:{step.surface}:{step.branch} "
             f"action={step.action_index} policy={step.policy_version}"
@@ -336,7 +340,15 @@ class HybridIQLLearner:
         legal_logits = logits[:count].masked_fill(~legal, float("-inf"))
         log_policy = torch.log_softmax(legal_logits, dim=0)
         advantage = (q_reference - target_value.detach()) / self.config.advantage_temperature
-        actor_weight = advantage.exp().clamp(max=self.config.maximum_advantage_weight)
+        # Coverage changes which factual action is executed.  Plain AWAC has
+        # exp(0) == 1, so an action whose advantage is still unresolved is
+        # nevertheless cloned at full strength.  That made branch-support
+        # collection a hidden preference channel.  The centered positive-
+        # advantage weight is zero at and below the value baseline and grows
+        # smoothly only after the critic has evidence of improvement.
+        maximum_log_weight = math.log1p(self.config.maximum_advantage_weight)
+        actor_weight = torch.expm1(advantage.clamp(min=0.0, max=maximum_log_weight))
+        positive_advantage = advantage > 0.0
         actor_loss = -actor_weight * log_policy[step.action_index]
         probabilities = log_policy.exp()
         entropy = -(probabilities[legal] * log_policy[legal]).sum()
@@ -355,12 +367,13 @@ class HybridIQLLearner:
             actor_loss,
             (executed_q - factual_target).detach().abs(),
             actor_weight.detach(),
+            positive_advantage.detach(),
             entropy.detach(),
         )
 
     def _macro_loss(self, view: DomainView, *, lambda_value: float) -> _DomainLoss:
         q, value, logits, target_q, target_value = self._states_and_outputs(view)
-        rows: list[tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]] = []
+        rows: list[tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]] = []
         run = view.run
         for index in view.learn_indices:
             successor = next_domain_index(run, index, "macro")
@@ -389,7 +402,7 @@ class HybridIQLLearner:
 
     def _combat_loss(self, view: DomainView, *, lambda_value: float) -> _DomainLoss:
         q, value, logits, target_q, target_value = self._states_and_outputs(view)
-        rows: list[tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]] = []
+        rows: list[tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]] = []
         run = view.run
         for index in view.learn_indices:
             encounter_id = run.steps[index].encounter_id
@@ -431,12 +444,12 @@ class HybridIQLLearner:
 
     @staticmethod
     def _reduce_rows(
-        rows: list[tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]],
+        rows: list[tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]],
     ) -> _DomainLoss:
         if not rows:
             raise ValueError("hybrid IQL domain view has no learning nodes")
         columns = tuple(torch.stack(items) for items in zip(*rows, strict=True))
-        q, value, actor, td_abs, weights, entropies = columns
+        q, value, actor, td_abs, weights, positive_advantages, entropies = columns
         q_mean = q.mean()
         value_mean = value.mean()
         actor_mean = actor.mean()
@@ -447,6 +460,7 @@ class HybridIQLLearner:
             actor=actor_mean,
             td_abs=td_abs.mean(),
             weights=weights,
+            positive_advantages=positive_advantages,
             entropies=entropies,
             steps=len(rows),
         )
@@ -485,6 +499,9 @@ class HybridIQLLearner:
             actor=mean("actor", macro_rows),
             td_abs=mean("td_abs", macro_rows),
             weights=torch.cat([row.weights for row in macro_rows]),
+            positive_advantages=torch.cat(
+                [row.positive_advantages for row in macro_rows]
+            ),
             entropies=torch.cat([row.entropies for row in macro_rows]),
             steps=sum(row.steps for row in macro_rows),
         )
@@ -495,6 +512,9 @@ class HybridIQLLearner:
             actor=mean("actor", combat_rows),
             td_abs=mean("td_abs", combat_rows),
             weights=torch.cat([row.weights for row in combat_rows]),
+            positive_advantages=torch.cat(
+                [row.positive_advantages for row in combat_rows]
+            ),
             entropies=torch.cat([row.entropies for row in combat_rows]),
             steps=sum(row.steps for row in combat_rows),
         )
@@ -583,9 +603,21 @@ class HybridIQLLearner:
         self.metrics.macro_td_abs = float(macro.td_abs.detach().item())
         self.metrics.combat_td_abs = float(combat.td_abs.detach().item())
         weights = torch.cat([macro.weights, combat.weights])
+        positive_advantages = torch.cat(
+            [macro.positive_advantages, combat.positive_advantages]
+        )
         entropies = torch.cat([macro.entropies, combat.entropies])
         self.metrics.mean_advantage_weight = float(weights.mean().item())
         self.metrics.maximum_advantage_weight = float(weights.max().item())
+        self.metrics.macro_positive_advantage_fraction = float(
+            macro.positive_advantages.float().mean().item()
+        )
+        self.metrics.combat_positive_advantage_fraction = float(
+            combat.positive_advantages.float().mean().item()
+        )
+        self.metrics.positive_advantage_fraction = float(
+            positive_advantages.float().mean().item()
+        )
         self.metrics.mean_policy_entropy = float(entropies.mean().item())
         self.metrics.critic_gradient_norm = float(critic_norm)
         self.metrics.actor_gradient_norm = float(actor_norm)

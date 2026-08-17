@@ -1,6 +1,8 @@
 # Hybrid Recurrent IQL/AWAC v1
 
-Status: implementation and short-isolation validation.
+Status: base critic/model design retained.  The actor weight is superseded by
+`hybrid-iql-strict-improvement-v3.md`; the plain `exp(A)` equation below is
+historical evidence, not the current collection-support contract.
 
 This document supersedes the **control objective** in
 `hybrid-domain-fusion-candidate-q-v1.md`. The factual graph, semantic actions,

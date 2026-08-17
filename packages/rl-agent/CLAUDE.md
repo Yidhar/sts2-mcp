@@ -161,7 +161,9 @@ payload drift; optional static catalog provenance is not a gate. A declared
 into a new lineage; optimizer, queue, RNG, counters, and all replay sidecars reset.
 Older compatible checkpoints may initialize all shared network tensors while
 the complete all-or-none long-horizon head group starts fresh; this is never
-reported as exact resume.
+reported as exact resume. A reviewed same-curriculum model initialization may
+carry collection-domain decision clocks solely to avoid rewinding behavior
+epsilon; learner/policy counters, optimizer, replay and RNG still reset.
 
 ## Change discipline
 
