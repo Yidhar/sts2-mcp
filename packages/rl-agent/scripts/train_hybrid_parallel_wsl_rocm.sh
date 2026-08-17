@@ -192,6 +192,11 @@ PERIODIC_EVALUATION_PID=""
 
 for index in $(seq 0 $((COLLECTORS - 1))); do
   producer="collector-$index"
+  if (( index % 2 == 0 )); then
+    collection_role="exploitation"
+  else
+    collection_role="support"
+  fi
   python scripts/run_hybrid_collector.py \
     --config "$CONFIG" \
     --champion "$CHAMPION" \
@@ -201,6 +206,7 @@ for index in $(seq 0 $((COLLECTORS - 1))); do
     --metrics-out "$METRICS/$producer.jsonl" \
     --pipeline-id "$PIPELINE_ID" \
     --producer-id "$producer" \
+    --collection-role "$collection_role" \
     --episodes "$COLLECTOR_EPISODES" \
     --start-episode-index "$COLLECTOR_START_EPISODE" \
     --seed $((SEED_BASE + index * 100000)) \

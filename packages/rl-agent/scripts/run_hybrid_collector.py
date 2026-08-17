@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect complete mixed-domain runs for the hybrid IQL/AWAC learner."""
+"""Collect complete mixed-domain runs for the hybrid IQL learner."""
 
 from __future__ import annotations
 
@@ -23,7 +23,11 @@ from sts2_baseline import (
 from sts2_env.headless_sim_bridge_client import HeadlessSimError
 from sts2_rl.backends.headless import HeadlessRecoverableProtocolError
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots
-from sts2_rl.joint import DomainExplorationSchedule, HybridCollectionAuthority
+from sts2_rl.joint import (
+    DomainExplorationSchedule,
+    FactualCoverageSchedule,
+    HybridCollectionAuthority,
+)
 from sts2_rl.macro import load_trunk_state
 from sts2_rl.models import HybridDomainIQLModel, HybridIQLConfig
 from sts2_rl.training import build_backend, build_training_resources, load_training_config
@@ -87,6 +91,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--metrics-out", required=True)
     parser.add_argument("--pipeline-id", required=True)
     parser.add_argument("--producer-id", required=True)
+    parser.add_argument(
+        "--collection-role",
+        choices=("exploitation", "support"),
+        default="support",
+        help="ordinary domain epsilon or additional sparse-macro factual coverage",
+    )
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--start-episode-index", type=int, default=0)
     parser.add_argument("--seed", type=int, required=True)
@@ -100,7 +110,11 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     status = Path(args.status_out)
-    base = {"pipeline_id": args.pipeline_id, "producer_id": args.producer_id}
+    base = {
+        "pipeline_id": args.pipeline_id,
+        "producer_id": args.producer_id,
+        "collection_role": args.collection_role,
+    }
     _atomic_json(status, {**base, "state": "running", "unix_s": time.time()})
     resources = None
     try:
@@ -248,6 +262,11 @@ def main() -> int:
             seed=collector_seed,
             macro_exploration=macro_schedule,
             combat_exploration=combat_schedule,
+            factual_coverage=(
+                FactualCoverageSchedule(0.0, 0.0, 1)
+                if args.collection_role == "exploitation"
+                else None
+            ),
         )
         resources.collector.macro_authority = authority
         spool = Path(args.spool)
@@ -352,6 +371,7 @@ def main() -> int:
                     collected_at=collected_at,
                 )
                 summary["control_forward_retries"] = authority.forward_retries
+                summary["collection_role"] = args.collection_role
                 if run is not None:
                     envelope = {
                         "format": HYBRID_SPOOL_ENVELOPE,

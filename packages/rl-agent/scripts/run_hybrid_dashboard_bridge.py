@@ -11,6 +11,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+# PATH_BOUNDARY_DELEGATED: the supervised Windows launcher creates the run
+# root and dashboard output below the configured artifact root before this
+# read-only projection process starts.
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -209,7 +213,7 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                     "architecture": (
                         "hybrid-domain-iql-v1"
                         if str(manifest.get("algorithm", "")).startswith(
-                            "recurrent_iql_awac_"
+                            "recurrent_iql_"
                         )
                         else "hybrid-domain-candidate-q-v1"
                     )
@@ -251,6 +255,7 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "episode_id": f"hybrid-run-{episode_number}",
                 "reset_seed": row.get("reset_seed"),
                 "producer_id": row.get("producer_id"),
+                "collection_role": row.get("collection_role"),
                 "max_floor": row.get("max_floor"),
                 "revivals_used": row.get("revivals_used"),
                 "act1_revivals": row.get("act1_revivals"),
@@ -302,6 +307,15 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 ),
                 "hybrid_maximum_advantage_weight": item.get(
                     "maximum_advantage_weight"
+                ),
+                "hybrid_macro_positive_advantage_fraction": item.get(
+                    "macro_positive_advantage_fraction"
+                ),
+                "hybrid_combat_positive_advantage_fraction": item.get(
+                    "combat_positive_advantage_fraction"
+                ),
+                "hybrid_positive_advantage_fraction": item.get(
+                    "positive_advantage_fraction"
                 ),
                 "hybrid_critic_gradient_norm": item.get(
                     "critic_gradient_norm"

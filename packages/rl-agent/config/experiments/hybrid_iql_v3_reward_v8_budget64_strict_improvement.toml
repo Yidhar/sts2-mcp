@@ -1,0 +1,42 @@
+# Hybrid IQL strict-improvement actor with split collection roles.
+#
+# Q and expectile V learn every factual transition.  The detached-feature
+# actor updates only from strictly positive critic advantage, so support
+# exploration cannot become neutral-weight behavior cloning.  Even-numbered
+# collectors retain the mature policy's ordinary domain epsilon; odd-numbered
+# collectors additionally cover sparse multi-branch macro surfaces.
+
+[optimization]
+learning_rate = 0.0001
+
+[transaction_learning]
+enabled = false
+
+[failure_credit]
+mode = "disabled"
+
+[rollout]
+deterministic_probe_interval_episodes = 0
+deterministic_probe_environment_steps = []
+
+[episodic_learning]
+enabled = false
+
+[curriculum]
+revival_budget = 64
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 100000
+
+[runtime]
+rocm_sdpa_backend = "math"
+# Preserve the paired held-out namespace used by policy 100 and the failed
+# factual-support isolation.  Training collectors receive a separate launcher
+# seed range.
+seed = 6600000
+log_dir = "runs/hybrid-iql-v3-reward-v8-budget64-strict-improvement"
+checkpoint_dir = "checkpoints/hybrid-iql-v3-reward-v8-budget64-strict-improvement"
+evaluation_steps = []
+early_evaluation_steps = []
+final_audit_steps = []
+evaluation_liveness_guard_enabled = false

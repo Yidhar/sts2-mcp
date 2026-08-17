@@ -59,6 +59,9 @@ def test_parallel_dashboard_uses_learner_acknowledgement_order(tmp_path: Path) -
                 "producer_id": producer,
                 "episode": {
                     "producer_id": producer,
+                    "collection_role": (
+                        "exploitation" if producer == "collector-0" else "support"
+                    ),
                     "reset_seed": seed,
                     "steps": 100,
                     "max_floor": 5,
@@ -100,6 +103,10 @@ def test_parallel_dashboard_uses_learner_acknowledgement_order(tmp_path: Path) -
     events = bridge._projection(args)
     episodes = [row for row in events if row["event"] == "train_episode"]
     assert [row["producer_id"] for row in episodes] == ["collector-0", "collector-1"]
+    assert [row["collection_role"] for row in episodes] == [
+        "exploitation",
+        "support",
+    ]
     assert [row["reset_seed"] for row in episodes] == [10, 20]
     assert [row["act1_revivals"] for row in episodes] == [1, 1]
     assert events[0]["config"]["runtime"]["collector_workers"] == 2
@@ -185,6 +192,9 @@ def test_parallel_launcher_defaults_to_two_collectors_and_one_update() -> None:
     assert 'COLLECTOR_DEVICE="${STS2_HYBRID_COLLECTOR_DEVICE:-cuda}"' in script
     assert 'COLLECTOR_START_EPISODE="${STS2_HYBRID_COLLECTOR_START_EPISODE:-0}"' in script
     assert '--producer-id "collector-$index"' in script
+    assert 'collection_role="exploitation"' in script
+    assert 'collection_role="support"' in script
+    assert '--collection-role "$collection_role"' in script
     assert '--start-episode-index "$COLLECTOR_START_EPISODE"' in script
     assert 'COLLECTOR_PIDS+=("$!")' in script
     assert "exited while learner was running" in script
@@ -214,6 +224,22 @@ def test_v8_q_calibration_preserves_early_update_debt_and_disables_dropout() -> 
     assert "while pending_learner_updates > 0:" in source
     assert "pending_learner_updates -= 1" in source
     assert '"pending_learner_updates": pending_learner_updates' in source
+
+
+def test_model_init_inherits_collection_curriculum_clocks() -> None:
+    trainer = _script("run_hybrid_trainer.py")
+    assert trainer._source_domain_decisions(
+        {"domain_decisions": {"macro": 11_196, "combat": 66_484}}
+    ) == {"macro": 11_196, "combat": 66_484}
+    assert trainer._source_domain_decisions({}) is None
+    with pytest.raises(ValueError, match="combat decision clock"):
+        trainer._source_domain_decisions(
+            {"domain_decisions": {"macro": 11_196, "combat": -1}}
+        )
+
+    source = (SCRIPT_ROOT / "run_hybrid_trainer.py").read_text(encoding="utf-8")
+    assert "inherited_domain_decisions = _source_domain_decisions(state)" in source
+    assert "domain_decisions = inherited_domain_decisions" in source
 
 
 def test_parallel_dashboard_surfaces_collector_failure(tmp_path: Path) -> None:
@@ -273,6 +299,14 @@ def test_hybrid_collector_continuation_advances_its_seed_stream() -> None:
     assert "collector_seed = args.seed + args.start_episode_index" in source
     assert "replace(config.runtime, seed=collector_seed)" in source
     assert "seed=collector_seed" in source
+
+
+def test_hybrid_collectors_split_exploitation_from_factual_support() -> None:
+    source = (SCRIPT_ROOT / "run_hybrid_collector.py").read_text(encoding="utf-8")
+    assert 'choices=("exploitation", "support")' in source
+    assert 'args.collection_role == "exploitation"' in source
+    assert "FactualCoverageSchedule(0.0, 0.0, 1)" in source
+    assert 'summary["collection_role"] = args.collection_role' in source
 
 
 def test_trainer_publication_uses_unique_atomic_replacement() -> None:
@@ -551,7 +585,7 @@ def test_dashboard_reads_hybrid_evaluation_summary() -> None:
     assert '"hybrid_last_target_update": item.get("last_target_update")' in source
     assert 'row.get("event") == "hybrid_evaluation_started"' in source
     assert 'state == "complete" and not evaluation_in_progress' in source
-    assert 'startswith(\n                            "recurrent_iql_awac_"' in source
+    assert 'startswith(\n                            "recurrent_iql_"' in source
 
 
 def test_monitor_projects_hybrid_target_update_clock() -> None:

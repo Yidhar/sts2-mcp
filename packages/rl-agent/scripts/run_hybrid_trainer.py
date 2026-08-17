@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified recurrent hybrid IQL/AWAC trainer over complete factual runs."""
+"""Unified recurrent hybrid IQL trainer over complete factual runs."""
 
 from __future__ import annotations
 
@@ -135,6 +135,31 @@ def _source_death_price(source: Mapping[str, Any]) -> float | None:
                 if isinstance(value, int | float) and not isinstance(value, bool):
                     return float(value)
     return None
+
+
+def _source_domain_decisions(source: Mapping[str, Any]) -> dict[str, int] | None:
+    """Carry collection-curriculum clocks across a model-init boundary.
+
+    Learner updates, policy versions, optimizer state and replay still start a
+    new lineage.  Domain decision counts are behavior-schedule progress: if
+    they rewind, a mature parent abruptly returns to its maximum epsilon and
+    the first corpus no longer represents the policy being initialized.
+    """
+
+    raw = source.get("domain_decisions")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError("hybrid model-init domain decision clocks must be a mapping")
+    decisions: dict[str, int] = {}
+    for domain in ("macro", "combat"):
+        value = raw.get(domain)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"hybrid model-init {domain} decision clock must be non-negative"
+            )
+        decisions[domain] = value
+    return decisions
 
 
 def _forward(model: HybridDomainIQLModel, encoder: Any, device: torch.device) -> Any:
@@ -341,6 +366,9 @@ def main() -> int:
                     "hybrid IQL model-init requires a finite Candidate-Q or IQL publication"
                 )
             target.load_state_dict(online.state_dict(), strict=True)
+            inherited_domain_decisions = _source_domain_decisions(state)
+            if inherited_domain_decisions is not None:
+                domain_decisions = inherited_domain_decisions
             # Candidate-Q v8 parents already completed their one-time scalar
             # calibration.  IQL inherits that Q scale; its V head starts on
             # the same offset and is fitted by the expectile objective.
