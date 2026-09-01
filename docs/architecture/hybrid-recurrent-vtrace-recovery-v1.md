@@ -97,3 +97,30 @@ Operational files:
 The existing hybrid dashboard bridge accepts the new episode/update events and
 shows domain policy/value losses, entropy weight, importance ratio, lag and
 shared-gradient interaction alongside the held-out journals.
+
+## Scope boundary and the next macro-credit experiment
+
+This lineage restores the recent, entropy-bearing recurrent online learning
+path and repairs the death-price geometry.  It does **not** claim to solve
+same-state counterfactual credit for long-horizon macro choices.
+
+In particular:
+
+- the V-trace recursion reaches only across one short mixed-domain unroll; it
+  is not an episode-wide macro SMDP lambda-return;
+- branch-balanced epsilon collection guarantees that a legal branch can be
+  observed, but an epsilon-selected action with learned probability near zero
+  still has a small target-policy importance ratio; support collection alone
+  is therefore not a non-vanishing actor-recovery mechanism;
+- one observed run still cannot identify what would have happened if a
+  different rest, reward, shop, upgrade or route action had been taken at the
+  same root state.
+
+The first run of this lineage is consequently a clean baseline, not the final
+macro-credit system.  The next experiment should remain separate: first build
+a read-only same-root macro rollout diagnostic, then—only if the measured
+ranking/regret gap warrants it—train a compact macro candidate-Q path from
+macro SMDP lambda-returns and grouped same-root simulator returns.  Results are
+normalized per semantic root and branch, and are distilled into the existing
+macro policy; no operation-specific rule, CE corridor or inference-time MCTS
+is added to this baseline.
