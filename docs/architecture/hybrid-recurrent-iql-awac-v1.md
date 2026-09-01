@@ -1,8 +1,9 @@
 # Hybrid Recurrent IQL/AWAC v1
 
-Status: base critic/model design retained.  The actor weight is superseded by
-`hybrid-iql-strict-improvement-v3.md`; the plain `exp(A)` equation below is
-historical evidence, not the current collection-support contract.
+Status: retired as the online main learner.  The actor-weight experiment was
+superseded first by `hybrid-iql-strict-improvement-v3.md` and then by
+`hybrid-recurrent-vtrace-recovery-v1.md`.  The factual representation remains;
+the IQL replay/critic/actor objective below is historical evidence.
 
 This document supersedes the **control objective** in
 `hybrid-domain-fusion-candidate-q-v1.md`. The factual graph, semantic actions,

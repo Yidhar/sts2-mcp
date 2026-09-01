@@ -11,6 +11,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+_UPDATE_EVENTS = frozenset({"hybrid_update", "hybrid_vtrace_update"})
+_EPISODE_EVENTS = frozenset({"hybrid_vtrace_episode"})
+
 # PATH_BOUNDARY_DELEGATED: the supervised Windows launcher creates the run
 # root and dashboard output below the configured artifact root before this
 # read-only projection process starts.
@@ -26,7 +29,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--collector-episode-capacity", type=int, required=True)
     parser.add_argument("--collector-count", type=int, default=1)
     parser.add_argument("--collector-device", default="cpu")
-    parser.add_argument("--maximum-pending-runs", type=int, required=True)
+    parser.add_argument(
+        "--maximum-pending-runs",
+        "--maximum-pending-items",
+        dest="maximum_pending_runs",
+        type=int,
+        required=True,
+    )
     parser.add_argument("--revival-budget", type=int, required=True)
     parser.add_argument("--final-evaluation-episodes", type=int, default=16)
     parser.add_argument("--curriculum-mode", default="hybrid-candidate-q")
@@ -63,9 +72,9 @@ def _canonical_trainer_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     canonical: list[dict[str, Any]] = []
     for row in rows:
-        ingested = row.get("ingested_runs")
+        ingested = row.get("ingested_runs", row.get("completed_runs"))
         if (
-            row.get("event") == "hybrid_update"
+            row.get("event") in _UPDATE_EVENTS
             and isinstance(ingested, int)
             and not isinstance(ingested, bool)
         ):
@@ -73,9 +82,15 @@ def _canonical_trainer_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 previous
                 for previous in canonical
                 if not (
-                    previous.get("event") == "hybrid_update"
-                    and isinstance(previous.get("ingested_runs"), int)
-                    and int(previous["ingested_runs"]) >= ingested
+                    previous.get("event") in _UPDATE_EVENTS
+                    and isinstance(
+                        previous.get("ingested_runs", previous.get("completed_runs")),
+                        int,
+                    )
+                    and int(
+                        previous.get("ingested_runs", previous.get("completed_runs"))
+                    )
+                    >= ingested
                 )
             ]
         canonical.append(row)
@@ -124,9 +139,16 @@ def _acknowledged_episodes(
     acknowledged = [
         dict(row["episode"])
         for row in trainer_rows
-        if row.get("event") == "hybrid_update" and isinstance(row.get("episode"), dict)
+        if row.get("event") in _UPDATE_EVENTS and isinstance(row.get("episode"), dict)
         and row["episode"]
     ]
+    acknowledged.extend(
+        dict(row["episode"])
+        for row in trainer_rows
+        if row.get("event") in _EPISODE_EVENTS
+        and isinstance(row.get("episode"), dict)
+        and row["episode"]
+    )
     if acknowledged:
         return acknowledged[: max(0, ingested_runs - resumed_from)]
     return _ingested_episodes(
@@ -153,18 +175,42 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
     collector_statuses = [
         _read_json(path) for path in sorted((run_root / "status").glob("collector-*.json"))
     ]
-    latest = trainer_rows[-1] if trainer_rows else {}
+    latest = next(
+        (row for row in reversed(trainer_rows) if isinstance(row.get("learner"), dict)),
+        trainer_rows[-1] if trainer_rows else {},
+    )
     learner_raw = latest.get("learner")
     learner: dict[str, Any] = learner_raw if isinstance(learner_raw, dict) else {}
-    resumed_from = int(manifest.get("resumed_from_ingested_runs", 0) or 0)
-    ingested = int(latest.get("ingested_runs", resumed_from) or resumed_from)
+    resumed_from = int(
+        manifest.get(
+            "resumed_from_ingested_runs",
+            manifest.get("resumed_from_completed_runs", 0),
+        )
+        or 0
+    )
+    ingested = int(
+        trainer_status.get(
+            "completed_runs",
+            latest.get("ingested_runs", latest.get("completed_runs", resumed_from)),
+        )
+        or resumed_from
+    )
     source_environment_steps = int(manifest.get("source_environment_steps", 0) or 0)
     environment_steps = int(
-        latest.get("environment_steps", source_environment_steps)
+        trainer_status.get(
+            "environment_steps",
+            latest.get("environment_steps", source_environment_steps),
+        )
         or source_environment_steps
     )
     source_updates = int(manifest.get("source_learner_updates", 0) or 0)
-    learner_updates = int(learner.get("updates", source_updates) or source_updates)
+    learner_updates = int(
+        trainer_status.get(
+            "learner_updates",
+            learner.get("updates", source_updates),
+        )
+        or source_updates
+    )
     environment_steps_by_policy: dict[int, int] = {}
     for row in trainer_rows:
         row_learner = row.get("learner")
@@ -211,7 +257,9 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 },
                 "model": {
                     "architecture": (
-                        "hybrid-domain-iql-v1"
+                        "hybrid-domain-actor-critic-v1"
+                        if "vtrace" in str(manifest.get("algorithm", "")).lower()
+                        else "hybrid-domain-iql-v1"
                         if str(manifest.get("algorithm", "")).startswith(
                             "recurrent_iql_"
                         )
@@ -229,9 +277,9 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
         }
     ]
     trainer_by_run = {
-        int(row.get("ingested_runs", 0) or 0): row
+        int(row.get("ingested_runs", row.get("completed_runs", 0)) or 0): row
         for row in trainer_rows
-        if row.get("event") == "hybrid_update"
+        if row.get("event") in _UPDATE_EVENTS | _EPISODE_EVENTS
     }
     cumulative_steps = source_environment_steps
     for episode_number, row in enumerate(
@@ -269,7 +317,7 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
         )
     pending = len(tuple((run_root / "spool").glob("*.pkl")))
     for row in trainer_rows:
-        if row.get("event") != "hybrid_update":
+        if row.get("event") not in _UPDATE_EVENTS:
             continue
         item_raw = row.get("learner")
         item: dict[str, Any] = item_raw if isinstance(item_raw, dict) else {}
@@ -301,7 +349,25 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                 "hybrid_combat_value_loss": item.get("combat_value_loss"),
                 "hybrid_macro_actor_loss": item.get("macro_actor_loss"),
                 "hybrid_combat_actor_loss": item.get("combat_actor_loss"),
-                "hybrid_policy_entropy": item.get("mean_policy_entropy"),
+                "hybrid_macro_policy_loss": item.get("macro_policy_loss"),
+                "hybrid_combat_policy_loss": item.get("combat_policy_loss"),
+                "hybrid_policy_entropy": item.get(
+                    "mean_policy_entropy",
+                    (
+                        (float(item.get("macro_entropy", 0.0)) + float(item.get("combat_entropy", 0.0)))
+                        / 2.0
+                        if item.get("macro_entropy") is not None
+                        and item.get("combat_entropy") is not None
+                        else None
+                    ),
+                ),
+                "hybrid_macro_entropy": item.get("macro_entropy"),
+                "hybrid_combat_entropy": item.get("combat_entropy"),
+                "hybrid_entropy_weight": item.get("entropy_weight"),
+                "hybrid_mean_importance_ratio": item.get("mean_importance_ratio"),
+                "hybrid_clipped_importance_fraction": item.get(
+                    "clipped_importance_fraction"
+                ),
                 "hybrid_mean_advantage_weight": item.get(
                     "mean_advantage_weight"
                 ),
@@ -370,8 +436,8 @@ def _projection(args: argparse.Namespace) -> list[dict[str, Any]]:
                     "phase": "collecting",
                     "decision_domain": "joint",
                     "policy_decisions": (
-                        int(item_replay.get("macro_steps", 0) or 0)
-                        + int(item_replay.get("combat_steps", 0) or 0)
+                        int(item.get("macro_steps", item_replay.get("macro_steps", 0)) or 0)
+                        + int(item.get("combat_steps", item_replay.get("combat_steps", 0)) or 0)
                     ),
                 },
             }

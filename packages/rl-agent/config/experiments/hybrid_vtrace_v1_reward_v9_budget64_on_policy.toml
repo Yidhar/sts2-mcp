@@ -1,0 +1,48 @@
+# Hybrid v1: fresh recurrent V-trace over the dual-stream semantic model.
+#
+# This is a model-init lineage from the healthy hybrid-IQL policy-100 parent.
+# It inherits representation, policy, value, split memories and exploration
+# clocks only.  The IQL optimizer/replay/target/death-price controller are not
+# part of this course.  Reward-v9 restores a high first-death price in every
+# Act and retains a non-zero tail price through the full budget.
+
+[optimization]
+learning_rate = 0.0001
+policy_weight = 1.0
+value_weight = 0.5
+entropy_weight = 0.02
+entropy_weight_end = 0.004
+entropy_decay_updates = 4000
+vtrace_rho_clip = 1.0
+vtrace_c_clip = 1.0
+policy_rho_clip = 1.0
+
+[rollout]
+unroll_length = 16
+deterministic_probe_interval_episodes = 0
+deterministic_probe_environment_steps = []
+
+[transaction_learning]
+enabled = false
+
+[failure_credit]
+mode = "disabled"
+
+[episodic_learning]
+enabled = false
+
+[curriculum]
+revival_budget = 64
+epsilon_start = 0.15
+epsilon_end = 0.05
+epsilon_decay_steps = 100000
+
+[runtime]
+rocm_sdpa_backend = "math"
+seed = 6700000
+log_dir = "runs/hybrid-vtrace-v1-reward-v9-budget64-on-policy"
+checkpoint_dir = "checkpoints/hybrid-vtrace-v1-reward-v9-budget64-on-policy"
+evaluation_steps = []
+early_evaluation_steps = []
+final_audit_steps = []
+evaluation_liveness_guard_enabled = false

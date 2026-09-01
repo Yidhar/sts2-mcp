@@ -118,6 +118,87 @@ def test_parallel_dashboard_uses_learner_acknowledgement_order(tmp_path: Path) -
     assert updates[-1]["hybrid_death_price_support_successes"] == 12
 
 
+def test_dashboard_projects_streaming_hybrid_vtrace_rows(tmp_path: Path) -> None:
+    bridge = _script("run_hybrid_dashboard_bridge.py")
+    run_root = tmp_path / "vtrace"
+    (run_root / "launcher").mkdir(parents=True)
+    (run_root / "status").mkdir()
+    (run_root / "launcher" / "launch.json").write_text(
+        json.dumps({"algorithm": "hybrid_vtrace_v1"}), encoding="utf-8"
+    )
+    (run_root / "status" / "trainer.json").write_text(
+        json.dumps(
+            {
+                "state": "running",
+                "completed_runs": 1,
+                "environment_steps": 120,
+                "learner_updates": 3,
+            }
+        ),
+        encoding="utf-8",
+    )
+    _append(
+        run_root / "metrics" / "trainer.jsonl",
+        {
+            "event": "hybrid_vtrace_episode",
+            "completed_runs": 1,
+            "environment_steps": 120,
+            "episode": {
+                "producer_id": "collector-0",
+                "collection_role": "exploitation",
+                "reset_seed": 77,
+                "steps": 120,
+                "max_floor": 12,
+                "revivals_used": 2,
+                "run_won": False,
+            },
+        },
+        {
+            "event": "hybrid_vtrace_update",
+            "completed_runs": 1,
+            "environment_steps": 120,
+            "spool_pending": 2,
+            "learner": {
+                "updates": 3,
+                "loss": 0.2,
+                "macro_loss": 0.1,
+                "combat_loss": 0.3,
+                "macro_policy_loss": -0.02,
+                "combat_policy_loss": 0.04,
+                "macro_entropy": 0.7,
+                "combat_entropy": 0.3,
+                "entropy_weight": 0.02,
+                "mean_importance_ratio": 0.9,
+                "gradient_norm": 0.5,
+                "macro_steps": 8,
+                "combat_steps": 32,
+            },
+        },
+    )
+    args = SimpleNamespace(
+        run_root=str(run_root),
+        lineage="hybrid-vtrace",
+        run_id="vtrace-1",
+        target_runs=400,
+        collector_episode_capacity=220,
+        collector_count=4,
+        collector_device="cuda",
+        maximum_pending_runs=32,
+        revival_budget=64,
+        curriculum_mode="hybrid-vtrace-v1",
+    )
+    events = bridge._projection(args)
+    assert events[0]["config"]["model"]["architecture"] == (
+        "hybrid-domain-actor-critic-v1"
+    )
+    episode = next(row for row in events if row["event"] == "train_episode")
+    assert episode["reset_seed"] == 77
+    update = next(row for row in events if row["event"] == "learner_update")
+    assert update["hybrid_macro_policy_loss"] == pytest.approx(-0.02)
+    assert update["hybrid_entropy_weight"] == pytest.approx(0.02)
+    assert update["hybrid_mean_importance_ratio"] == pytest.approx(0.9)
+
+
 def test_parallel_dashboard_resume_starts_at_checkpoint_counters(tmp_path: Path) -> None:
     bridge = _script("run_hybrid_dashboard_bridge.py")
     run_root = tmp_path / "resumed"
@@ -388,6 +469,18 @@ def test_parallel_launcher_establishes_heldout_floor_before_collection() -> None
     assert '[[ "$STARTUP_EVALUATION_EPISODES" -eq 0 && -z "$RESUME" ]]' in source
     assert "exact resume reuses restored held-out controller evidence" in source
     assert '--metrics-out "$METRICS/evaluation.jsonl"' in source
+
+
+def test_vtrace_parallel_launcher_evaluates_before_streaming_collectors() -> None:
+    source = (SCRIPT_ROOT / "train_hybrid_vtrace_parallel_wsl_rocm.sh").read_text(
+        encoding="utf-8"
+    )
+    startup = source.index("python scripts/run_hybrid_vtrace_evaluation.py")
+    collector = source.index("python scripts/run_hybrid_vtrace_collector.py")
+    assert startup < collector
+    assert "--batch-unrolls" in source
+    assert "--replay-runs" not in source
+    assert "--updates-per-run" not in source
 
 
 def test_parallel_dashboard_preserves_standard_hybrid_evaluation_fields(
