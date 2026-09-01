@@ -4,9 +4,11 @@ import pytest
 
 from sts2_baseline import (
     AbsoluteDeathPriceRewardCalculator,
+    ActFrontloadedDeathRewardCalculator,
     RevivalEfficiencyRewardCalculator,
     TaskRewardCalculator,
     absolute_death_price_reward_identity,
+    act_frontloaded_death_reward_identity,
     revival_efficiency_reward_identity,
     task_reward_identity,
 )
@@ -301,6 +303,49 @@ def test_reward_v8_uses_the_larger_terminal_outcome_margin() -> None:
     assert victory.terminal_reward == 2.0
     assert defeat.terminal_reward == -2.0
     assert victory.discount == defeat.discount == 0.0
+
+
+def test_reward_v9_frontloads_each_act_and_keeps_a_tail_price() -> None:
+    calculator = ActFrontloadedDeathRewardCalculator(
+        objective="run",
+        maximum_episode_steps=512,
+        revival_budget=64,
+    )
+    calculator.begin_episode()
+    first = calculator.evaluate(
+        _result(step=0, act=1, revival_budget=64, revivals_used=0),
+        _result(step=1, act=1, revival_budget=64, revivals_used=1),
+    )
+    second = calculator.evaluate(
+        _result(step=1, act=1, revival_budget=64, revivals_used=1),
+        _result(step=2, act=1, revival_budget=64, revivals_used=2),
+    )
+    third = calculator.evaluate(
+        _result(step=2, act=1, revival_budget=64, revivals_used=2),
+        _result(step=3, act=1, revival_budget=64, revivals_used=3),
+    )
+    assert first.revival_penalty == pytest.approx(-0.1125)
+    assert second.revival_penalty == pytest.approx(-(0.0125 + 0.2 / 6.0))
+    assert third.revival_penalty == pytest.approx(-(0.0125 + 0.2 / 12.0))
+
+    boundary = calculator.evaluate(
+        _result(step=3, act=1, revival_budget=64, revivals_used=3),
+        _result(step=4, act=2, revival_budget=64, revivals_used=3),
+    )
+    first_act2 = calculator.evaluate(
+        _result(step=4, act=2, revival_budget=64, revivals_used=3),
+        _result(step=5, act=2, revival_budget=64, revivals_used=4),
+    )
+    assert boundary.revival_penalty == 0.0
+    assert first_act2.revival_penalty == pytest.approx(-0.1125)
+
+
+def test_reward_v9_identity_is_budget_specific_without_a_digest() -> None:
+    identity = act_frontloaded_death_reward_identity(revival_budget=64)
+    assert identity["version"] == "sts2-run-survival-efficiency-v9"
+    assert identity["revival_budget"] == 64
+    assert "fingerprint" not in identity
+    assert "fingerprint_sha256" not in identity
 
 
 def test_healing_does_not_erase_exact_hp_loss_cost() -> None:

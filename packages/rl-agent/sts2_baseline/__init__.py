@@ -3,11 +3,14 @@
 from .objective import (
     ABSOLUTE_DEATH_PRICE_REWARD_SPEC,
     ABSOLUTE_DEATH_PRICE_TASK_REWARD_SPEC,
+    ACT_FRONTLOADED_DEATH_REWARD_SPEC,
     REVIVAL_EFFICIENCY_REWARD_SPEC,
     TASK_REWARD_SPEC,
     AbsoluteDeathPriceRewardCalculator,
     AbsoluteDeathPriceRewardSpec,
     AbsoluteDeathPriceTaskRewardSpec,
+    ActFrontloadedDeathRewardCalculator,
+    ActFrontloadedDeathRewardSpec,
     RevivalEfficiencyRewardCalculator,
     RevivalEfficiencyRewardSpec,
     TaskObjective,
@@ -16,6 +19,7 @@ from .objective import (
     TaskRewardCalculator,
     TaskRewardSpec,
     absolute_death_price_reward_identity,
+    act_frontloaded_death_reward_identity,
     revival_efficiency_reward_identity,
     task_reward_identity,
 )
@@ -32,6 +36,7 @@ from .rollout import (
 __all__ = [
     "ABSOLUTE_DEATH_PRICE_REWARD_SPEC",
     "ABSOLUTE_DEATH_PRICE_TASK_REWARD_SPEC",
+    "ACT_FRONTLOADED_DEATH_REWARD_SPEC",
     "REVIVAL_EFFICIENCY_REWARD_SPEC",
     "ROLLOUT_QUEUE_VERSION",
     "ROLLOUT_STEP_VERSION",
@@ -40,6 +45,8 @@ __all__ = [
     "AbsoluteDeathPriceRewardCalculator",
     "AbsoluteDeathPriceRewardSpec",
     "AbsoluteDeathPriceTaskRewardSpec",
+    "ActFrontloadedDeathRewardCalculator",
+    "ActFrontloadedDeathRewardSpec",
     "BoundedRolloutQueue",
     "RevivalEfficiencyRewardCalculator",
     "RevivalEfficiencyRewardSpec",
@@ -52,6 +59,7 @@ __all__ = [
     "TaskRewardCalculator",
     "TaskRewardSpec",
     "absolute_death_price_reward_identity",
+    "act_frontloaded_death_reward_identity",
     "revival_efficiency_reward_identity",
     "task_reward_identity",
 ]

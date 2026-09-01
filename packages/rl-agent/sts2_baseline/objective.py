@@ -112,6 +112,33 @@ class AbsoluteDeathPriceRewardSpec:
 ABSOLUTE_DEATH_PRICE_REWARD_SPEC: Final = AbsoluteDeathPriceRewardSpec()
 
 
+@dataclass(frozen=True, slots=True)
+class ActFrontloadedDeathRewardSpec:
+    """Reward-v9 death cost used by the recurrent hybrid policy.
+
+    The first deaths in *each* Act are deliberately expensive, matching the
+    useful pressure of reward-v4, while a fixed tail price keeps every later
+    revival distinguishable.  ``act_frontload_cap * k / (k + 1)`` is applied
+    independently to each Act and ``tail_budget / revival_budget`` is charged
+    for every revival in the run.
+
+    The calculator owns no adaptive price or training feedback loop.  A
+    revival-budget change is a course boundary; within one course the reward
+    is stationary and can be learned by an ordinary recurrent actor-critic.
+    """
+
+    version: str = field(default="sts2-run-survival-efficiency-v9", init=False)
+    required_discount: float = field(default=1.0, init=False)
+    hp_loss_weight: float = field(default=0.55, init=False)
+    pace_budget: float = field(default=0.04, init=False)
+    hp_loss_scale: float = field(default=80.0, init=False)
+    act_frontload_cap: float = field(default=0.20, init=False)
+    tail_budget: float = field(default=0.80, init=False)
+
+
+ACT_FRONTLOADED_DEATH_REWARD_SPEC: Final = ActFrontloadedDeathRewardSpec()
+
+
 def task_reward_identity() -> dict[str, Any]:
     payload: dict[str, Any] = {
         "version": TASK_REWARD_SPEC.version,
@@ -178,6 +205,31 @@ def absolute_death_price_reward_identity() -> dict[str, Any]:
         "forbidden_shaping": "enemy_hp_delta+damage_dealt+cards_played",
     }
     return payload
+
+
+def act_frontloaded_death_reward_identity(*, revival_budget: int) -> dict[str, Any]:
+    """Return the stationary reward-v9 identity for one budget course."""
+
+    if isinstance(revival_budget, bool) or not isinstance(revival_budget, int):
+        raise TypeError("reward-v9 revival budget must be an integer")
+    if revival_budget <= 0:
+        raise ValueError("reward-v9 revival budget must be positive")
+    return {
+        "version": ACT_FRONTLOADED_DEATH_REWARD_SPEC.version,
+        "base": {
+            "version": ABSOLUTE_DEATH_PRICE_TASK_REWARD_SPEC.version,
+            "spec": asdict(ABSOLUTE_DEATH_PRICE_TASK_REWARD_SPEC),
+        },
+        "spec": asdict(ACT_FRONTLOADED_DEATH_REWARD_SPEC),
+        "revival_budget": revival_budget,
+        "revival_event_source": "observation._training.revivals_used exact counter",
+        "revival_pricing": (
+            "per_act 0.20*k/(k+1) plus per_run (0.80/revival_budget)*k"
+        ),
+        "act_reset": "observation.run.act boundary",
+        "hp_loss_source": "observation._training.player_hp_lost exact counter",
+        "forbidden_shaping": "enemy_hp_delta+damage_dealt+cards_played",
+    }
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -545,14 +597,150 @@ class AbsoluteDeathPriceRewardCalculator:
         )
 
 
+class ActFrontloadedDeathRewardCalculator:
+    """Reward-v9 with a fresh high marginal death price in every Act.
+
+    ``begin_episode`` is intentionally explicit because the Act-local counter
+    is an environment-course fact, not learner state.  Hybrid collectors call
+    it immediately before resetting/collecting a run.  The total revival and
+    HP-loss counters remain authoritative checks on every transition.
+    """
+
+    def __init__(
+        self,
+        *,
+        maximum_episode_steps: int,
+        revival_budget: int,
+        objective: TaskObjective = "combat",
+        discount: float = 1.0,
+    ) -> None:
+        if objective not in {"combat", "act1", "run"}:
+            raise ValueError("objective must be combat, act1, or run")
+        if isinstance(maximum_episode_steps, bool) or maximum_episode_steps <= 0:
+            raise ValueError("maximum_episode_steps must be a positive integer")
+        if isinstance(revival_budget, bool) or not isinstance(revival_budget, int):
+            raise TypeError("reward-v9 revival budget must be an integer")
+        if revival_budget <= 0:
+            raise ValueError("reward-v9 revival budget must be positive")
+        if float(discount) != ACT_FRONTLOADED_DEATH_REWARD_SPEC.required_discount:
+            raise ValueError("act-frontloaded death reward requires discount=1")
+        self.maximum_episode_steps = int(maximum_episode_steps)
+        self.revival_budget = int(revival_budget)
+        self.base = TaskRewardCalculator(
+            objective,
+            discount=discount,
+            spec=ABSOLUTE_DEATH_PRICE_TASK_REWARD_SPEC,
+        )
+        self._episode_started = False
+        self._current_act = 1
+        self._act_revivals = 0
+        self._last_total_revivals = 0
+
+    def begin_episode(self) -> None:
+        self._episode_started = True
+        self._current_act = 1
+        self._act_revivals = 0
+        self._last_total_revivals = 0
+
+    def _revival_penalty(self, count: int) -> float:
+        penalty = 0.0
+        tail = ACT_FRONTLOADED_DEATH_REWARD_SPEC.tail_budget / self.revival_budget
+        for ordinal in range(self._act_revivals + 1, self._act_revivals + count + 1):
+            penalty += tail + (
+                ACT_FRONTLOADED_DEATH_REWARD_SPEC.act_frontload_cap
+                / float(ordinal * (ordinal + 1))
+            )
+        self._act_revivals += count
+        return -penalty
+
+    def evaluate(
+        self,
+        before: EnvironmentResult,
+        after: EnvironmentResult,
+        *,
+        deadlock: bool = False,
+        horizon_exhausted: bool = False,
+    ) -> TaskReward:
+        if not self._episode_started:
+            self.begin_episode()
+        base = self.base.evaluate(
+            before,
+            after,
+            deadlock=deadlock,
+            horizon_exhausted=horizon_exhausted,
+        )
+        before_revivals = _training_counter(before.observation, "revivals_used")
+        after_revivals = _training_counter(after.observation, "revivals_used")
+        before_budget = _training_revival_budget(before.observation)
+        after_budget = _training_revival_budget(after.observation)
+        before_hp_lost = _training_counter(before.observation, "player_hp_lost")
+        after_hp_lost = _training_counter(after.observation, "player_hp_lost")
+        if before_budget != self.revival_budget or after_budget != self.revival_budget:
+            raise ValueError("environment revival budget differs from reward-v9 course")
+        if after_revivals < before_revivals or after_hp_lost < before_hp_lost:
+            raise ValueError("training efficiency counters must be monotonic")
+
+        raw_delta = after_revivals - before_revivals
+        if not float(raw_delta).is_integer():
+            raise ValueError("training revival delta must be an integer")
+        revivals_used_delta = int(raw_delta)
+        before_act = max(_run_position(before.observation)[0], 1)
+        after_act = max(_run_position(after.observation)[0], 1)
+        # A fresh episode or a newly entered Act gets a fresh front-loaded
+        # curve.  The run-wide tail remains in force through the fixed unit
+        # price and never refunds earlier Act costs.
+        if before_revivals < self._last_total_revivals or before_act < self._current_act:
+            self.begin_episode()
+        if before_act != self._current_act:
+            self._current_act = before_act
+            self._act_revivals = 0
+        revival_penalty = self._revival_penalty(revivals_used_delta)
+        self._last_total_revivals = int(after_revivals)
+        if after_act != before_act:
+            self._current_act = after_act
+            self._act_revivals = 0
+
+        player_hp_lost_delta = after_hp_lost - before_hp_lost
+        hp_loss_penalty = -ACT_FRONTLOADED_DEATH_REWARD_SPEC.hp_loss_weight * (
+            _bounded_resource_score(
+                after_hp_lost,
+                ACT_FRONTLOADED_DEATH_REWARD_SPEC.hp_loss_scale,
+            )
+            - _bounded_resource_score(
+                before_hp_lost,
+                ACT_FRONTLOADED_DEATH_REWARD_SPEC.hp_loss_scale,
+            )
+        )
+        pace_penalty = -ACT_FRONTLOADED_DEATH_REWARD_SPEC.pace_budget / float(
+            self.maximum_episode_steps
+        )
+        return TaskReward(
+            reward=float(base.reward + hp_loss_penalty + revival_penalty + pace_penalty),
+            discount=base.discount,
+            terminal_reward=base.terminal_reward,
+            potential_reward=base.potential_reward,
+            task_terminal=base.task_terminal,
+            outcome=base.outcome,
+            revival_penalty=float(revival_penalty),
+            pace_penalty=float(pace_penalty),
+            hp_loss_penalty=float(hp_loss_penalty),
+            progress_reward=base.progress_reward,
+            revivals_used_delta=revivals_used_delta,
+            player_hp_lost_delta=float(player_hp_lost_delta),
+        )
+
+
 __all__ = [
     "ABSOLUTE_DEATH_PRICE_REWARD_SPEC",
     "ABSOLUTE_DEATH_PRICE_TASK_REWARD_SPEC",
+    "ACT_FRONTLOADED_DEATH_REWARD_SPEC",
     "REVIVAL_EFFICIENCY_REWARD_SPEC",
     "TASK_REWARD_SPEC",
     "AbsoluteDeathPriceRewardCalculator",
     "AbsoluteDeathPriceRewardSpec",
     "AbsoluteDeathPriceTaskRewardSpec",
+    "ActFrontloadedDeathRewardCalculator",
+    "ActFrontloadedDeathRewardSpec",
     "RevivalEfficiencyRewardCalculator",
     "RevivalEfficiencyRewardSpec",
     "TaskObjective",
@@ -561,6 +749,7 @@ __all__ = [
     "TaskRewardCalculator",
     "TaskRewardSpec",
     "absolute_death_price_reward_identity",
+    "act_frontloaded_death_reward_identity",
     "revival_efficiency_reward_identity",
     "task_reward_identity",
 ]

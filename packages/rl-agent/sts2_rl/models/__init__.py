@@ -19,11 +19,19 @@ from .grounded_candidate import (
     WorldEncoding,
     WorldTokenBatch,
 )
+from .hybrid_actor_critic import (
+    HYBRID_ACTOR_CRITIC_MODEL_VERSION,
+    HybridActorCriticConfig,
+    HybridActorCriticOutput,
+    HybridDomainActorCriticModel,
+    initialize_actor_critic_from_iql,
+)
 from .hybrid_candidate_q import (
     HYBRID_CANDIDATE_Q_VERSION,
     HybridCandidateQConfig,
     HybridCandidateQOutput,
     HybridDomainCandidateQModel,
+    HybridRepresentationOutput,
     initialize_hybrid_from_grounded,
 )
 from .hybrid_iql import (
@@ -35,6 +43,7 @@ from .hybrid_iql import (
 )
 
 __all__ = [
+    "HYBRID_ACTOR_CRITIC_MODEL_VERSION",
     "HYBRID_CANDIDATE_Q_VERSION",
     "HYBRID_IQL_MODEL_VERSION",
     "MACRO_ECONOMIC_SURFACE_CARD_REWARD",
@@ -50,16 +59,21 @@ __all__ = [
     "CandidateTokenBatch",
     "GroundedCandidateBatch",
     "GroundedCandidateConfig",
+    "HybridActorCriticConfig",
+    "HybridActorCriticOutput",
     "HybridCandidateQConfig",
     "HybridCandidateQOutput",
+    "HybridDomainActorCriticModel",
     "HybridDomainCandidateQModel",
     "HybridDomainIQLModel",
     "HybridIQLConfig",
     "HybridIQLOutput",
+    "HybridRepresentationOutput",
     "RecurrentCandidateModel",
     "RecurrentCandidateOutput",
     "WorldEncoding",
     "WorldTokenBatch",
+    "initialize_actor_critic_from_iql",
     "initialize_hybrid_from_grounded",
     "initialize_iql_from_candidate_q",
 ]

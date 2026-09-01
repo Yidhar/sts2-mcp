@@ -102,6 +102,17 @@ class HybridCandidateQOutput:
         return batch_size, action_count
 
 
+@dataclass(frozen=True, slots=True)
+class HybridRepresentationOutput:
+    """Shared dual-stream representation before a control readout."""
+
+    recurrent_state: Tensor
+    joint_state_embedding: Tensor
+    world_state_embedding: Tensor
+    candidate_embeddings: Tensor
+    action_mask: Tensor
+
+
 class HybridDomainCandidateQModel(RecurrentCandidateModel):
     """Domain-local dual streams followed by one shared candidate-Q stream.
 
@@ -181,13 +192,13 @@ class HybridDomainCandidateQModel(RecurrentCandidateModel):
             nn.Linear(cfg.ffn_dim, 1),
         )
 
-    def forward(  # type: ignore[override]
+    def forward_representation(
         self,
         batch: GroundedCandidateBatch,
         recurrent_state: Tensor | None = None,
         *,
         validate: bool = True,
-    ) -> HybridCandidateQOutput:
+    ) -> HybridRepresentationOutput:
         if validate:
             batch.validate(self.config)
         batch_size = int(batch.domain_ids.shape[0])
@@ -281,29 +292,51 @@ class HybridDomainCandidateQModel(RecurrentCandidateModel):
         joint_candidates = self.joint_candidate_norm(joint[:, 2:])
         joint_candidates = joint_candidates * mask.unsqueeze(-1).to(joint_candidates.dtype)
 
-        q_state = next_recurrent_state.unsqueeze(1).expand(
-            -1,
-            joint_candidates.shape[1],
-            -1,
-        )
-        q_values = self.candidate_q_head(
-            torch.cat(
-                [
-                    joint_candidates,
-                    joint_state.unsqueeze(1).expand_as(joint_candidates),
-                    q_state,
-                ],
-                dim=-1,
-            )
-        ).squeeze(-1)
-        q_values = q_values.masked_fill(~mask, 0.0)
-        output = HybridCandidateQOutput(
-            q_values=q_values,
+        return HybridRepresentationOutput(
             recurrent_state=next_recurrent_state,
             joint_state_embedding=joint_state,
             world_state_embedding=world.state_embedding,
             candidate_embeddings=joint_candidates,
             action_mask=mask,
+        )
+
+    def forward(  # type: ignore[override]
+        self,
+        batch: GroundedCandidateBatch,
+        recurrent_state: Tensor | None = None,
+        *,
+        validate: bool = True,
+    ) -> HybridCandidateQOutput:
+        representation = self.forward_representation(
+            batch,
+            recurrent_state,
+            validate=validate,
+        )
+        q_state = representation.recurrent_state.unsqueeze(1).expand(
+            -1,
+            representation.candidate_embeddings.shape[1],
+            -1,
+        )
+        q_values = self.candidate_q_head(
+            torch.cat(
+                [
+                    representation.candidate_embeddings,
+                    representation.joint_state_embedding.unsqueeze(1).expand_as(
+                        representation.candidate_embeddings
+                    ),
+                    q_state,
+                ],
+                dim=-1,
+            )
+        ).squeeze(-1)
+        q_values = q_values.masked_fill(~representation.action_mask, 0.0)
+        output = HybridCandidateQOutput(
+            q_values=q_values,
+            recurrent_state=representation.recurrent_state,
+            joint_state_embedding=representation.joint_state_embedding,
+            world_state_embedding=representation.world_state_embedding,
+            candidate_embeddings=representation.candidate_embeddings,
+            action_mask=representation.action_mask,
         )
         if validate:
             output.validate(self.hybrid_config)
@@ -374,5 +407,6 @@ __all__ = [
     "HybridCandidateQConfig",
     "HybridCandidateQOutput",
     "HybridDomainCandidateQModel",
+    "HybridRepresentationOutput",
     "initialize_hybrid_from_grounded",
 ]

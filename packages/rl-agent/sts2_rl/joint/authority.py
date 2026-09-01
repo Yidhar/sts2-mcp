@@ -3,17 +3,27 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Literal
+
+import numpy as np
+import torch
+from torch import Tensor
 
 from sts2_rl.macro.authority import MacroCollectionAuthority
 from sts2_rl.semantics.clock import decision_discount
 from sts2_rl.semantics.forward import ForwardDecision, SemanticCandidate
 
-from .transitions import HybridRun, HybridStep
+from .transitions import (
+    HybridRun,
+    HybridStep,
+    HybridVTraceStep,
+    HybridVTraceUnroll,
+)
 
 HYBRID_AUTHORITY_VERSION: Final = "sts2-hybrid-authority-v3"
+HYBRID_VTRACE_AUTHORITY_VERSION: Final = "sts2-hybrid-vtrace-authority-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,9 +364,219 @@ class HybridCollectionAuthority(MacroCollectionAuthority):
         }
 
 
+class HybridVTraceCollectionAuthority(HybridCollectionAuthority):
+    """Stochastic semantic policy that streams fresh mixed-domain unrolls."""
+
+    def __init__(
+        self,
+        *args: Any,
+        unroll_length: int,
+        unroll_sink: Callable[[HybridVTraceUnroll], None],
+        **kwargs: Any,
+    ) -> None:
+        if isinstance(unroll_length, bool) or not isinstance(unroll_length, int):
+            raise TypeError("hybrid V-trace unroll length must be an integer")
+        if unroll_length <= 0:
+            raise ValueError("hybrid V-trace unroll length must be positive")
+        super().__init__(*args, **kwargs)
+        self.unroll_length = unroll_length
+        self.unroll_sink = unroll_sink
+        self.last_behavior_log_probability = 0.0
+        self.last_model_log_probability = 0.0
+        self.last_policy_probabilities: np.typing.NDArray[np.float64] | None = None
+        self._last_hidden_before: Tensor | None = None
+        self._last_semantic_snapshot: Any = None
+        self._open_vtrace_initial_state: np.typing.NDArray[np.float32] | None = None
+        self._open_vtrace_behavior_log_probability = 0.0
+        self._vtrace_pending: list[HybridVTraceStep] = []
+        self._vtrace_initial_state: np.typing.NDArray[np.float32] | None = None
+        self._vtrace_start_decision = 0
+        self._vtrace_decisions = 0
+        self._vtrace_emitted = 0
+
+    def begin_episode(self, episode_id: str) -> None:
+        super().begin_episode(episode_id)
+        self._vtrace_pending = []
+        self._vtrace_initial_state = None
+        self._open_vtrace_initial_state = None
+        self._vtrace_start_decision = 0
+        self._vtrace_decisions = 0
+        self.last_behavior_log_probability = 0.0
+        self.last_model_log_probability = 0.0
+        self.last_policy_probabilities = None
+
+    def _q_values(self, snapshot: Any) -> Tensor:
+        hidden_before = self._hidden
+        values = super()._q_values(snapshot)
+        if not torch.is_tensor(hidden_before):
+            raise TypeError("hybrid V-trace recurrent state must be a tensor")
+        self._last_hidden_before = hidden_before.detach().clone()
+        self._last_semantic_snapshot = snapshot
+        return values
+
+    def _semantic_choice(
+        self,
+        *,
+        candidates: Sequence[SemanticCandidate],
+        snapshot: Any,
+    ) -> int:
+        logits = self._q_values(snapshot)
+        values = logits.detach().double().cpu().numpy()
+        if values.shape != (len(candidates),) or not bool(np.isfinite(values).all()):
+            raise FloatingPointError("hybrid V-trace policy logits are non-finite")
+        shifted = values - float(values.max())
+        policy = np.exp(shifted)
+        policy /= float(policy.sum())
+        branches = sorted({candidate.branch for candidate in candidates})
+        support = np.zeros_like(policy)
+        for branch in branches:
+            members = [index for index, item in enumerate(candidates) if item.branch == branch]
+            support[members] = 1.0 / (len(branches) * len(members))
+        behavior = (1.0 - self.epsilon) * policy + self.epsilon * support
+
+        self.last_q_values = values.astype(np.float32)
+        self.last_policy_probabilities = policy.copy()
+        self.last_decision_value = float(values.max())
+        if self.evaluation_ownership:
+            selected = int(np.argmax(values))
+            self.last_choice_exploratory = False
+            self.last_behavior_log_probability = 0.0
+        elif self._rng.random() < self.epsilon:
+            self.last_choice_exploratory = True
+            branch = branches[int(self._rng.integers(len(branches)))]
+            pool = [index for index, item in enumerate(candidates) if item.branch == branch]
+            selected = int(pool[int(self._rng.integers(len(pool)))])
+            self.last_behavior_log_probability = float(math.log(behavior[selected]))
+        else:
+            self.last_choice_exploratory = False
+            selected = int(self._rng.choice(len(candidates), p=policy))
+            self.last_behavior_log_probability = float(math.log(behavior[selected]))
+        self.last_model_log_probability = float(math.log(policy[selected]))
+        return selected
+
+    def _open_transition(
+        self,
+        *,
+        snapshot: Any,
+        action_index: int,
+        surface: str,
+        branch: str,
+        target_key: str | None,
+        floor: int,
+        recurrent_reset: bool,
+        control_domain: Literal["macro", "combat"] | None = None,
+    ) -> None:
+        super()._open_transition(
+            snapshot=snapshot,
+            action_index=action_index,
+            surface=surface,
+            branch=branch,
+            target_key=target_key,
+            floor=floor,
+            recurrent_reset=recurrent_reset,
+            control_domain=control_domain,
+        )
+        if self._last_hidden_before is None:
+            raise RuntimeError("hybrid V-trace choice has no initial recurrent state")
+        initial = self._last_hidden_before.detach().float().cpu()
+        if initial.ndim == 2 and initial.shape[0] == 1:
+            initial = initial[0]
+        self._open_vtrace_initial_state = initial.numpy().copy()
+        self._open_vtrace_behavior_log_probability = self.last_behavior_log_probability
+
+    def _emit_pending(self, *, bootstrap_snapshot: Any = None) -> None:
+        if not self._vtrace_pending:
+            return
+        if self._vtrace_initial_state is None:
+            raise RuntimeError("hybrid V-trace pending unroll lost its initial state")
+        unroll = HybridVTraceUnroll(
+            episode_id=self._episode_id or "hybrid-vtrace",
+            start_decision=self._vtrace_start_decision,
+            policy_version=self._vtrace_pending[0].policy_version,
+            initial_recurrent_state=self._vtrace_initial_state,
+            steps=tuple(self._vtrace_pending),
+            bootstrap_snapshot=bootstrap_snapshot,
+        )
+        self.unroll_sink(unroll)
+        self._vtrace_start_decision += len(self._vtrace_pending)
+        self._vtrace_emitted += 1
+        self._vtrace_pending = []
+        self._vtrace_initial_state = None
+
+    def _close_open(
+        self,
+        *,
+        terminal: bool,
+        floor: int | None = None,
+        bridge_snapshot: Any = None,
+        bridge_value: float | None = None,
+    ) -> None:
+        if self._open is None:
+            return
+        initial = self._open_vtrace_initial_state
+        behavior_log_probability = self._open_vtrace_behavior_log_probability
+        before = len(self._hybrid_steps)
+        super()._close_open(
+            terminal=terminal,
+            floor=floor,
+            bridge_snapshot=bridge_snapshot,
+            bridge_value=bridge_value,
+        )
+        if len(self._hybrid_steps) != before + 1 or initial is None:
+            raise RuntimeError("hybrid V-trace transition close lost its factual step")
+        factual = self._hybrid_steps[-1]
+        if not self._vtrace_pending:
+            self._vtrace_initial_state = initial
+        self._vtrace_pending.append(
+            HybridVTraceStep(
+                snapshot=factual.snapshot,
+                action_index=factual.action_index,
+                behavior_log_probability=behavior_log_probability,
+                reward=factual.reward,
+                discount=factual.discount,
+                terminal=factual.terminal,
+                surface=factual.surface,
+                branch=factual.branch,
+                control_domain=factual.control_domain,
+                policy_version=factual.policy_version,
+            )
+        )
+        self._vtrace_decisions += 1
+        self._open_vtrace_initial_state = None
+        if terminal:
+            self._emit_pending(bootstrap_snapshot=None)
+        elif len(self._vtrace_pending) >= self.unroll_length:
+            if self._last_semantic_snapshot is None:
+                raise RuntimeError("hybrid V-trace unroll has no bootstrap snapshot")
+            self._emit_pending(bootstrap_snapshot=self._last_semantic_snapshot)
+
+    def finish_run(
+        self,
+        run_id: str | None = None,
+        *,
+        environment_steps: int = 0,
+    ) -> HybridRun | None:
+        run = super().finish_run(run_id, environment_steps=environment_steps)
+        if run is None:
+            self._vtrace_pending = []
+            self._vtrace_initial_state = None
+        return run
+
+    def metrics(self) -> dict[str, Any]:
+        return {
+            **super().metrics(),
+            "version": HYBRID_VTRACE_AUTHORITY_VERSION,
+            "vtrace_unrolls_emitted": self._vtrace_emitted,
+            "vtrace_decisions": self._vtrace_decisions,
+            "vtrace_pending_steps": len(self._vtrace_pending),
+        }
+
+
 __all__ = [
     "HYBRID_AUTHORITY_VERSION",
+    "HYBRID_VTRACE_AUTHORITY_VERSION",
     "DomainExplorationSchedule",
     "FactualCoverageSchedule",
     "HybridCollectionAuthority",
+    "HybridVTraceCollectionAuthority",
 ]

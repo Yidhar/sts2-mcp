@@ -14,9 +14,14 @@ import math
 from dataclasses import dataclass
 from typing import Final, Literal
 
+import numpy as np
+import numpy.typing as npt
+
 from sts2_rl.encoding import EncodedDecisionSnapshot
 
 HYBRID_TRANSITION_VERSION: Final = "sts2-hybrid-transition-v2"
+HYBRID_VTRACE_STEP_VERSION: Final = "sts2-hybrid-vtrace-step-v1"
+HYBRID_VTRACE_UNROLL_VERSION: Final = "sts2-hybrid-vtrace-unroll-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +113,105 @@ class HybridRun:
         return len(self.steps) - self.macro_steps
 
 
+@dataclass(frozen=True, slots=True)
+class HybridVTraceStep:
+    """One semantic policy decision consumed once by recurrent V-trace."""
+
+    snapshot: EncodedDecisionSnapshot
+    action_index: int
+    behavior_log_probability: float
+    reward: float
+    discount: float
+    terminal: bool
+    surface: str
+    branch: str
+    control_domain: Literal["macro", "combat"]
+    policy_version: int
+    version: str = HYBRID_VTRACE_STEP_VERSION
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.snapshot, EncodedDecisionSnapshot):
+            raise TypeError("hybrid V-trace step snapshot has the wrong type")
+        if isinstance(self.action_index, bool) or not isinstance(self.action_index, int):
+            raise TypeError("hybrid V-trace action index must be an integer")
+        if not 0 <= self.action_index < len(self.snapshot.action_mask):
+            raise ValueError("hybrid V-trace action is outside its candidate set")
+        if not bool(self.snapshot.action_mask[self.action_index]):
+            raise ValueError("hybrid V-trace action is not legal")
+        if not math.isfinite(self.behavior_log_probability) or self.behavior_log_probability > 1.0e-7:
+            raise ValueError("hybrid V-trace behavior log probability must be finite and <= 0")
+        if not math.isfinite(self.reward):
+            raise ValueError("hybrid V-trace reward must be finite")
+        if not math.isfinite(self.discount) or not 0.0 <= self.discount <= 1.0:
+            raise ValueError("hybrid V-trace discount must be in [0, 1]")
+        if self.terminal != (self.discount == 0.0):
+            raise ValueError("hybrid V-trace terminal and discount disagree")
+        if not self.surface or not self.branch:
+            raise ValueError("hybrid V-trace step requires surface and branch")
+        if self.control_domain not in {"macro", "combat"}:
+            raise ValueError("hybrid V-trace domain must be macro or combat")
+        if isinstance(self.policy_version, bool) or not isinstance(self.policy_version, int) or self.policy_version < 0:
+            raise ValueError("hybrid V-trace policy version must be non-negative")
+        if self.version != HYBRID_VTRACE_STEP_VERSION:
+            raise ValueError("hybrid V-trace step version differs")
+
+
+def _owned_initial_state(value: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
+    state = np.asarray(value)
+    if state.dtype != np.float32 or state.ndim != 1:
+        raise ValueError("hybrid V-trace initial state must be rank-1 float32")
+    if not np.all(np.isfinite(state)):
+        raise ValueError("hybrid V-trace initial state must be finite")
+    owned = np.ascontiguousarray(state).copy()
+    owned.setflags(write=False)
+    return owned
+
+
+@dataclass(frozen=True, slots=True)
+class HybridVTraceUnroll:
+    """A contiguous mixed-domain semantic unroll with one bootstrap fact."""
+
+    episode_id: str
+    start_decision: int
+    policy_version: int
+    initial_recurrent_state: npt.NDArray[np.float32]
+    steps: tuple[HybridVTraceStep, ...]
+    bootstrap_snapshot: EncodedDecisionSnapshot | None
+    version: str = HYBRID_VTRACE_UNROLL_VERSION
+
+    def __post_init__(self) -> None:
+        if not self.episode_id:
+            raise ValueError("hybrid V-trace unroll requires an episode id")
+        for name, value in (
+            ("start_decision", self.start_decision),
+            ("policy_version", self.policy_version),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"hybrid V-trace {name} must be non-negative")
+        object.__setattr__(
+            self,
+            "initial_recurrent_state",
+            _owned_initial_state(self.initial_recurrent_state),
+        )
+        if not self.steps or not all(isinstance(step, HybridVTraceStep) for step in self.steps):
+            raise ValueError("hybrid V-trace unroll requires semantic steps")
+        if any(step.policy_version != self.policy_version for step in self.steps):
+            raise ValueError("hybrid V-trace unroll mixes behavior policy versions")
+        requires_bootstrap = self.steps[-1].discount > 0.0
+        if requires_bootstrap != (self.bootstrap_snapshot is not None):
+            raise ValueError("hybrid V-trace bootstrap presence disagrees with final discount")
+        if self.version != HYBRID_VTRACE_UNROLL_VERSION:
+            raise ValueError("hybrid V-trace unroll version differs")
+
+    @property
+    def macro_steps(self) -> int:
+        return sum(step.control_domain == "macro" for step in self.steps)
+
+    @property
+    def combat_steps(self) -> int:
+        return len(self.steps) - self.macro_steps
+
+
 def next_domain_index(
     run: HybridRun,
     start: int,
@@ -123,7 +227,11 @@ def next_domain_index(
 
 __all__ = [
     "HYBRID_TRANSITION_VERSION",
+    "HYBRID_VTRACE_STEP_VERSION",
+    "HYBRID_VTRACE_UNROLL_VERSION",
     "HybridRun",
     "HybridStep",
+    "HybridVTraceStep",
+    "HybridVTraceUnroll",
     "next_domain_index",
 ]

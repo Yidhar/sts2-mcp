@@ -2,9 +2,11 @@
 
 from .authority import (
     HYBRID_AUTHORITY_VERSION,
+    HYBRID_VTRACE_AUTHORITY_VERSION,
     DomainExplorationSchedule,
     FactualCoverageSchedule,
     HybridCollectionAuthority,
+    HybridVTraceCollectionAuthority,
 )
 from .death_price import (
     DEATH_PRICE_CONTROLLER_VERSION,
@@ -37,9 +39,20 @@ from .replay import (
 )
 from .transitions import (
     HYBRID_TRANSITION_VERSION,
+    HYBRID_VTRACE_STEP_VERSION,
+    HYBRID_VTRACE_UNROLL_VERSION,
     HybridRun,
     HybridStep,
+    HybridVTraceStep,
+    HybridVTraceUnroll,
     next_domain_index,
+)
+from .vtrace_learner import (
+    HYBRID_VTRACE_LEARNER_VERSION,
+    HybridActorCriticForward,
+    HybridVTraceLearner,
+    HybridVTraceLearnerConfig,
+    HybridVTraceMetrics,
 )
 
 __all__ = [
@@ -50,6 +63,10 @@ __all__ = [
     "HYBRID_Q_LEARNER_VERSION",
     "HYBRID_REPLAY_VERSION",
     "HYBRID_TRANSITION_VERSION",
+    "HYBRID_VTRACE_AUTHORITY_VERSION",
+    "HYBRID_VTRACE_LEARNER_VERSION",
+    "HYBRID_VTRACE_STEP_VERSION",
+    "HYBRID_VTRACE_UNROLL_VERSION",
     "AbsoluteDeathPriceController",
     "DeathPriceCourse",
     "DeathPriceEpisodeOutcome",
@@ -57,6 +74,7 @@ __all__ = [
     "DomainExplorationSchedule",
     "DomainView",
     "FactualCoverageSchedule",
+    "HybridActorCriticForward",
     "HybridCollectionAuthority",
     "HybridIQLForward",
     "HybridIQLLearner",
@@ -68,6 +86,12 @@ __all__ = [
     "HybridRun",
     "HybridRunReplay",
     "HybridStep",
+    "HybridVTraceCollectionAuthority",
+    "HybridVTraceLearner",
+    "HybridVTraceLearnerConfig",
+    "HybridVTraceMetrics",
+    "HybridVTraceStep",
+    "HybridVTraceUnroll",
     "HybridViewPair",
     "death_price_course",
     "next_domain_index",

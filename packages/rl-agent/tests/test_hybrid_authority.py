@@ -11,6 +11,7 @@ from sts2_rl.joint import (  # noqa: E402
     DomainExplorationSchedule,
     FactualCoverageSchedule,
     HybridCollectionAuthority,
+    HybridVTraceCollectionAuthority,
 )
 from tests.test_macro_authority import (  # noqa: E402
     _REST_ACTIONS,
@@ -64,6 +65,79 @@ def test_hybrid_authority_records_only_factual_terminal_runs() -> None:
     assert run.steps[-1].terminal is True
     assert run.steps[-1].revivals_delta == 2
     assert run.environment_steps == 17
+
+
+def test_vtrace_authority_records_exact_branch_balanced_mixture_probability() -> None:
+    emitted = []
+
+    def forward(snapshot: Any, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.tensor([np.log(4.0), 0.0])[: len(snapshot.action_mask)], hidden + 1.0
+
+    authority = HybridVTraceCollectionAuthority(
+        forward_q=forward,
+        initial_state=lambda: torch.zeros((1, 4)),
+        epsilon=0.0,
+        seed=7,
+        macro_exploration=DomainExplorationSchedule(0.4, 0.4, 1),
+        combat_exploration=DomainExplorationSchedule(0.4, 0.4, 1),
+        factual_coverage=FactualCoverageSchedule(0.0, 0.0, 1),
+        unroll_length=16,
+        unroll_sink=emitted.append,
+    )
+    authority.begin_episode("mixture")
+    authority.choose(
+        observation=_rest_observation(),
+        semantic_actions=_REST_ACTIONS,
+        snapshot=_snapshot(candidate_count=2),
+        valid=np.ones(2, dtype=np.bool_),
+    )
+    authority.observe_step(reward=1.0, floor=7, terminal=True)
+    authority.finish_run(environment_steps=1)
+
+    assert len(emitted) == 1
+    step = emitted[0].steps[0]
+    expected = np.asarray([0.68, 0.32])
+    assert np.exp(step.behavior_log_probability) == pytest.approx(
+        expected[step.action_index]
+    )
+
+
+def test_vtrace_authority_streams_before_the_episode_ends() -> None:
+    emitted = []
+
+    def forward(snapshot: Any, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.zeros(len(snapshot.action_mask)), hidden + 1.0
+
+    authority = HybridVTraceCollectionAuthority(
+        forward_q=forward,
+        initial_state=lambda: torch.zeros((1, 4)),
+        epsilon=0.0,
+        seed=3,
+        macro_exploration=DomainExplorationSchedule(0.0, 0.0, 1),
+        combat_exploration=DomainExplorationSchedule(0.0, 0.0, 1),
+        factual_coverage=FactualCoverageSchedule(0.0, 0.0, 1),
+        unroll_length=1,
+        unroll_sink=emitted.append,
+    )
+    authority.begin_episode("stream")
+    authority.choose(
+        observation=_rest_observation(7),
+        semantic_actions=_REST_ACTIONS,
+        snapshot=_snapshot(candidate_count=2),
+        valid=np.ones(2, dtype=np.bool_),
+    )
+    authority.observe_step(reward=0.25, floor=7, terminal=False)
+    authority.choose(
+        observation=_rest_observation(8),
+        semantic_actions=_REST_ACTIONS,
+        snapshot=_snapshot(candidate_count=2),
+        valid=np.ones(2, dtype=np.bool_),
+    )
+
+    assert len(emitted) == 1
+    assert emitted[0].bootstrap_snapshot is not None
+    assert emitted[0].steps[0].reward == pytest.approx(0.25)
+    np.testing.assert_allclose(emitted[0].initial_recurrent_state, np.zeros(4))
 
 
 def test_infrastructure_discard_cannot_leak_a_partial_run() -> None:
