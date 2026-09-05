@@ -124,3 +124,19 @@ macro SMDP lambda-returns and grouped same-root simulator returns.  Results are
 normalized per semantic root and branch, and are distilled into the existing
 macro policy; no operation-specific rule, CE corridor or inference-time MCTS
 is added to this baseline.
+
+The first prerequisite is now implemented as the standalone
+[B0 same-action macro-root reconstruction diagnostic](../runbooks/macro-root-b0.md).
+It rebuilds environment facts, recurrent memory and reward-v9 state from a
+full-run prefix in two isolated simulator processes, without modifying this
+learner. The initial bounded card-reward-root smoke matched; this is observable
+reproducibility evidence only, not hidden-RNG cloning, candidate ranking,
+long-horizon credit validation, or a trained V-trace result.
+
+The subsequent [synchronous macro-credit v1 decision](macro-credit-v1.md)
+supersedes the tentative candidate-Q suggestion above: retain this actor +
+scalar V ABI, derive conditional-action targets from actual simulator branches,
+and project them onto the existing macro actor without introducing a Q head.
+This is a distinct fresh-teacher course, not a hidden change to this baseline's
+V-trace objective. See its [operational runbook](../runbooks/macro-credit-training.md)
+for bounded validation evidence and cohort-boundary recovery requirements.

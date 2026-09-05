@@ -1,11 +1,21 @@
 # RL agent contributor guide
 
-This package contains the relational recurrent legal-candidate V-trace v4
-baseline. The only maintained training entry point is:
+This package contains the historical relational recurrent legal-candidate
+V-trace v4 baseline. Its standalone training entry point is:
 
 ```text
 python -m sts2_rl.train
 ```
+
+The separately approved hybrid macro-credit experiment uses
+`python -m sts2_rl.train_macro_credit`, not the legacy asynchronous launcher.
+Its current contracts and readiness evidence are in
+`docs/architecture/macro-credit-v1.md` and
+`docs/runbooks/macro-credit-training.md` at the repository root. It retains
+the existing hybrid actor + scalar V, uses real headless same-root training
+rollouts, and owns a distinct synchronous course/checkpoint/publication. The
+legacy ownership diagram below does not describe that experiment. Do not
+silently route one course's checkpoints, replay, or configuration into another.
 
 The old MuZero/token-memory/MCTS stack, PPO trainers, semantic/future-world
 rollouts, objective heads, offline shadow losses, tactical guards and
@@ -73,7 +83,10 @@ sts2_rl.train
 - Run-scale memory updates outside combat. Combat-scale memory updates inside
   combat and clears on exit; keep the combined recurrent tensor ABI stable.
 - Only the authoritative environment legality mask can suppress an action.
-- No MCTS, planner, root bias or policy distillation is allowed. The
+- No inference-time MCTS, planner, root bias or policy rewriting is allowed.
+  Training-only full-root return projection is permitted exclusively by the
+  separate macro-credit ADR; it must not introduce operation-specific rules,
+  model-predicted world rollouts, or a second inference controller. The
   semantic executor executes compiled semantic decisions: UI mechanics
   (selection traffic, confirmation, pickers) are mechanical suffixes of a
   chosen semantic candidate, never independently optimized actions.
