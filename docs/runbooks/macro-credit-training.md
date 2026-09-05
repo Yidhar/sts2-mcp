@@ -314,3 +314,62 @@ skipping a seed. It is a prepared bounded continuation, not a launch performed
 by this documentation update. Use Ctrl-C for an operator stop, then inspect the
 last checkpoint before resuming; never infer commit authority from publication
 or terminal output alone.
+
+## Subsequent authorized pilot launch — 2026-09-05
+
+After the readiness checks above, the operator requested Git submission, a
+monitoring panel, and the next training run. Core training code was committed as
+`66bf5c207fd5498245aac38e1ce36f4136a18290`. The prepared continuation was then
+actually launched at **2026-09-05 03:23:25 UTC / 11:23:25 Asia/Shanghai**:
+
+- Resume the same audited lineage at update **2**, seed cursor **2** and seed
+  **13400004**; do not reinitialize the parent or replay update zero.
+- At most **20 additional committed updates**, hence target update at most
+  **22**. Resource/legality/reconstruction failures still abort rather than
+  skip a seed or automatically retry.
+- The pinned WSL/ROCm environment, complete course identity, and selected
+  source hashes are unchanged. A later docs/monitoring commit is not a model
+  or learner identity change.
+- The process is launched with a hidden Windows host window, independently of
+  the interactive command session. No recurring restart or notification
+  automation was created.
+
+Invocation records are under the external artifact directory
+`analysis/macro-credit-pilot-20260905-20updates/`: `launch.json` records the
+Windows host PID and Git revision; `process.json` records the actual WSL Python
+PID/arguments/start time; `stdout.log` and `stderr.log` retain process output.
+`exit.json` is written only when that invocation exits. The training run's own
+`status.json`, `cohorts/*/update.json`, and committed checkpoint retain their
+existing roles. A quiet stdout log is not a stalled-run diagnosis.
+
+The launch-time PIDs were Windows `wsl.exe` **74140** and WSL Python **271**.
+These numbers are observations, not reusable process identities. Before any
+manual stop, inspect `process.json` and verify the live command still names
+this invocation's `launch.py`; only then send SIGINT to that verified WSL PID.
+Inspect the final checkpoint/status afterward and never remove an active
+writer lock. A missing publication remains a rebuildable derivative, not an
+instruction to restart training from an earlier version.
+
+### Initial continuation observations
+
+The first new update **3** was independently read back from both checkpoint
+and publication: all **238 model tensors** were finite and exactly equal, and
+the checkpoint retained **238 optimizer parameter states**, cursor **3**, and
+the original **18 selected source hashes**. This verifies a real resumed
+commit, not just process creation.
+
+Update **7** subsequently committed at **11:38:12 Asia/Shanghai**, then the
+course entered collection for the next cohort. Its learner elapsed time was
+**340.76 seconds**, much slower than updates 3/4/5/6
+(16.27/22.81/26.28/61.42 seconds). During the delay, a read-only process sample
+observed the main thread waiting in `p9_client_rpc`, consistent with a WSL
+mounted-filesystem RPC wait. This does not establish a GPU deadlock or identify
+the sole source of the slowdown. The course's repeated output-directory
+resource checks are one code-level I/O candidate for later profiling, not a
+proven diagnosis. Update 7 still reported finite loss **0.586758**, parameter
+delta L2 **0.0488583**, graph span **16**, and policy lag **0**.
+
+Treat this as a performance warning for the bounded pilot. Do not claim all
+20 additional updates completed, sustained healthy throughput, or improved
+policy quality from these startup observations. No runtime changes, process
+restart, seed skipping, or recovery rollback were performed during inspection.
