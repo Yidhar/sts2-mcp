@@ -29,9 +29,9 @@ from sts2_rl.models.grounded_candidate import (
     WorldTokenBatch,
 )
 
-ENCODED_DECISION_SNAPSHOT_VERSION: Final = "relational-encoded-decision-v4"
+ENCODED_DECISION_SNAPSHOT_VERSION: Final = "relational-encoded-decision-v5"
 _WORLD_ID_WIDTH: Final = 9
-_CANDIDATE_ID_WIDTH: Final = 13
+_CANDIDATE_ID_WIDTH: Final = 14
 _LOCAL_ID_WIDTH: Final = 9
 _INT32_ID_BOUND: Final = int(np.iinfo(np.int32).max) + 1
 
@@ -402,6 +402,7 @@ class EncodedDecisionSnapshot:
             cfg.entity_vocab_size,
             _INT32_ID_BOUND,
             _INT32_ID_BOUND,
+            self.candidate_count,
         )
         self.world.validate(
             feature_dim=cfg.feature_dim,
@@ -637,6 +638,7 @@ def collate_encoded_snapshots(
             target_entity_aux_ids=candidate_ids_tensor[:, :, 10],
             target_definition_binding_ids=candidate_ids_tensor[:, :, 11],
             target_relation_binding_ids=candidate_ids_tensor[:, :, 12],
+            policy_branch_ids=candidate_ids_tensor[:, :, 13],
             local_features=_tensor(local_features, device=dev),
             local_mask=_tensor(local_mask, device=dev),
             local_type_ids=local_ids_tensor[:, :, :, 0],

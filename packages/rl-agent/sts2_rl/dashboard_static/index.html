@@ -6,6 +6,15 @@
   <meta name="color-scheme" content="light dark">
   <title>STS2 训练监控</title>
   <style>
+    .macro-only { display: none; }
+    body[data-dashboard-mode="macro-credit"] .macro-only { display: block; }
+    body[data-dashboard-mode="macro-credit"] section[aria-labelledby="episode-drill-title"],
+    body[data-dashboard-mode="macro-credit"] .heldout-zone > :not(.section-header):not(#heldout-scope-note) { display: none; }
+    .macro-controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: end; margin: 14px 0; }
+    .macro-controls select { max-width: min(530px, 78vw); }
+    .macro-description { color: var(--muted-foreground); font-size: .88rem; }
+    .macro-selected { background: var(--accent); }
+    .macro-warning { border-left: 4px solid var(--warning); padding: 10px 14px; background: var(--warning-soft); }
     :root {
       color-scheme: light;
       --background: #f5f7fa;
@@ -1400,6 +1409,20 @@
     </section>
 
     <main id="main-content" aria-busy="true">
+      <section class="section macro-only" aria-labelledby="macro-performance-title">
+        <div class="section-header"><div>
+          <h2 id="macro-performance-title">模型实际打到了哪里？</h2>
+          <p id="macro-performance-context">等待最近已提交自然轨迹，不用强制分支替代模型自己的选择。</p>
+        </div></div>
+        <p id="macro-quality-verdict" class="scope-note macro-warning">表现结论：尚不能判断是否变强。当前没有完整对局、固定种子的训练前后对照评估。</p>
+        <div class="metric-grid">
+          <article class="card"><div class="metric-label">最近自然轨迹 · 截止楼层</div><div id="macro-ending-floor-value" class="metric-value">未知</div><div id="macro-ending-floor-context" class="metric-context">不是整局最终失败楼层</div></article>
+          <article class="card"><div class="metric-label">截至停止时 · 累计复活</div><div id="macro-revival-value" class="metric-value">未知</div><div class="metric-context">这次游戏从 reset 起累计；不是所有训练的复活总数</div></article>
+          <article class="card"><div class="metric-label">截至停止时 · 累计失血</div><div id="macro-hp-loss-value" class="metric-value">未知</div><div class="metric-context">真实玩家失血计数，可超过最大生命值</div></article>
+          <article class="card"><div class="metric-label">为什么停止？</div><div id="macro-stop-value" class="metric-value">未知</div><div id="macro-stop-context" class="metric-context">不把训练截断当成死亡或通关</div></article>
+        </div>
+      </section>
+
       <section class="section" aria-labelledby="overview-title">
         <div class="section-header">
           <div>
@@ -1477,6 +1500,39 @@
               <tbody id="episodes-body"></tbody>
             </table>
           </div>
+        </div>
+      </section>
+
+      <section class="section macro-only" aria-labelledby="macro-returns-title">
+        <div class="section-header"><div>
+          <h2 id="macro-returns-title">游戏内回报与行为量</h2>
+          <p>每个已提交 root 只计一条自然参考轨迹；强制候选与复现检查不重复计入主趋势。</p>
+        </div></div>
+        <div class="two-column">
+          <article class="card chart-panel"><div class="chart-heading"><h3>Root 后实测回报</h3><span>不含末尾 V，也不等于 λ-return Y</span></div><div id="macro-return-chart" class="chart"></div></article>
+          <article class="card chart-panel"><div class="chart-heading"><h3>实际游戏行为量</h3><span>Root 后动作与战斗决策，不是战斗胜场</span></div><div id="macro-actions-chart" class="chart"></div></article>
+        </div>
+      </section>
+
+      <section class="section macro-only" aria-labelledby="macro-compare-title">
+        <div class="section-header"><div><h2 id="macro-compare-title">历史训练窗口对比</h2><p>保留每次采样的真实数值，可选任意两条已提交自然参考窗口。</p></div></div>
+        <p class="scope-note">不同 Update 使用不同 seed / root；下面的差值是样本描述，不是固定种子下策略提升的证据。正负变化不自动标成好坏。</p>
+        <div class="macro-controls">
+          <div class="field"><label for="macro-baseline-select">基准窗口</label><select id="macro-baseline-select"></select></div>
+          <div class="field"><label for="macro-current-select">对照窗口</label><select id="macro-current-select"></select></div>
+        </div>
+        <p id="macro-comparison-context" class="macro-description"></p>
+        <div class="table-wrap"><table aria-label="历史训练窗口数值对比"><thead><tr><th>实测指标</th><th class="numeric">基准</th><th class="numeric">对照</th><th class="numeric">对照 − 基准</th><th>口径</th></tr></thead><tbody id="macro-comparison-body"></tbody></table></div>
+      </section>
+
+      <section class="section macro-only" aria-labelledby="macro-root-title">
+        <div class="section-header"><div><h2 id="macro-root-title">同一游戏状态：候选动作对比</h2><p>同根强制分支单独展示；策略概率取更新前后网络，游戏结果来自更新前冻结 teacher 的 rollout。</p></div></div>
+        <div class="macro-controls"><div class="field"><label for="macro-root-select">选择游戏 Root</label><select id="macro-root-select"></select></div></div>
+        <p id="macro-root-context" class="scope-note"></p>
+        <div class="table-wrap"><table aria-label="同根候选动作游戏表现"><thead><tr><th>候选动作</th><th class="numeric">截止楼层</th><th class="numeric">窗口实测回报</th><th class="numeric">较自然参考 Δ</th><th class="numeric">窗口动作步</th><th class="numeric">Teacher 概率</th><th class="numeric">更新后概率</th><th class="numeric">概率 Δ（百分点）</th><th class="numeric">λ-return Y</th></tr></thead><tbody id="macro-candidates-body"></tbody></table></div>
+        <div class="two-column" style="margin-top: 14px">
+          <article class="card"><div class="chart-heading"><h3>自然参考：实测奖励组成</h3><span>折扣后分量；不从惩罚反推 HP 或死亡</span></div><dl id="macro-rewards-kv" class="kv-list"></dl></article>
+          <article class="card"><div class="chart-heading"><h3>训练目标与一致性</h3><span>非独立质量评估</span></div><dl id="macro-root-kv" class="kv-list"></dl></article>
         </div>
       </section>
 
@@ -1834,6 +1890,7 @@
       "use strict";
 
       const API_RUNS = "/api/v1/runs";
+      const MACRO_MODE = document.body.dataset.dashboardMode === "macro-credit";
       const API_SNAPSHOT = "/api/v1/snapshot";
       const API_HELDOUT_JOURNALS = "/api/v1/heldout-journals";
       const API_HELDOUT_EPISODES = "/api/v1/heldout-episodes";
@@ -1859,7 +1916,10 @@
         timer: 0,
         loading: false,
         refreshMs: 15000,
-        lastFetchedAt: 0
+        lastFetchedAt: 0,
+        macroBaseline: "",
+        macroCurrent: "",
+        macroRoot: ""
       };
 
       const labels = {
@@ -4038,6 +4098,339 @@
         target.append(svg);
       }
 
+      // Reuse the legacy dashboard layout and SVG renderer without translating
+      // bounded root windows into legacy full-episode or held-out records.
+      function macroNumber(value) {
+        return typeof value === "number" && Number.isFinite(value) ? value : null;
+      }
+
+      function macroDifference(current, baseline) {
+        const a = macroNumber(current), b = macroNumber(baseline);
+        return a == null || b == null ? null : a - b;
+      }
+
+      function macroSigned(value, digits = 4) {
+        return value == null ? "—" : `${value > 0 ? "+" : ""}${decimal(value, digits)}`;
+      }
+
+      function macroEnding(value) {
+        return ({ macro_horizon: "宏观窗口截止（非胜负）", factual_terminal: "真实终止（胜负需终局证据）",
+          native_step_limit: "动作步预算截止" })[value] || value || "未记录";
+      }
+
+      function macroOutcome(reference) {
+        const evidence = [reference.terminal_reason, reference.run_result]
+          .filter(value => typeof value === "string" && value && value !== "none");
+        return [macroEnding(reference.ending), ...new Set(evidence)].join(" · ");
+      }
+
+      function macroWindowRows(snapshot) {
+        return (snapshot.history || []).flatMap(update => (update.gameplay?.roots || [])
+          .filter(root => root.natural_reference)
+          .map(root => ({ key: `${update.update}/${root.root_id}`, update: update.update,
+            metrics: update.metrics || {}, root, ref: root.natural_reference })))
+          .map((row, index) => ({ ...row, order: index + 1 }));
+      }
+
+      function macroHeadline(row) {
+        const ref = row?.ref || {};
+        return {
+          floor: macroNumber(ref.ending_floor),
+          revivals: macroNumber(ref.last_total_revivals),
+          hpLoss: macroNumber(ref.player_hp_lost_since_reset),
+          stopLabel: ref.ending === "macro_horizon" ? "训练窗口截断"
+            : ref.ending === "factual_terminal" ? "真实终止" : "未记录",
+          fullGameQuality: "尚不能判断是否变强"
+        };
+      }
+
+      function macroWindowLabel(row) {
+        return `Update ${row.update} · teacher ${row.root.teacher_version ?? "—"} · seed ${row.root.seed ?? "—"} · ${row.root.root_id}`;
+      }
+
+      function macroSelect(id, rows, requested, followLatest = false) {
+        const select = element(id);
+        select.replaceChildren();
+        if (followLatest) {
+          const option = document.createElement("option");
+          option.value = "";
+          option.textContent = "自动跟随最新已提交窗口";
+          select.append(option);
+        }
+        for (const row of rows) {
+          const option = document.createElement("option");
+          option.value = row.key;
+          option.textContent = macroWindowLabel(row);
+          select.append(option);
+        }
+        if (requested && !rows.some(row => row.key === requested)) {
+          const unavailable = document.createElement("option");
+          unavailable.value = requested;
+          unavailable.textContent = `所选窗口 ${requested} 暂不可用（未自动切换）`;
+          select.append(unavailable);
+          select.value = requested;
+          select.disabled = false;
+          return undefined;
+        }
+        const selected = rows.find(row => row.key === requested) || (followLatest ? rows.at(-1) : rows[0]);
+        select.value = requested || (followLatest ? "" : selected?.key || "");
+        select.disabled = !rows.length;
+        return selected;
+      }
+
+      function macroTable(id, values, columns, empty = "尚无已提交窗口记录") {
+        const body = element(id);
+        body.replaceChildren();
+        if (!values.length) {
+          const row = document.createElement("tr"), cell = createCell(empty, "wrap");
+          cell.colSpan = columns;
+          row.append(cell); body.append(row); return;
+        }
+        for (const cells of values) {
+          const row = document.createElement("tr");
+          cells.forEach((value, index) => row.append(createCell(value, index ? "numeric" : "wrap")));
+          body.append(row);
+        }
+      }
+
+      function renderMacroComparison(rows) {
+        const baseline = macroSelect("macro-baseline-select", rows, state.macroBaseline);
+        const current = macroSelect("macro-current-select", rows, state.macroCurrent, true);
+        setText("macro-comparison-context", baseline && current
+          ? `${macroWindowLabel(baseline)} → ${macroWindowLabel(current)}` : "尚无可比较的已提交窗口。");
+        const metrics = [
+          ["Root 后实测折扣回报", row => row.ref.observed_discounted_return, "只含窗口已观测 reward，不含 V"],
+          ["Root 后推进楼层", row => row.ref.post_root_floor_span, "截止楼层 − root 楼层"],
+          ["截止楼层", row => row.ref.ending_floor, "不是完整对局最远楼层"],
+          ["Root 后动作步", row => row.ref.branch_native_steps, "不含 root 前缀回放"],
+          ["Root 后战斗决策", row => row.ref.continuation_combat_decisions, "决策量，不是胜场"],
+          ["窗口结束累计复活", row => row.ref.last_total_revivals, "从 reset 累计，不是窗口新增或死亡率"],
+          ["窗口结束累计失血", row => row.ref.player_hp_lost_since_reset, "从 reset 累计；无 exact counter 时留空"],
+          ["该 Update 学习器耗时（秒）", row => row.metrics.elapsed_seconds, "性能指标，不是游戏表现"]
+        ];
+        macroTable("macro-comparison-body", baseline && current ? metrics.map(([label, read, scope]) => {
+          const a = macroNumber(read(baseline)), b = macroNumber(read(current));
+          return [label, decimal(a, 5), decimal(b, 5), macroSigned(macroDifference(b, a), 5), scope];
+        }) : [], 5);
+      }
+
+      function renderMacroRoot(rows) {
+        const selected = macroSelect("macro-root-select", rows, state.macroRoot, true);
+        const root = selected?.root || {}, ref = selected?.ref || {};
+        setText("macro-root-context", selected
+          ? `${macroWindowLabel(selected)} · ${int(ref.root_floor)} → ${int(ref.ending_floor)} 层 · 自然参考回报 ${decimal(ref.observed_discounted_return, 5)}。所有候选都由 teacher ${root.teacher_version ?? "—"} 采集；更新后概率不是更新后游戏回报。`
+          : "等待已提交 root 的采集汇总；不回退到旧实验的数据。");
+        macroTable("macro-candidates-body", (root.candidates || []).map(candidate => {
+          const pass = candidate.pass || {};
+          return [
+            `${candidate.label || `候选 ${candidate.candidate_index}`} · ${({ take: "拿取", skip: "跳过" })[candidate.branch] || candidate.branch || "—"}${candidate.is_reference_action ? "（自然选择）" : ""}`,
+            int(pass.ending_floor), decimal(pass.observed_discounted_return, 5),
+            macroSigned(candidate.observed_return_delta_vs_reference, 5), int(pass.branch_native_steps),
+            percent(candidate.teacher_probability, 2), percent(candidate.updated_probability, 2),
+            macroSigned(candidate.updated_probability_delta == null ? null : candidate.updated_probability_delta * 100, 3),
+            decimal(candidate.y, 5)
+          ];
+        }), 9, "这个 root 尚无完整的候选汇总；没有补造候选表现。");
+        const components = ref.discounted_reward_components || {};
+        renderKeyValues("macro-rewards-kv", {
+          "窗口实测回报（总量）": ref.observed_discounted_return,
+          "进展奖励": components.progress_reward ?? components.potential_reward ?? null,
+          "终局奖励": components.terminal_reward ?? null,
+          "复活惩罚": components.revival_penalty ?? null,
+          "失血惩罚": components.hp_loss_penalty ?? null,
+          "节奏惩罚": components.pace_penalty ?? null,
+          "截止原因": macroOutcome(ref)
+        });
+        renderKeyValues("macro-root-kv", {
+          "Teacher 版本（采集策略）": root.teacher_version,
+          "提交后的 Update": selected?.update,
+          "同动作复现检查": root.same_action_gate,
+          "原策略加权 V 目标": root.value_target,
+          "投影 KL(q ∥ teacher)": root.projected_kl_to_teacher,
+          "实测 KL(更新后 ∥ teacher)": root.updated_policy_kl_to_teacher,
+          "目标 q 的冻结标签增益": root.expected_target_improvement,
+          "更新后策略的冻结标签增益": root.updated_target_surrogate_improvement,
+          "标签增益说明": "仅使用同组 Y 的 surrogate，不是额外游戏实测"
+        });
+      }
+
+      function initializeMacroDashboard() {
+        document.querySelector(".brand p").textContent = "原监控面板 · 游戏内表现、自然参考轨迹与同根动作对比";
+        const training = element("training-title").closest("section");
+        setText("training-title", "在线训练 · 游戏内表现");
+        training.querySelector(".section-header p").textContent = "每条记录是有限 root 窗口，不是完整对局；展示自然采集 teacher 的游戏表现，而非更新后策略评测。";
+        const headings = training.querySelectorAll("h3");
+        headings[0].textContent = "楼层推进与累计复活趋势";
+        headings[1].textContent = "最新自然参考窗口";
+        headings[2].textContent = "最近已提交的自然参考窗口";
+        training.querySelector(".chart-heading span").textContent = "按窗口完成顺序；不同种子只作描述性比较";
+        const headers = training.querySelector("thead tr");
+        headers.replaceChildren();
+        ["Update / 采集 teacher", "Seed", "Root → 截止楼层", "推进层数", "窗口实测回报", "窗口动作步", "截止累计复活", "截止累计失血", "截止原因"].forEach(label => {
+          const th = document.createElement("th"); th.textContent = label; headers.append(th);
+        });
+        training.querySelector("table").setAttribute("aria-label", "已提交自然参考窗口游戏表现");
+        const overviewLabels = document.querySelectorAll(".overview-grid .metric-label");
+        ["本次训练更新", "最新窗口：Root → 截止楼层", "最近 5 个自然窗口平均回报", "完整对局独立评估"].forEach((label, i) => { overviewLabels[i].textContent = label; });
+        element("heldout-title").parentElement.querySelector("p").textContent = "当前课程未接入完整对局固定种子评估，不能从训练窗口生成胜率。";
+        setText("heldout-scope-note", "Act 1 / Act 3 / 通关率：未评估（不是 0%）。已有的有限窗口执行检查也不等同于完整对局质量评估，不能混入这里。旧训练运行的评估视图保持原样。");
+        setText("heldout-gate-badge", "未接入完整对局评估");
+        element("pipeline-title").parentElement.querySelector("p").textContent = "沿用旧面板学习器视图；GPU 峰值仅限 learner 窗口，RSS 是进程历史高水位。";
+        element("checkpoint-title").parentElement.querySelector("p").textContent = "已提交版本取持久化 metadata。checkpoint 才是恢复 authority；本面板不反序列化权重，不声称已做恢复验收。";
+        element("checkpoints-body").closest("table").querySelectorAll("th")[1].textContent = "提交版本";
+        element("run-select").disabled = true;
+        setText("run-help", "该服务固定监控一个明确选择的同步课程，不自动混入旧实验。");
+        for (const [id, key] of [["macro-baseline-select", "macroBaseline"], ["macro-current-select", "macroCurrent"], ["macro-root-select", "macroRoot"]]) {
+          element(id).addEventListener("change", event => {
+            state[key] = event.target.value;
+            if (state.snapshot) renderMacroSnapshot(state.snapshot);
+          });
+        }
+      }
+
+      function renderMacroSnapshot(snapshot) {
+        if (snapshot.schema !== "sts2-macro-credit-dashboard-v1") throw new Error("不是所选同步课程的监控数据");
+        state.snapshot = snapshot;
+        const rows = macroWindowRows(snapshot), latest = rows.at(-1), ref = latest?.ref || {};
+        const update = snapshot.latest_update || {}, metrics = update.metrics || {}, invocation = snapshot.invocation || {};
+        const headline = macroHeadline(latest);
+        setText("macro-ending-floor-value", headline.floor == null ? "未知" : `第 ${int(headline.floor)} 层`);
+        setText("macro-revival-value", headline.revivals == null ? "未知" : `${int(headline.revivals)} 次`);
+        setText("macro-hp-loss-value", headline.hpLoss == null ? "未知" : `${decimal(headline.hpLoss)} HP`);
+        setText("macro-stop-value", headline.stopLabel);
+        setText("macro-ending-floor-context", `Root 位于第 ${int(ref.root_floor)} 层 → 推进 ${int(ref.post_root_floor_span)} 层；不是整局最远能力`);
+        setText("macro-stop-context", ref.ending === "macro_horizon"
+          ? `达到 ${snapshot.macro_horizon ?? "—"} 个宏观决策的窗口预算，游戏没有因此判负`
+          : macroOutcome(ref));
+        setText("macro-performance-context", latest
+          ? `${macroWindowLabel(latest)}。这是模型自然选择的轨迹；当前采集中分支的楼层不能替代这条已提交结果。`
+          : "尚无已提交自然轨迹。楼层、复活与失血保持未知，不用 0 或候选分支补齐。");
+        setText("macro-quality-verdict", `表现结论：${headline.fullGameQuality}。当前只有有限训练窗口，未做完整对局、固定种子的训练前后对照评估；loss 或一次较高回报不能代替游戏能力结论。`);
+        const phases = { collecting: "采集中", updating: "学习器更新中", initializing: "初始化", aborted: "已中止", bounded_training_complete: "本次预算完成" };
+        const pill = element("status-pill");
+        pill.textContent = `记录阶段：${phases[snapshot.state] || snapshot.state}`;
+        pill.dataset.state = snapshot.state === "aborted" ? "failed" : snapshot.state === "bounded_training_complete" ? "complete" : "running";
+        setText("mode-badge", `同步 Macro Credit · ${snapshot.macro_horizon ?? "—"} macro 窗口 · 非完整对局`);
+        setText("run-title", snapshot.lineage_id);
+        setText("run-id", `teacher → committed update · ${snapshot.root_surface || "—"} root`);
+        setText("run-device", snapshot.device || "—");
+        const runSelect = element("run-select");
+        if (runSelect.options.length !== 1 || runSelect.options[0].value !== snapshot.lineage_id) {
+          const option = document.createElement("option"); option.value = snapshot.lineage_id; option.textContent = snapshot.lineage_id;
+          runSelect.replaceChildren(option);
+        }
+        setText("data-age", `最近状态 / trace 活动：${duration(snapshot.activity_age_seconds)}前`);
+        setText("status-evidence", `${rows.length} 个已加载自然参考窗口 · ${snapshot.history?.length || 0} 个可见 Update · 游戏明细最多最近 ${snapshot.gameplay_history_limit ?? "—"} 个 Update，按刷新逐批补齐。强制分支与复现控制不计入自然样本；活动年龄不是进程存活证明。`);
+        setText("progress-value", `${int(snapshot.committed_update)} / ${int(invocation.target_update)} Update`);
+        const start = macroNumber(invocation.starting_update), target = macroNumber(invocation.target_update), current = macroNumber(snapshot.committed_update);
+        const progress = start != null && target != null && current != null && target > start ? Math.max(0, Math.min(100, (current - start) / (target - start) * 100)) : 0;
+        element("run-progress").value = progress;
+        setText("progress-context", `本次起点 ${int(start)} · 新增 ${int(macroDifference(current, start))} / ${int(invocation.maximum_additional_updates)} · ${progress.toFixed(1)}%`);
+        setText("policy-value", `${int(ref.root_floor)} → ${int(ref.ending_floor)} 层`);
+        setText("policy-context", `推进 ${int(ref.post_root_floor_span)} 层 · 采集 teacher ${int(latest?.root.teacher_version)} · ${macroEnding(ref.ending)}`);
+        const returns = rows.slice(-5).map(row => macroNumber(row.ref.observed_discounted_return)).filter(value => value != null);
+        setText("throughput-value", returns.length ? decimal(returns.reduce((sum, value) => sum + value, 0) / returns.length, 5) : "—");
+        setText("throughput-context", `n=${returns.length} · 不含 tail V · seed 随 Update 变化，非配对质量评估`);
+        setText("heldout-value", "未评估");
+        setText("heldout-context", "没有完整对局胜率；缺失不填 0%");
+        setText("training-meta", `自然窗口 ${rows.length} · 截止前 ${snapshot.macro_horizon ?? "—"} macro · 下一 seed ${snapshot.next_training_seed ?? "—"}`);
+        renderKeyValues("latest-episode-kv", latest ? {
+          "提交 Update / 采集 Teacher": `${latest.update} / ${latest.root.teacher_version}`,
+          "Seed": latest.root.seed, "Root → 截止楼层": `${ref.root_floor} → ${ref.ending_floor}`,
+          "窗口推进楼层": ref.post_root_floor_span, "窗口实测折扣回报": ref.observed_discounted_return,
+          "窗口动作步": ref.branch_native_steps, "前缀动作步": ref.prefix_native_steps,
+          "从 reset 累计动作": ref.native_steps, "截止累计引擎复活": ref.last_total_revivals,
+          "截止累计玩家失血": ref.player_hp_lost_since_reset,
+          "Root 后宏观 / 战斗决策": `${ref.continuation_macro_decisions ?? "—"} / ${ref.continuation_combat_decisions ?? "—"}`,
+          "截止原因": macroOutcome(ref)
+        } : {});
+        setText("latest-episode-time", latest ? `由 teacher ${latest.root.teacher_version} 采集` : "—");
+        const points = getter => {
+          let missing = false, previousUpdate = null;
+          return rows.flatMap(row => {
+            const y = macroNumber(getter(row));
+            const gap = previousUpdate != null && row.update > previousUpdate + 1;
+            previousUpdate = row.update;
+            if (y == null) { missing = true; return []; }
+            const point = { x: row.order, y, breakBefore: missing || gap,
+              meta: `${macroWindowLabel(row)} · ${decimal(y, 5)}` };
+            missing = false;
+            return [point];
+          });
+        };
+        const options = { xLabel: "自然参考窗口（完成顺序）", empty: "等待已提交窗口的 collection 汇总；没有补造游戏表现" };
+        renderLineChart("episode-chart", [
+          { label: "窗口推进楼层", color: "--series-1", points: points(row => row.ref.post_root_floor_span) },
+          { label: "截止累计复活", color: "--series-5", axis: "right", dash: "6 4", points: points(row => row.ref.last_total_revivals) }
+        ], { ...options, yLabel: "Root 后推进层数", rightYLabel: "从 reset 累计复活" });
+        renderLineChart("macro-return-chart", [{ label: "自然窗口实测折扣回报", color: "--series-2", points: points(row => row.ref.observed_discounted_return) }], { ...options, yLabel: "已观测回报（不含 V）" });
+        renderLineChart("macro-actions-chart", [
+          { label: "Root 后动作步", color: "--series-1", points: points(row => row.ref.branch_native_steps) },
+          { label: "Root 后战斗决策", color: "--series-4", points: points(row => row.ref.continuation_combat_decisions) }
+        ], { ...options, yLabel: "次数（非胜场）" });
+        macroTable("episodes-body", rows.slice(-30).reverse().map(row => [
+          `${row.update} / ${row.root.teacher_version}`, row.root.seed, `${row.ref.root_floor ?? "—"} → ${row.ref.ending_floor ?? "—"}`,
+          int(row.ref.post_root_floor_span), decimal(row.ref.observed_discounted_return, 5), int(row.ref.branch_native_steps),
+          int(row.ref.last_total_revivals), decimal(row.ref.player_hp_lost_since_reset, 2), macroOutcome(row.ref)
+        ]), 9);
+        renderMacroComparison(rows);
+        renderMacroRoot(rows);
+        renderKeyValues("latest-learner-kv", {
+          "已提交 Update": update.update, "Joint / Macro / Combat loss": `${decimal(metrics.loss, 5)} / ${decimal(metrics.macro_loss, 5)} / ${decimal(metrics.combat_loss, 5)}`,
+          "梯度范数": metrics.gradient_norm, "参数 Δ L2": metrics.parameter_delta_norm,
+          "Graph / Backward chunks": `${metrics.max_autograd_steps ?? "—"} / ${metrics.backward_chunks ?? "—"}`,
+          "Likelihood 最大重建误差": metrics.maximum_likelihood_error,
+          "Learner 耗时（秒）": metrics.elapsed_seconds, "Policy lag": metrics.policy_lag,
+          "GPU allocated / reserved 峰值 MiB": `${decimal(metrics.peak_cuda_allocated_bytes == null ? null : metrics.peak_cuda_allocated_bytes / 1048576, 1)} / ${decimal(metrics.peak_cuda_reserved_bytes == null ? null : metrics.peak_cuda_reserved_bytes / 1048576, 1)}`,
+          "RSS 历史高水位 MiB": metrics.process_peak_rss_bytes == null ? null : metrics.process_peak_rss_bytes / 1048576
+        });
+        renderKeyValues("latest-actor-kv", {
+          "当前记录阶段": phases[snapshot.state] || snapshot.state,
+          "当前 trace": snapshot.progress?.trace,
+          "当前 trace 楼层": snapshot.progress?.floor,
+          "自然 Macro / Combat 决策": `${metrics.macro_steps ?? "—"} / ${metrics.combat_steps ?? "—"}`,
+          "下一训练 Seed": snapshot.next_training_seed,
+          "Writer lock 文件": snapshot.writer_lock_present,
+          "WSL / Windows PID（记录值）": `${invocation.wsl_training_pid_recorded ?? "—"} / ${invocation.windows_wsl_pid_recorded ?? "—"}`,
+          "退出记录存在": invocation.exit_record_present,
+          "stderr 字节": invocation.logs?.["stderr.log"]?.bytes,
+          "进程存活是否由面板验证": false
+        });
+        setText("latest-learner-time", `Update ${update.update ?? "—"}`);
+        setText("latest-actor-time", dateTime(snapshot.observed_at_utc));
+        const learnerPoints = key => {
+          let missing = false, previousUpdate = null;
+          return (snapshot.history || []).flatMap(item => {
+            const gap = previousUpdate != null && item.update > previousUpdate + 1;
+            previousUpdate = item.update;
+            if (macroNumber(item.metrics?.[key]) == null) { missing = true; return []; }
+            const point = { x: item.update, y: item.metrics[key], breakBefore: missing || gap,
+              meta: `Update ${item.update} · ${decimal(item.metrics[key], 5)}` };
+            missing = false;
+            return [point];
+          });
+        };
+        renderLineChart("learner-chart", [
+          { label: "Joint loss", color: "--series-1", points: learnerPoints("loss") },
+          { label: "Learner 耗时", color: "--series-5", axis: "right", points: learnerPoints("elapsed_seconds") }
+        ], { xLabel: "已提交 Update", yLabel: "有符号复合目标", rightYLabel: "耗时（秒）", empty: "尚无已提交学习器指标" });
+        macroTable("checkpoints-body", [["未反序列化验收", `Update ${snapshot.committed_update ?? "—"}`, `${snapshot.run_dir} · checkpoint.pt / publication.pt`, "—", "未做完整对局评估"]], 5);
+        setText("checkpoint-summary", "仅显示所选运行 metadata；checkpoint 是恢复 authority");
+        const warnings = [...(snapshot.warnings || [])];
+        if (snapshot.error) warnings.push(`${snapshot.error_type || "错误"}: ${snapshot.error}`);
+        if (["collecting", "updating"].includes(snapshot.state) && snapshot.activity_age_seconds > 300) warnings.push(`状态 / trace 已 ${duration(snapshot.activity_age_seconds)}未变化；该阶段没有逐步心跳，需要区分耗时与阻塞，不能仅据此判死锁。`);
+        setText("alerts-count", warnings.length);
+        const list = element("alerts-list"); list.replaceChildren();
+        for (const warning of warnings.length ? warnings : ["没有元数据读取告警；不代表策略质量或持续吞吐已通过验收。"]) { const li = document.createElement("li"); li.textContent = warning; list.append(li); }
+        renderKeyValues("data-quality-kv", { "数据源": "已提交 update.json + reference collection 汇总", "自然样本数": rows.length,
+          "强制分支作为独立自然样本": false, "完整对局胜率": "未评估", "不同种子的差值": "描述性，不是配对质量增益", "缺失 HP / 时间字段": "保持未知，不填 0" });
+        setText("incidents-count", "明确区分实测与估计"); element("incidents-list").replaceChildren();
+        document.querySelectorAll(".skeleton").forEach(node => node.classList.remove("skeleton"));
+        element("main-content").setAttribute("aria-busy", "false");
+        setText("last-refresh", `页面刷新：${dateTime(snapshot.observed_at_utc)}`);
+        state.lastFetchedAt = Date.now();
+      }
+
       function renderSnapshot(snapshot) {
         state.snapshot = snapshot;
         renderStatus(snapshot);
@@ -4175,6 +4568,12 @@
         if (manual) clearError();
 
         try {
+          if (MACRO_MODE) {
+            const snapshot = await fetchJson(API_SNAPSHOT);
+            clearError();
+            renderMacroSnapshot(snapshot);
+            return;
+          }
           const runPayload = await fetchJson(API_RUNS);
           const selected = populateRuns(runPayload);
           if (!selected) {
@@ -4242,6 +4641,7 @@
         }
       });
 
+      if (MACRO_MODE) initializeMacroDashboard();
       refresh(false);
     })();
   </script>

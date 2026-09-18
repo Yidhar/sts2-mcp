@@ -707,7 +707,7 @@ _FEATURE_ABI_END: Final = _ACTION_GROUP_MULTIPLICITY_SLOT + 1
 # strategic fact (including nested upgrade previews and enchantments) remains
 # represented.  Tensor shapes are unchanged, but candidate identities and
 # replay action indices are not compatible with earlier encoders.
-GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v17"
+GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v18"
 
 # This table is executable encoder semantics, not parser convenience. Keep it
 # immutable and include it verbatim in the grounding identity payload so any
@@ -751,6 +751,7 @@ def _grounding_encoding_contract() -> dict[str, Any]:
         "entity_collision_policy": (
             "stable-hash-embeddings-plus-exact-decision-local-bindings-v1"
         ),
+        "policy_branch_binding": "sorted-exact-semantic-labels-independent-of-role-embedding-v1",
         "summary_slot_count": _SUMMARY_SLOT_COUNT,
         "numeric_slots": _NUMERIC_SLOT_BY_KEY,
         "category_slot_start": _CATEGORY_SLOT_START,
@@ -3098,32 +3099,12 @@ class GroundedObservationEncoder:
         target_lookup = _target_fact_lookup(observation)
         candidates: list[_Candidate] = []
         references: list[ActionReference] = []
-        # ``role_id`` is also the parameter-free policy branch ID. Hashing is
-        # still appropriate for embeddings, but two distinct co-occurring
-        # branch labels must never be silently merged into one probability
-        # marginal. Fail closed at the untrusted action boundary if the finite
-        # role vocabulary collides for this decision.
-        branch_labels_by_id: dict[int, str] = {}
+        # Learned role embeddings retain their stable hash buckets. Exact
+        # parameter-free policy grouping must never inherit hash collisions.
+        # Sorted labels make bindings independent of candidate enumeration.
+        branch_labels = tuple(self._candidate_role_label(group.prototype) for group in action_groups)
+        branch_bindings = {label: index for index, label in enumerate(sorted(set(branch_labels)))}
         for group in action_groups:
-            branch_label = self._candidate_role_label(group.prototype)
-            branch_id = _hash_id(
-                "role",
-                branch_label,
-                self.config.role_vocab_size,
-            )
-            previous_branch_label = branch_labels_by_id.setdefault(
-                branch_id,
-                branch_label,
-            )
-            if previous_branch_label != branch_label:
-                raise ValueError(
-                    "co-occurring semantic action branches collide in the "
-                    "configured role vocabulary; refusing to merge policy "
-                    "marginals: "
-                    f"role_id={branch_id} "
-                    f"first={previous_branch_label!r} "
-                    f"second={branch_label!r}"
-                )
             candidate = self._candidate_token(
                 group.prototype,
                 target_lookup=target_lookup,
@@ -3144,6 +3125,7 @@ class GroundedObservationEncoder:
             world_tokens,
             candidates,
             bindings=bindings,
+            policy_branch_ids=tuple(branch_bindings[label] for label in branch_labels),
             domain_id=domain_id,
             macro_economic_surface_id=macro_economic_surface_id,
             encoding_fingerprint=fingerprint,
@@ -3305,6 +3287,7 @@ class GroundedObservationEncoder:
         candidates: Sequence[_Candidate],
         *,
         bindings: _EntityBindingAllocation,
+        policy_branch_ids: Sequence[int],
         domain_id: int,
         macro_economic_surface_id: int,
         encoding_fingerprint: str,
@@ -3363,11 +3346,12 @@ class GroundedObservationEncoder:
                         candidate.target_entity_aux_key,
                         candidate.target_entity_aux_is_relation,
                     ),
+                    branch_id,
                 )
-                for token, candidate in zip(candidate_tokens, candidates, strict=True)
+                for token, candidate, branch_id in zip(candidate_tokens, candidates, policy_branch_ids, strict=True)
             ),
             feature_dim=self.config.feature_dim,
-            id_width=13,
+            id_width=14,
         )
         flattened_locals = tuple(local for candidate in candidates for local in candidate.locals)
         local_table = sparse_token_table(

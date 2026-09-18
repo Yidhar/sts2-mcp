@@ -204,6 +204,22 @@ def test_collect_update_commit_publication_order_and_seed_cursor(tmp_path: Path,
     assert result["long_run_certified"] is False
 
 
+def test_model_only_fork_starts_at_explicit_unconsumed_seed_offset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+    output, config, learner = _prepare_run(tmp_path, monkeypatch, events)
+    config = replace(config, course=replace(config.course, seed_index_offset=20))
+    result = _run(tmp_path, output, config, learner)
+    assert "collect:0:13400040" in events
+    assert "collect:0:13400042" in events
+    assert result["next_seed_index"] == 2
+
+
+@pytest.mark.parametrize("offset", [-1, True, 0.5])
+def test_seed_offset_requires_nonnegative_integer(offset: Any) -> None:
+    with pytest.raises(ValueError):
+        cli.CourseLimits(seed_index_offset=offset)
+
+
 def test_partial_cohort_never_updates_or_advances_committed_cursor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
     output, config, learner = _prepare_run(tmp_path, monkeypatch, events)

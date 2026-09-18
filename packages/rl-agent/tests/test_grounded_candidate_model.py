@@ -123,6 +123,7 @@ def _make_batch(config: GroundedCandidateConfig) -> GroundedCandidateBatch:
         order_ids=_ids((batch_size, world_count), config.order_vocab_size),
     )
     candidates = CandidateTokenBatch(
+        policy_branch_ids=torch.arange(action_count).unsqueeze(0).expand(batch_size, -1),
         features=torch.randn(batch_size, action_count, config.token_feature_dim),
         type_ids=_ids((batch_size, action_count), config.type_vocab_size),
         role_ids=_ids((batch_size, action_count), config.role_vocab_size),
@@ -285,8 +286,8 @@ def test_hierarchical_policy_does_not_turn_branch_cardinality_into_preference(
     del many_branch_label, singleton_branch_label
     model = RecurrentCandidateModel(config).eval()
     template = model(_make_batch(config))
-    many_branch = 2
-    singleton_branch = 5
+    many_branch = 0
+    singleton_branch = 1
 
     two_candidates = replace(
         template,
@@ -346,8 +347,8 @@ def test_hierarchical_policy_normalizes_entropy_by_its_exact_capacity(
 ) -> None:
     model = RecurrentCandidateModel(config).eval()
     template = model(_make_batch(config))
-    multi_branch = 2
-    singleton_branch = 5
+    multi_branch = 0
+    singleton_branch = 1
 
     # Uniform actions inside the multi-candidate branch and branch logits
     # proportional to exp(q_b) attain the exact capacity log(e + 1).
@@ -382,8 +383,8 @@ def test_confirm_and_deselect_are_learned_distinct_branches_without_hard_coding(
 ) -> None:
     model = RecurrentCandidateModel(config).eval()
     template = model(_make_batch(config))
-    deselect_branch = 3
-    confirm_branch = 7
+    deselect_branch = 0
+    confirm_branch = 1
     surface = replace(
         template,
         policy_logits=torch.tensor([[0.1, 0.4]]),

@@ -119,6 +119,7 @@ def _synthetic_batch(
     local_shape = (batch_size, action_count, local_count)
     candidate_shape = (batch_size, action_count)
     candidates = CandidateTokenBatch(
+        policy_branch_ids=torch.arange(action_count, device=device).unsqueeze(0).expand(batch_size, -1),
         features=torch.randn(*candidate_shape, cfg.token_feature_dim, device=device),
         type_ids=_ids(candidate_shape, cfg.type_vocab_size, device=device),
         role_ids=_ids(candidate_shape, cfg.role_vocab_size, device=device),

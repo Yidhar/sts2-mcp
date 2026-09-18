@@ -66,6 +66,7 @@ DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config/experiments/hybri
 @dataclass(frozen=True, slots=True)
 class CourseLimits:
     roots_per_cohort: int = 1
+    seed_index_offset: int = 0
     maximum_root_snapshot_bytes: int = 256 * 1024 * 1024
     maximum_cohort_snapshot_bytes: int = 512 * 1024 * 1024
     maximum_root_seconds: float = 3600.0
@@ -75,6 +76,10 @@ class CourseLimits:
 
     def __post_init__(self) -> None:
         for name, value in asdict(self).items():
+            if name == "seed_index_offset":
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError("course.seed_index_offset must be a non-negative integer")
+                continue
             if name.endswith("seconds"):
                 if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value <= 0:
                     raise ValueError(f"course.{name} must be positive and finite")
@@ -113,7 +118,8 @@ class MacroTrainingConfig:
             "course": asdict(self.course),
             "branches": asdict(self.branches),
             "learner": asdict(self.learner),
-            "seed_recipe": {"base": TRAINING_SEED_BASE, "multiplier": 2, "partition": "training-even"},
+            "seed_recipe": {"base": TRAINING_SEED_BASE, "multiplier": 2, "partition": "training-even",
+                            "index_offset": self.course.seed_index_offset},
         })
         return result
 
@@ -302,8 +308,8 @@ def run_cohorts(
         raise ValueError("max_updates must be a positive integer")
     if isinstance(learner.update, bool) or not isinstance(learner.update, int) or learner.update < 0:
         raise ValueError("learner update must be a non-negative integer")
-    seed_at(initial_seed_index)
-    seed_at(initial_seed_index + max_updates * config.course.roots_per_cohort - 1)
+    seed_at(config.course.seed_index_offset + initial_seed_index)
+    seed_at(config.course.seed_index_offset + initial_seed_index + max_updates * config.course.roots_per_cohort - 1)
     if initial_seed_index != learner.update * config.course.roots_per_cohort:
         raise ValueError("committed update and seed cursor do not describe a complete cohort boundary")
     output = resolve_artifact_path(output, root=root)
@@ -350,7 +356,8 @@ def run_cohorts(
                 remaining_seconds = config.course.maximum_cohort_seconds - (time.monotonic() - guard.started)
                 collected, _report = collect_macro_credit_root(
                     backend_factory=backend_factory, policy=teacher, config=config.training,
-                    seed=seed_at(cursor + offset), teacher_version=learner.update, limits=config.branches,
+                    seed=seed_at(config.course.seed_index_offset + cursor + offset), teacher_version=learner.update,
+                    limits=config.branches,
                     output_dir=cohort_dir / f"root-{offset:03d}",
                     maximum_snapshot_bytes=min(config.course.maximum_root_snapshot_bytes, remaining_bytes),
                     maximum_group_seconds=min(config.course.maximum_root_seconds, remaining_seconds),
@@ -411,6 +418,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", required=True)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--initialize-from-iql", type=Path)
+    mode.add_argument("--initialize-from-macro-publication", type=Path,
+                      help="explicit model-only new lineage; optimizer/RNG/update are reset, never exact resume")
     mode.add_argument("--resume", type=Path)
     parser.add_argument("--sim-exe", type=Path)
     parser.add_argument("--max-updates", type=int, default=1, help="maximum committed updates in this invocation")
@@ -431,7 +440,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         device = explicit_device(args.device)
         if not args.lineage_id.strip():
             raise ValueError("--lineage-id must be non-empty")
-        source = resolve_external_input_path(args.initialize_from_iql or args.resume, root=root)
+        source = resolve_external_input_path(
+            args.initialize_from_iql or args.initialize_from_macro_publication or args.resume, root=root)
         if not source.exists():
             raise FileNotFoundError("initialization/resume source does not exist")
         if args.resume:
@@ -464,18 +474,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.dry_run:
             print(json.dumps({"state": "preflight_only", "training_ready": False, "config_validated": True,
                               "simulator_verified": True, "source_weights_validated": False,
-                              "next_training_seed_if_new": seed_at(0), "course": config.as_mapping()}, allow_nan=False))
+                              "next_training_seed_if_new": seed_at(config.course.seed_index_offset),
+                              "course": config.as_mapping()}, allow_nan=False))
             return 0
         with output_owner(output, resume=bool(args.resume)):
             _json(output / "status.json", {"state": "initializing", "lineage_id": args.lineage_id})
             configure_rocm_sdpa_backend(training.runtime.rocm_sdpa_backend, devices=(device,))
-            if args.initialize_from_iql:
+            if args.initialize_from_iql or args.initialize_from_macro_publication:
                 random.seed(TRAINING_SEED_BASE)
                 np.random.seed(TRAINING_SEED_BASE)
                 torch.manual_seed(TRAINING_SEED_BASE)
-                loaded = FrozenMacroRootPolicy(source, training, str(device), initialize_from_iql=True)
+                source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+                loaded = FrozenMacroRootPolicy(source, training, str(device),
+                                               initialize_from_iql=bool(args.initialize_from_iql))
+                if args.initialize_from_macro_publication and loaded.provenance["source_kind"] != "hybrid_macro_credit_publication":
+                    raise ValueError("macro model-only initialization requires a macro-credit publication")
+                if hashlib.sha256(source.read_bytes()).hexdigest() != source_hash:
+                    raise ValueError("initialization source changed while loading")
                 model = loaded.model
-                initialization = {**loaded.provenance, "mode": "model_only_new_macro_lineage"}
+                initialization = {**loaded.provenance, "mode": "model_only_new_macro_lineage",
+                                  "source_sha256": source_hash, "optimizer_reset": True,
+                                  "rng_reset": True, "destination_update": 0,
+                                  "destination_encoding": grounding_encoding_identity()}
             else:
                 model = HybridDomainActorCriticModel(HybridActorCriticConfig(training.model.to_model_config())).to(device)
                 initialization = {}
@@ -499,7 +519,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                                        protocol_quarantine_dir=protocol_incidents),
                 initial_seed_index=cursor, initialization=initialization, max_updates=args.max_updates,
                 initialize_boundary=not bool(args.resume), root=root,
-                source_paths=(source,) if args.initialize_from_iql else (),
+                source_paths=(source,) if args.initialize_from_iql or args.initialize_from_macro_publication else (),
             )
             print(json.dumps(summary, allow_nan=False))
         return 0

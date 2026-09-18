@@ -1231,7 +1231,7 @@ def test_encoder_requires_registered_canonical_model_action_kind() -> None:
         )
 
 
-def test_encoder_fails_closed_on_cooccurring_policy_branch_hash_collision() -> None:
+def test_encoder_separates_exact_branches_despite_role_embedding_collision() -> None:
     encoder = _encoder()
     # These two reviewed labels currently collide in both the small test role
     # vocabulary and the production-size vocabulary. They normally belong to
@@ -1260,11 +1260,12 @@ def test_encoder_fails_closed_on_cooccurring_policy_branch_hash_collision() -> N
         },
     ]
 
-    with pytest.raises(
-        ValueError,
-        match=r"co-occurring semantic action branches collide",
-    ):
-        encoder.encode(_observation(), actions)
+    encoded = encoder.encode(_observation(), actions)
+    batch = encoded.batch.candidates
+    assert batch.role_ids[0, 0] == batch.role_ids[0, 1]
+    assert batch.policy_branch_ids[0, 0] != batch.policy_branch_ids[0, 1]
+    reversed_batch = encoder.encode(_observation(), actions[::-1]).batch.candidates
+    assert torch.equal(batch.policy_branch_ids.flip(1), reversed_batch.policy_branch_ids)
 
 
 def test_unknown_engineered_subtrees_are_pruned_at_container_boundary() -> None:
@@ -1368,7 +1369,7 @@ def test_encoder_rejects_feature_dimensions_below_versioned_abi() -> None:
 def test_encoding_contract_has_stable_checkpoint_identity() -> None:
     identity = grounding_encoding_identity()
 
-    assert identity["version"] == "grounded-relational-runtime-encoding-v17"
+    assert identity["version"] == "grounded-relational-runtime-encoding-v18"
     assert identity["version"] == GROUNDING_ENCODING_VERSION
     assert identity["min_token_feature_dim"] == 224
     assert identity["feature_abi_end"] == 215

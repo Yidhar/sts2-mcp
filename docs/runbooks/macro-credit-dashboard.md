@@ -5,11 +5,94 @@ The new synchronous course does not emit the legacy
 therefore cannot correctly discover this course. Do not point the old UI at it
 and interpret a previous lineage's metrics as the current training run.
 
-The separate `sts2_rl.macro_dashboard` reads one explicitly selected external
+The `sts2_rl.macro_dashboard` data adapter reads one explicitly selected external
 run's `course.json`, `status.json`, `cohorts/*/update.json`, and a bounded tail of
 its newest active trace. An optional, explicitly selected invocation directory
 adds the recorded launch target/PIDs and exit-file/log-size observations. Its
 lineage must match before those observations are used.
+
+## Shared legacy panel, new-course gameplay adapter
+
+The default page now reuses **`dashboard_static/index.html`**, including the old
+panel's styles, layout, SVG trend renderer, refresh controls, diagnostic cards,
+and table interactions. The adapter injects an explicit
+`data-dashboard-mode="macro-credit"` marker. The normal legacy server does not
+inject that marker, so its run selection, full-episode views and held-out
+drill-down keep their existing behavior. There is no fabricated legacy
+`metrics.jsonl`, nor a fallback to an unrelated old training run.
+
+The synchronous mode shows:
+
+- A first-screen gameplay result strip: latest committed natural ending floor,
+  cumulative revival count, cumulative exact HP loss and the actual stopping
+  reason. `macro_horizon` is prominently labelled as a training-window cutoff,
+  not a defeat or proof that the model cannot progress further. A separate
+  verdict states that full-game improvement remains unmeasured.
+- Game progress, observed post-root return, action counts, cumulative engine
+  revivals and exact cumulative HP loss when available.
+- One natural reference per committed root in the main trends. Same-action
+  control and forced branches are excluded from natural sample counts.
+- Two selectable historical windows with baseline/current/difference columns.
+  Different seeds and roots are descriptive comparisons, not paired evidence
+  of policy improvement. An unavailable explicitly selected window stays
+  unavailable rather than silently changing to another sample.
+- Same-root action alternatives with recorded card/action identifiers, ending
+  floor, observed return, return delta, teacher/post-update probabilities, and
+  the separately labelled estimated lambda-return target.
+- Missing full-episode held-out success rates remain **not evaluated**, not
+  zero. The frozen collection teacher is labelled separately from the
+  post-update committed version; a candidate probability update is not a new
+  game rollout.
+
+Only completed collections joined to a committed update and matching root /
+teacher identity enter the gameplay projection. Observed reward covers the
+post-root window; total native/semantic counts include the reset prefix, while
+branch/continuation counts do not. End-of-window revival and exact HP counters
+are cumulative since reset. `macro_horizon` means a cutoff, not defeat.
+`progress_reward` and its `potential_reward` alias are counted only once.
+
+Collection projections and bounded reference tails are cached with file
+identity/mtime/size checks. Metadata and each tail are capped at 1 MiB, details
+cover at most 64 recent updates / 16 roots per update, and each poll admits a
+bounded number of cold collection/tail reads. Older missing details and HP
+counters remain unknown while warming, not zero. Trend lines break across
+unknown points rather than implying continuous measurement.
+
+### Applying an update to an already running panel
+
+The Python server loads its module and shared HTML at startup. **Reloading the
+browser alone does not upgrade an existing dashboard process.** Restart only
+the dashboard, using its verified process/terminal, then reload its page.
+Never use the WSL trainer PID or its Windows wrapper PID as the dashboard PID.
+The user-started dashboard observed on 2026-09-05 used Windows PID **83152** on
+port 8766; that number is historical, so verify the command before any stop.
+No training restart is needed for this adapter/UI change.
+
+### Shared-panel regression verification — 2026-09-05
+
+The Windows run of `test_macro_dashboard.py`, `test_macro_dashboard_ui.py`,
+`test_training_dashboard.py`, and `test_episode_monitoring.py` passed **67
+tests**, with the WSL-writer integration enabled. Ruff and Windows-target mypy
+passed. The shared HTML's JavaScript passed Node syntax checking, and the UI
+projection tests cover natural-reference-only counts, unknown values,
+preservation of a missing pinned comparison, and gaps in chart data. The
+existing legacy dashboard regression suite remains passing.
+
+A read-only real-course adapter check observed 11 natural windows from 11
+committed updates. The latest was teacher 10 / committed update 11, seed
+13400020, floor 3 to 6, observed discounted return -0.0527007805, window native
+steps 42, reset-cumulative HP loss 63 and revivals 0. The 18 frozen training
+source hashes were unchanged.
+
+A normal hidden launch of the updated server on an unused validation port was
+rejected before process creation by the execution tool. No existing dashboard
+or training process was stopped. A subsequent API read still found the
+user-started PID 83152 without the new `gameplay_history_limit` field, so that
+process had **not** loaded this version. An attempted local-file visual QA
+preview was blocked by the browser URL policy; no alternate browser route was
+used. Automated tests and live visual deployment are distinct: restart only
+the dashboard, then verify the shared page and `history[].gameplay` over its
+normal loopback HTTP URL before claiming live visual acceptance.
 
 ## Safety and measurement scope
 
@@ -86,15 +169,17 @@ mutation methods return 405. The API must name
 `sts2-macro-credit-dashboard-v1` and the selected new lineage, not the old
 `sts2-training-dashboard-v1` schema.
 
-## Current verification and startup limitation — 2026-09-05
+## Earlier startup limitation — 2026-09-05
 
-**The dashboard service has not been started.** Ordinary Windows
+**The agent had not started a dashboard service at that point.** Ordinary Windows
 `Start-Process -WindowStyle Hidden` requests were rejected by the execution
 policy before process creation, both from the dashboard task and from the root
 task. No escalation, alternative launcher or startup retry is being used to
-work around that restriction. There is no confirmed live dashboard PID or
-live service URL to report. `http://127.0.0.1:8766/` is the prepared address,
-not a claim that a service is listening.
+work around that restriction. Subsequently the user started the documented
+command, and a loopback service at `http://127.0.0.1:8766/` was observed with
+the correct selected lineage. This historical launch record is not proof that
+an existing process has loaded the latest source changes; see the restart
+requirement above.
 
 The implementation is verified independently of that launch limitation:
 

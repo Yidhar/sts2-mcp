@@ -281,6 +281,7 @@ class CandidateTokenBatch:
     target_entity_aux_ids: Tensor  # [B, A]
     target_definition_binding_ids: Tensor  # [B, A]
     target_relation_binding_ids: Tensor  # [B, A]
+    policy_branch_ids: Tensor  # [B, A], exact grouping; NEVER a learned embedding index
     local_features: Tensor  # [B, A, L, F]
     local_mask: Tensor  # [B, A, L]
     local_type_ids: Tensor  # [B, A, L]
@@ -306,6 +307,9 @@ class CandidateTokenBatch:
                 f"token_feature_dim={config.token_feature_dim}, got {feature_dim}"
             )
         candidate_shape = (batch_size, action_count)
+        _require_shape("candidates.policy_branch_ids", self.policy_branch_ids, candidate_shape)
+        _require_ids("candidates.policy_branch_ids", self.policy_branch_ids, action_count)
+        _require_same_device("candidates.policy_branch_ids", self.features, self.policy_branch_ids)
         for name, value in (
             ("type_ids", self.type_ids),
             ("role_ids", self.role_ids),
@@ -429,6 +433,7 @@ class CandidateTokenBatch:
             features=_candidate_axis(self.features, permutation),
             type_ids=_candidate_axis(self.type_ids, permutation),
             role_ids=_candidate_axis(self.role_ids, permutation),
+            policy_branch_ids=_candidate_axis(self.policy_branch_ids, permutation),
             owner_ids=_candidate_axis(self.owner_ids, permutation),
             entity_ids=_candidate_axis(self.entity_ids, permutation),
             entity_aux_ids=_candidate_axis(self.entity_aux_ids, permutation),
@@ -1765,8 +1770,8 @@ class RecurrentCandidateModel(nn.Module):
             recurrent_state=next_recurrent_state,
             candidate_embeddings=policy_features,
             policy_logits=policy_logits,
-            policy_branch_ids=batch.candidates.role_ids,
-            policy_branch_count=self.config.role_vocab_size,
+            policy_branch_ids=batch.candidates.policy_branch_ids,
+            policy_branch_count=int(batch.candidates.features.shape[1]),
             value=self.value_head(next_recurrent_state).squeeze(-1),
             combat_task_value=self.combat_task_value_head(next_recurrent_state).squeeze(-1),
             act_task_value=self.act_task_value_head(next_recurrent_state).squeeze(-1),

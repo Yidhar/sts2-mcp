@@ -1,0 +1,72 @@
+# Bounded long-run experiment: only branch-binding repair and new lineage.
+# Preserve v1 learner/horizon/revival settings for an interpretable continuation.
+# Model-only parent update 20; fresh optimizer; even training seeds start 13400040.
+version = "sts2-synchronous-macro-credit-course-v1"
+
+[course]
+roots_per_cohort = 1
+seed_index_offset = 20
+maximum_root_snapshot_bytes = 268435456
+maximum_cohort_snapshot_bytes = 536870912
+maximum_root_seconds = 3600.0
+maximum_cohort_seconds = 7200.0
+maximum_output_bytes = 68719476736
+minimum_free_disk_bytes = 1073741824
+
+[branches]
+root_surface = "reward"
+root_occurrence = 1
+continuation_macro_decisions = 12
+terminal_only = false
+max_native_steps = 8192
+max_candidates = 16
+timeout_seconds = 1200.0
+max_trace_bytes = 134217728
+policy_atol = 0.000001
+policy_rtol = 0.00001
+
+[learner]
+learning_rate = 0.0001
+shared_learning_rate_scale = 0.5
+weight_decay = 0.01
+macro_trace_lambda = 0.95
+macro_kl = 0.02
+chunk_steps = 16
+combat_unroll_steps = 16
+macro_policy_weight = 1.0
+macro_value_weight = 0.5
+combat_policy_weight = 1.0
+combat_value_weight = 0.5
+combat_entropy_weight = 0.02
+rho_clip = 1.0
+c_clip = 1.0
+policy_rho_clip = 1.0
+gradient_clip_norm = 1.0
+likelihood_tolerance = 0.00001
+
+[training.transaction_learning]
+enabled = false
+
+[training.failure_credit]
+mode = "disabled"
+
+[training.episodic_learning]
+enabled = false
+
+[training.rollout]
+deterministic_probe_interval_episodes = 0
+deterministic_probe_environment_steps = []
+
+[training.curriculum]
+revival_budget = 64
+epsilon_start = 0.0
+epsilon_end = 0.0
+
+[training.runtime]
+rocm_sdpa_backend = "math"
+seed = 6700000
+evaluation_steps = []
+early_evaluation_steps = []
+final_audit_steps = []
+evaluation_liveness_guard_enabled = false
+
