@@ -27,6 +27,7 @@ from sts2_rl.models.hybrid_actor_critic import HybridActorCriticOutput
 from .macro_credit_data import MacroCounterfactualRoot, MacroCreditCohort, MacroCreditTrajectory
 from .macro_returns import mixed_vtrace_lambda_targets
 from .macro_targets import MacroPolicyProjection, project_macro_policy
+from .shadow_price import evaluate_combat_value_from_snapshot
 from .transitions import HybridVTraceStep
 
 MACRO_CREDIT_LEARNER_VERSION: Final = "sts2-fresh-macro-credit-learner-v1"
@@ -286,18 +287,25 @@ class MacroCreditLearner:
         action_values: list[Tensor] = []
         if self.config.target_mode == "combat_shadow_price":
             for trajectory in root.candidates:
-                candidate = self._evaluate(trajectory)
-                if len(candidate.values) > 1:
-                    post_combat_val = candidate.values[1]
-                elif evaluation.bootstrap_value is not None:
-                    post_combat_val = evaluation.bootstrap_value
+                if len(trajectory.steps) > 1:
+                    candidate = self._evaluate(trajectory)
+                    _, conditional = self._targets(trajectory, candidate, trace_lambda=self.config.macro_trace_lambda)
+                    action_values.append(conditional[0])
+                    calls += candidate.forward_calls
+                    maximum_error = max(maximum_error, candidate.maximum_likelihood_error)
                 else:
-                    post_combat_val = candidate.values[0]
-                reward_tensor = post_combat_val.new_tensor(trajectory.steps[0].reward)
-                q_shadow = reward_tensor + self.config.macro_trace_lambda * post_combat_val
-                action_values.append(q_shadow.squeeze())
-                calls += candidate.forward_calls
-                maximum_error = max(maximum_error, candidate.maximum_likelihood_error)
+                    if trajectory.steps[0].terminal:
+                        action_val = evaluation.values.new_tensor(trajectory.steps[0].reward)
+                    else:
+                        target_snap = trajectory.bootstrap_snapshot or trajectory.steps[0].snapshot
+                        combat_val = evaluate_combat_value_from_snapshot(
+                            self.model, target_snap, device=self.device
+                        )
+                        combat_tensor = evaluation.values.new_tensor(combat_val)
+                        reward_tensor = combat_tensor.new_tensor(trajectory.steps[0].reward)
+                        action_val = reward_tensor + self.config.macro_trace_lambda * trajectory.steps[0].discount * combat_tensor
+                    action_values.append(action_val.squeeze())
+                    calls += 1
         else:
             for trajectory in root.candidates:
                 candidate = self._evaluate(trajectory)

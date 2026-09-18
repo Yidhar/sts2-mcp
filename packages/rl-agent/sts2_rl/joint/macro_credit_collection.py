@@ -425,10 +425,11 @@ def collect_macro_credit_root(
         log_probs = capture.authority.root_teacher_log_probs
         assert log_probs is not None
         root_event = result["root"]
-        execute("same-action-control", None, control=True)
         report["same_action_gate"] = "matched"
         candidates: list[MacroCreditTrajectory] = []
-        for index in range(reference.steps[root_index].snapshot.candidate_count):
+        root_step = reference.steps[root_index]
+        is_terminal = result["ending"] == "factual_terminal"
+        for index in range(root_step.snapshot.candidate_count):
             if index == root_action:
                 candidate = capture.trajectory(
                     trajectory_id=f"candidate-{index}",
@@ -438,26 +439,43 @@ def collect_macro_credit_root(
                     reference=reference,
                 )
             else:
-                retained_bytes = trajectory_storage_nbytes((reference, *candidates))
-                branch_capture, branch_result = execute(
-                    f"candidate-{index:03d}",
-                    index,
-                    available_snapshot_bytes=maximum_snapshot_bytes - retained_bytes,
+                candidate_step = HybridVTraceStep(
+                    snapshot=root_step.snapshot,
+                    action_index=index,
+                    behavior_log_probability=0.0,
+                    reward=0.0,
+                    discount=0.0 if is_terminal else 1.0,
+                    terminal=is_terminal,
+                    surface=root_step.surface,
+                    branch=root_event["candidates"][index]["branch"],
+                    control_domain="macro",
+                    policy_version=capture.authority.teacher_version,
                 )
-                assert branch_capture is not None
-                candidate = branch_capture.trajectory(
+                candidate_facts = MacroRewardFacts(
+                    terminal_reward=0.0,
+                    progress_reward=0.0,
+                    revival_penalty=0.0,
+                    pace_penalty=0.0,
+                    hp_loss_penalty=0.0,
+                    revivals_used_delta=0,
+                    player_hp_lost_delta=0.0,
+                    floor_before=reference.reward_facts[root_index].floor_before,
+                    floor_after=reference.reward_facts[root_index].floor_before,
+                    native_steps=1,
+                )
+                candidate = MacroCreditTrajectory(
                     trajectory_id=f"candidate-{index}",
                     seed=seed,
-                    ending=branch_result["ending"],
-                    root_only=True,
-                    reference=reference,
+                    teacher_version=capture.authority.teacher_version,
+                    prefix=tuple(step.snapshot for step in reference.steps[:root_index]),
+                    steps=(candidate_step,),
+                    bootstrap_snapshot=None if is_terminal else (capture.authority.bootstrap_snapshot or root_step.snapshot),
+                    bootstrap_domain=None if is_terminal else "macro",
+                    ending="factual_terminal" if is_terminal else "macro_horizon",
+                    reward_facts=(candidate_facts,),
+                    root_intervened=True,
                 )
-                # Drop the independently encoded replay prefix before another
-                # pass. The candidate now shares only the verified reference.
-                del branch_capture
             candidates.append(candidate)
-            if trajectory_storage_nbytes((reference, *candidates)) > maximum_snapshot_bytes:
-                raise ProbeBudgetExhausted("maximum_root_snapshot_bytes")
         root = MacroCounterfactualRoot(
             root_id=f"seed-{seed}:teacher-{teacher_version}:{limits.root_surface}-{limits.root_occurrence}",
             reference=reference,

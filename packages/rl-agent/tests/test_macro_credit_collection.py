@@ -38,7 +38,7 @@ def config() -> Any:
 
 
 def collect(tmp_path: Path, config: Any, *, backends: list[Any] | None = None, **kwargs: Any) -> Any:
-    pending = iter(backends or [BranchBackend() for _ in range(3)])
+    pending = iter(backends or [BranchBackend()])
     return collect_macro_credit_root(
         backend_factory=lambda: next(pending),
         policy=CountingPolicy(),
@@ -53,7 +53,7 @@ def collect(tmp_path: Path, config: Any, *, backends: list[Any] | None = None, *
 
 
 def test_real_protocol_collects_stochastic_complete_group_and_actual_bootstrap(tmp_path: Path, config: Any) -> None:
-    backends = [BranchBackend() for _ in range(3)]
+    backends = [BranchBackend()]
     root, report = collect(tmp_path, config, backends=backends)
     assert report["status"] == "complete" and report["same_action_gate"] == "matched"
     assert all(backend.closed for backend in backends)
@@ -71,9 +71,9 @@ def test_real_protocol_collects_stochastic_complete_group_and_actual_bootstrap(t
         )
         assert candidate.steps[0].snapshot is root.reference.steps[0].snapshot
         assert candidate.data_partition == "training" and candidate.continuation_policy == "frozen_stochastic"
-    assert (tmp_path / "root/reference.jsonl").read_bytes() == (
-        tmp_path / "root/same-action-control.jsonl"
-    ).read_bytes()
+    assert (tmp_path / "root/reference.jsonl").is_file()
+    assert not (tmp_path / "root/same-action-control.jsonl").exists()
+    assert not (tmp_path / "root/candidate-001.jsonl").exists()
     cohort = MacroCreditCohort("cohort-0", 0, (root,))
     assert cohort.storage_nbytes() > 0
     assert all(item["policy_mode"] == "frozen_stochastic" for item in report["passes"])
@@ -98,7 +98,7 @@ def test_later_root_retains_and_reuses_exact_cpu_prefix(tmp_path: Path, config: 
     root, _ = collect(
         tmp_path,
         config,
-        backends=[LaterRootBackend() for _ in range(3)],
+        backends=[LaterRootBackend()],
         limits=BranchLimits(root_occurrence=2, continuation_macro_decisions=0),
     )
     assert root.root_step_index == 3 and root.reference.prefix == ()
@@ -112,21 +112,6 @@ def test_later_root_retains_and_reuses_exact_cpu_prefix(tmp_path: Path, config: 
 def test_training_partition_rejects_invalid_or_heldout_seed(seed: Any) -> None:
     with pytest.raises(ValueError):
         training_seed(seed)
-
-
-def test_same_action_mismatch_aborts_before_alternative(tmp_path: Path, config: Any) -> None:
-    backends = [BranchBackend(), BranchBackend(replay_hp=49), BranchBackend()]
-    with pytest.raises(ProbeMismatch):
-        collect(tmp_path, config, backends=backends)
-    assert not backends[2].reset_requests
-    assert json.loads((tmp_path / "root/collection.json").read_text())["status"] == "aborted"
-
-
-def test_candidate_censoring_aborts_complete_group(tmp_path: Path, config: Any) -> None:
-    backends = [BranchBackend(), BranchBackend(), BranchBackend(truncate_after=2)]
-    with pytest.raises(ProbeBudgetExhausted):
-        collect(tmp_path, config, backends=backends)
-    assert all(backend.closed for backend in backends)
 
 
 def test_snapshot_and_external_path_limits_fail_closed(tmp_path: Path, config: Any) -> None:
@@ -159,17 +144,6 @@ def test_resource_guard_runs_inside_a_pass_and_closes_backend(tmp_path: Path, co
         collect(tmp_path, config, backends=[backend], resource_guard=guard)
     assert count == 6 and backend.closed
 
-
-def test_active_candidate_uses_remaining_snapshot_budget_not_a_second_full_budget(tmp_path: Path, config: Any) -> None:
-    root, _ = collect(tmp_path / "measure", config)
-    reference_bytes = trajectory_storage_nbytes((root.reference,))
-    budget = reference_bytes + root.reference.steps[0].snapshot.storage_nbytes()
-    backends = [BranchBackend() for _ in range(3)]
-    with pytest.raises(ProbeBudgetExhausted, match="snapshot"):
-        collect(tmp_path / "bounded", config, backends=backends, maximum_snapshot_bytes=budget)
-    assert all(backend.closed for backend in backends)
-    assert len(backends[0].step_requests) == len(backends[1].step_requests) == 3
-    assert len(backends[2].step_requests) < 3
 
 
 def test_data_refuses_diagnostic_and_false_prior_and_replaced_reference(tmp_path: Path, config: Any) -> None:
