@@ -47,6 +47,13 @@ from .transitions import (
     HybridVTraceUnroll,
     next_domain_index,
 )
+from .shadow_price import (
+    SHADOW_PRICE_VERSION,
+    CombatShadowPriceOracle,
+    ShadowPriceEvaluation,
+    compute_hp_shadow_price,
+    evaluate_combat_value_from_snapshot,
+)
 from .vtrace_learner import (
     HYBRID_VTRACE_LEARNER_VERSION,
     HybridActorCriticForward,
@@ -67,7 +74,9 @@ __all__ = [
     "HYBRID_VTRACE_LEARNER_VERSION",
     "HYBRID_VTRACE_STEP_VERSION",
     "HYBRID_VTRACE_UNROLL_VERSION",
+    "SHADOW_PRICE_VERSION",
     "AbsoluteDeathPriceController",
+    "CombatShadowPriceOracle",
     "DeathPriceCourse",
     "DeathPriceEpisodeOutcome",
     "DeathPriceMetrics",
@@ -93,7 +102,10 @@ __all__ = [
     "HybridVTraceStep",
     "HybridVTraceUnroll",
     "HybridViewPair",
+    "ShadowPriceEvaluation",
+    "compute_hp_shadow_price",
     "death_price_course",
+    "evaluate_combat_value_from_snapshot",
     "next_domain_index",
     "validate_discounted_outcome_margin",
 ]

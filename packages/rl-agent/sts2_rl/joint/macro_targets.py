@@ -159,4 +159,22 @@ def project_macro_policy(
     )
 
 
-__all__ = ["MacroPolicyProjection", "project_macro_policy"]
+def project_macro_policy_from_shadow_price(
+    *,
+    shadow_action_values: Tensor,
+    teacher_log_probs: Tensor,
+    max_kl: float,
+) -> MacroPolicyProjection:
+    """Project macro policy directly using combat resource shadow price targets."""
+    return project_macro_policy(
+        action_value_targets=shadow_action_values,
+        teacher_log_probs=teacher_log_probs,
+        max_kl=max_kl,
+    )
+
+
+__all__ = [
+    "MacroPolicyProjection",
+    "project_macro_policy",
+    "project_macro_policy_from_shadow_price",
+]

@@ -52,8 +52,13 @@ class MacroCreditLearnerConfig:
     policy_rho_clip: float = 1.0
     gradient_clip_norm: float = 1.0
     likelihood_tolerance: float = 1e-5
+    target_mode: str = "counterfactual_rollout"
 
     def __post_init__(self) -> None:
+        if self.target_mode not in {"counterfactual_rollout", "combat_shadow_price"}:
+            raise ValueError(
+                f"macro credit target_mode must be 'counterfactual_rollout' or 'combat_shadow_price', got {self.target_mode}"
+            )
         for name in ("chunk_steps", "combat_unroll_steps"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 16:
@@ -279,12 +284,27 @@ class MacroCreditLearner:
         calls = evaluation.forward_calls
         maximum_error = max(evaluation.maximum_likelihood_error, float((evaluation.root_logs - recorded).abs().max().item()))
         action_values: list[Tensor] = []
-        for trajectory in root.candidates:
-            candidate = self._evaluate(trajectory)
-            _, conditional = self._targets(trajectory, candidate, trace_lambda=self.config.macro_trace_lambda)
-            action_values.append(conditional[0])
-            calls += candidate.forward_calls
-            maximum_error = max(maximum_error, candidate.maximum_likelihood_error)
+        if self.config.target_mode == "combat_shadow_price":
+            for trajectory in root.candidates:
+                candidate = self._evaluate(trajectory)
+                if len(candidate.values) > 1:
+                    post_combat_val = candidate.values[1]
+                elif evaluation.bootstrap_value is not None:
+                    post_combat_val = evaluation.bootstrap_value
+                else:
+                    post_combat_val = candidate.values[0]
+                reward_tensor = post_combat_val.new_tensor(trajectory.steps[0].reward)
+                q_shadow = reward_tensor + self.config.macro_trace_lambda * post_combat_val
+                action_values.append(q_shadow.squeeze())
+                calls += candidate.forward_calls
+                maximum_error = max(maximum_error, candidate.maximum_likelihood_error)
+        else:
+            for trajectory in root.candidates:
+                candidate = self._evaluate(trajectory)
+                _, conditional = self._targets(trajectory, candidate, trace_lambda=self.config.macro_trace_lambda)
+                action_values.append(conditional[0])
+                calls += candidate.forward_calls
+                maximum_error = max(maximum_error, candidate.maximum_likelihood_error)
         candidate_values = torch.stack(action_values)
         projection = project_macro_policy(
             action_value_targets=candidate_values, teacher_log_probs=evaluation.root_logs, max_kl=self.config.macro_kl,
