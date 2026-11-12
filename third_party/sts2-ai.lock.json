@@ -68,6 +68,11 @@
       "path": "third_party/patches/sts2-ai/0012-complete-game-action-after-queue-pop.patch",
       "sha256": "41c5334cf19299a9690bd6c9a95b4a1d910685a50b6b042644935cde4f13488f",
       "purpose": "Publish GameAction completion only after AfterFinished has removed the action from its queue, preventing combat-settlement continuations from cancelling a still-queued hook action."
+    },
+    {
+      "path": "third_party/patches/sts2-ai/0013-rest-site-deck-upgrade-preview.patch",
+      "sha256": "9530166bb990e176559c5a9aa067a3add352462ccdf1b9e490eb95820159b395",
+      "purpose": "Emit exact instance-preserving upgrade_preview on rest_site player.deck cards so parent-surface Smith(card) candidates and fail-closed deterministic afterstates receive authoritative upgraded card facts."
     }
   ],
   "migration_notes": [
@@ -75,5 +80,5 @@
     "252bf989feb598c61c20267d3979b00bf316edb5 is a reachable ancestor of origin/main and exactly matches the preimage blobs for the canonical HeadlessSim patch stack.",
     "Obsolete STS2AI/ENV/Sim/Overlay mirror hunks were intentionally removed: that tree was deleted upstream before this base and is not the canonical project."
   ],
-  "patched_tree": "41ac9a426b350fda7b3704eb17ba1b8be5d4af02"
+  "patched_tree": "f7d27dc3f57f9c82f78188c9c8976eaa43ee4917"
 }

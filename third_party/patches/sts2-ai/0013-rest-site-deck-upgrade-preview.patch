@@ -1,0 +1,76 @@
+diff --git a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
+index 932b022..6f7ca8a 100644
+--- a/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
++++ b/STS2AI/ENV/Sim/HeadlessSim/Simulation/FullRunApiStateBuilder.cs
+@@ -333,6 +333,10 @@ public static class FullRunApiStateBuilder
+ 		Player? player,
+ 		FullRunApiPlayerState playerState)
+ 	{
++		if (player?.Deck?.Cards is { } deckCards)
++		{
++			playerState.deck = SafeBuildPileCards(deckCards, shuffle: false, includeUpgradePreview: true);
++		}
+ 		IReadOnlyList<RestSiteOption> options = RunManager.Instance.RestSiteSynchronizer.GetLocalOptions();
+ 		return new FullRunApiRestSiteState
+ 		{
+@@ -631,7 +635,10 @@ public static class FullRunApiStateBuilder
+ 		return state;
+ 	}
+ 
+-	private static List<FullRunApiCardOption> SafeBuildPileCards(IReadOnlyList<CardModel> cards, bool shuffle)
++	private static List<FullRunApiCardOption> SafeBuildPileCards(
++		IReadOnlyList<CardModel> cards,
++		bool shuffle,
++		bool includeUpgradePreview = false)
+ 	{
+ 		try
+ 		{
+@@ -643,6 +650,10 @@ public static class FullRunApiStateBuilder
+ 			foreach (CardModel card in cards.Where(static card => card != null))
+ 			{
+ 				FullRunApiCardOption option = ToApiCardOption(card, index: 0);
++				if (includeUpgradePreview)
++				{
++					option.upgrade_preview = TryBuildDeckUpgradePreview(card);
++				}
+ 				option.quantity = 1;
+ 				string identity = JsonSerializer.Serialize(option);
+ 				if (grouped.TryGetValue(identity, out FullRunApiCardOption? existing))
+@@ -671,6 +682,37 @@ public static class FullRunApiStateBuilder
+ 		}
+ 	}
+ 
++	private static FullRunApiCardOption? TryBuildDeckUpgradePreview(CardModel card)
++	{
++		if (!card.IsUpgradable)
++		{
++			return null;
++		}
++		try
++		{
++			CardModel preview = card.IsMutable
++				? (CardModel)card.ClonePreservingMutability()
++				: card.ToMutable();
++			int targetLevel = card.CurrentUpgradeLevel + 1;
++			while (preview.CurrentUpgradeLevel < targetLevel && preview.IsUpgradable)
++			{
++				preview.UpgradeInternal();
++				preview.FinalizeUpgradeInternal();
++			}
++			if (preview.CurrentUpgradeLevel != targetLevel)
++			{
++				return null;
++			}
++			FullRunApiCardOption option = ToApiCardOption(preview, index: 0);
++			option.source_pile = card.Pile?.Type.ToString() ?? PileType.Deck.ToString();
++			return option;
++		}
++		catch
++		{
++			return null;
++		}
++	}
++
+ 	private static FullRunApiPlayerState BuildCombatPlayerState(
+ 		Player player,
+ 		CombatTrainingStateSnapshot? combat,

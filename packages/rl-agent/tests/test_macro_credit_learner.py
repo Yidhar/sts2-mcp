@@ -155,6 +155,30 @@ def test_one_finite_update_routes_only_natural_data_and_emits_json_metrics():
     assert metrics["loss"] == pytest.approx(0.5 * (metrics["macro_loss"] + metrics["combat_loss"]))
 
 
+def test_full_game_failure_without_macro_root_still_updates_combat_and_values():
+    learner = _learner()
+    reference = _root(learner, domains=("macro", "combat"), final_reward=-2).reference
+    reference = replace(reference, steps=tuple(replace(step, control_domain="combat", surface="combat")
+                                               for step in reference.steps))
+    cohort = MacroCreditCohort("rootless", learner.update, (), natural_only=(reference,))
+    metrics = learner.learn(cohort)
+    assert metrics["root_count"] == 0
+    assert metrics["natural_only_games"] == 1
+    assert metrics["training_forward_calls"] == 2
+    assert metrics["gradient_norm"] > 0
+    assert metrics["parameter_delta_norm"] > 0
+    assert metrics["root_targets"] == []
+    assert metrics["macro_policy_loss"] == 0
+    json.dumps(metrics, allow_nan=False)
+
+
+def test_rootless_horizon_is_not_a_complete_game():
+    learner = _learner()
+    reference = _root(learner, terminal=False).reference
+    with pytest.raises(ValueError, match="complete"):
+        MacroCreditCohort("rootless", 0, (), natural_only=(reference,))
+
+
 def test_macro_actor_is_full_root_projection_with_all_root_denominator():
     learner = _learner(macro_value_weight=0, combat_policy_weight=0, combat_value_weight=0, combat_entropy_weight=0)
     roots = (_root(learner, outcomes=(0.0, 1.0), seed=2), _root(learner, outcomes=(2.0, 2.0), seed=4))
@@ -484,3 +508,48 @@ def test_learner_refuses_frozen_models_and_q_heads():
     model.candidate_q_head = torch.nn.Parameter(torch.tensor(1.0))
     with pytest.raises(ValueError, match="Q head"):
         _learner(model)
+
+
+def test_macro_only_trainable_scope_freezes_combat_and_shared_parameters():
+    model_config = ModelConfig(d_model=32, n_heads=4, ffn_dim=64, world_layers=1, latent_slots=4, latent_layers=1,
+                               recurrent_hidden_dim=64, dropout=0.2, max_world_tokens=256, max_candidates=16,
+                               max_candidate_local_tokens=16)
+    model = HybridDomainActorCriticModel(HybridActorCriticConfig(model_config.to_model_config()))
+    initial_params = {name: p.clone() for name, p in model.named_parameters()}
+    
+    learner = MacroCreditLearner(
+        model=model,
+        config=_config(chunk_steps=2, trainable_scope="macro_only", combat_policy_weight=0.0, combat_value_weight=0.0),
+    )
+    
+    macro_tokens = ("macro_stream", "run_recurrent")
+    for name, p in model.named_parameters():
+        is_macro = any(token in name for token in macro_tokens)
+        assert p.requires_grad == is_macro, f"{name} requires_grad={p.requires_grad} expected {is_macro}"
+    
+    encoder = GroundedObservationEncoder(model_config.to_encoding_config())
+    macro = encoder.encode(_rest_observation(), _REST_ACTIONS).snapshot
+    combat = encoder.encode(
+        {"phase": "combat", "combat": {"in_progress": True}},
+        [{"kind": "end_turn", "model_action_kind": "end_turn", "action_handle": "end"},
+         {"kind": "play_card", "model_action_kind": "play_card", "action_handle": "play"}],
+    ).snapshot
+    root = _root(learner, snapshots=(macro, combat, macro))
+    metrics = learner.learn(_cohort(learner, root))
+    
+    assert metrics["update"] == 1
+    assert metrics["gradient_norm"] > 0
+    assert metrics["policy_head_gradient_norm"] == 0.0
+    assert metrics["value_head_gradient_norm"] == 0.0
+    assert metrics["domain_stream_gradient_norm"] > 0.0
+    assert metrics["shared_gradient_norm"] > 0.0
+    
+    for name, p in model.named_parameters():
+        is_macro = any(token in name for token in macro_tokens)
+        initial = initial_params[name]
+        if not is_macro:
+            torch.testing.assert_close(p, initial, rtol=0, atol=0, msg=lambda m: f"Non-macro param {name} drifted: {m}")
+        else:
+            if "weight" in name:
+                assert not torch.equal(p, initial), f"Macro param {name} was expected to update"
+

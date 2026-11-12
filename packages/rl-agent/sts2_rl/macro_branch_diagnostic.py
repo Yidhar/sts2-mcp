@@ -332,6 +332,7 @@ def run_branch_pass(
     prefix: EvidenceTrace,
     forced_candidate: int | None = None,
     authority: BranchAuthority | None = None,
+    allow_zero_budget: bool = False,
 ) -> dict[str, Any]:
     """One fresh full-prefix execution. The caller must close its backend.
 
@@ -341,7 +342,9 @@ def run_branch_pass(
     alone does not make evidence training-eligible or validate policy sampling.
     """
     validate_seed(seed)
-    budget = validate_course(config)
+    if allow_zero_budget and (not limits.terminal_only or authority is not None or forced_candidate is not None):
+        raise ValueError("zero-budget override is only for natural terminal-only evaluation")
+    budget = validate_course(config, allow_zero_budget=allow_zero_budget)
     started = time.monotonic()
 
     def remaining_ms(cap: int = 20_000) -> int:

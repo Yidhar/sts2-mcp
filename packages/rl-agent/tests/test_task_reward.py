@@ -348,6 +348,26 @@ def test_reward_v9_identity_is_budget_specific_without_a_digest() -> None:
     assert "fingerprint_sha256" not in identity
 
 
+@pytest.mark.parametrize("outcome", ["victory", "defeat"])
+def test_reward_v9_explicit_permadeath_is_finite_and_no_division_by_zero(outcome) -> None:
+    import math
+    calculator = ActFrontloadedDeathRewardCalculator(objective="run", revival_budget=0, maximum_episode_steps=10000)
+    result = calculator.evaluate(_result(step=0, revival_budget=0),
+                                 _result(step=1, revival_budget=0, terminated=True, run_result=outcome))
+    assert math.isfinite(result.reward)
+    assert result.revival_penalty == 0
+    assert result.task_terminal
+    assert act_frontloaded_death_reward_identity(revival_budget=0) != act_frontloaded_death_reward_identity(revival_budget=1)
+
+
+@pytest.mark.parametrize("budget,revivals", [(1, 0), (-1, 0), (0, 1)])
+def test_reward_v9_permadeath_rejects_missing_budget_or_consumed_revival(budget, revivals) -> None:
+    calculator = ActFrontloadedDeathRewardCalculator(objective="run", revival_budget=0, maximum_episode_steps=10000)
+    with pytest.raises(ValueError):
+        calculator.evaluate(_result(step=0, revival_budget=0),
+                            _result(step=1, revival_budget=budget, revivals_used=revivals))
+
+
 def test_healing_does_not_erase_exact_hp_loss_cost() -> None:
     calculator = RevivalEfficiencyRewardCalculator(
         maximum_episode_steps=512,

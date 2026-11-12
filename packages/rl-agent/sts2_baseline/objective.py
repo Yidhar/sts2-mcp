@@ -212,8 +212,8 @@ def act_frontloaded_death_reward_identity(*, revival_budget: int) -> dict[str, A
 
     if isinstance(revival_budget, bool) or not isinstance(revival_budget, int):
         raise TypeError("reward-v9 revival budget must be an integer")
-    if revival_budget <= 0:
-        raise ValueError("reward-v9 revival budget must be positive")
+    if revival_budget < 0:
+        raise ValueError("reward-v9 revival budget must be non-negative")
     return {
         "version": ACT_FRONTLOADED_DEATH_REWARD_SPEC.version,
         "base": {
@@ -225,6 +225,7 @@ def act_frontloaded_death_reward_identity(*, revival_budget: int) -> dict[str, A
         "revival_event_source": "observation._training.revivals_used exact counter",
         "revival_pricing": (
             "per_act 0.20*k/(k+1) plus per_run (0.80/revival_budget)*k"
+            if revival_budget > 0 else "permadeath: no revival permitted; revival cost is zero"
         ),
         "act_reset": "observation.run.act boundary",
         "hp_loss_source": "observation._training.player_hp_lost exact counter",
@@ -620,8 +621,8 @@ class ActFrontloadedDeathRewardCalculator:
             raise ValueError("maximum_episode_steps must be a positive integer")
         if isinstance(revival_budget, bool) or not isinstance(revival_budget, int):
             raise TypeError("reward-v9 revival budget must be an integer")
-        if revival_budget <= 0:
-            raise ValueError("reward-v9 revival budget must be positive")
+        if revival_budget < 0:
+            raise ValueError("reward-v9 revival budget must be non-negative")
         if float(discount) != ACT_FRONTLOADED_DEATH_REWARD_SPEC.required_discount:
             raise ValueError("act-frontloaded death reward requires discount=1")
         self.maximum_episode_steps = int(maximum_episode_steps)
@@ -643,6 +644,10 @@ class ActFrontloadedDeathRewardCalculator:
         self._last_total_revivals = 0
 
     def _revival_penalty(self, count: int) -> float:
+        if self.revival_budget == 0:
+            if count != 0:
+                raise ValueError("permadeath forbids any revival")
+            return 0.0
         penalty = 0.0
         tail = ACT_FRONTLOADED_DEATH_REWARD_SPEC.tail_budget / self.revival_budget
         for ordinal in range(self._act_revivals + 1, self._act_revivals + count + 1):
@@ -671,8 +676,19 @@ class ActFrontloadedDeathRewardCalculator:
         )
         before_revivals = _training_counter(before.observation, "revivals_used")
         after_revivals = _training_counter(after.observation, "revivals_used")
-        before_budget = _training_revival_budget(before.observation)
-        after_budget = _training_revival_budget(after.observation)
+        if self.revival_budget == 0:
+            # Never use the legacy v7 fallback (0 -> reference budget 64).
+            # A zero-budget evaluation needs explicit simulator evidence.
+            for observation in (before.observation, after.observation):
+                counters = _mapping(observation.get("_training"))
+                for name in ("revival_budget", "revivals_used"):
+                    value = counters.get(name)
+                    if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+                        raise ValueError(f"permadeath requires explicit {name}=0")
+            before_budget = after_budget = 0
+        else:
+            before_budget = _training_revival_budget(before.observation)
+            after_budget = _training_revival_budget(after.observation)
         before_hp_lost = _training_counter(before.observation, "player_hp_lost")
         after_hp_lost = _training_counter(after.observation, "player_hp_lost")
         if before_budget != self.revival_budget or after_budget != self.revival_budget:

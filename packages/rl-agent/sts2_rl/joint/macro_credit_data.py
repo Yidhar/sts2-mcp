@@ -14,8 +14,11 @@ from dataclasses import dataclass
 from typing import Final, Literal
 
 import numpy as np
+import torch
+from torch import Tensor
 
-from sts2_rl.encoding import EncodedDecisionSnapshot
+from sts2_rl.encoding import EncodedDecisionSnapshot, EncodedWorldSnapshot
+from sts2_rl.models.grounded_candidate import COMBAT_DOMAIN_ID
 from sts2_rl.semantics.clock import decision_discount
 from sts2_rl.training.seeding import SIGNED_INT32_MAX, TRAINING_SEED_PARITY
 
@@ -100,6 +103,87 @@ def snapshot_equal(left: EncodedDecisionSnapshot, right: EncodedDecisionSnapshot
     return True
 
 
+def macro_mixture_log_probs(
+    model_log_probs: Tensor,
+    snapshot: EncodedDecisionSnapshot,
+    epsilon: float,
+) -> Tensor:
+    """Compute exact branch-uniform exploration mixture log-probabilities.
+
+    When ``epsilon == 0.0``, ``snapshot.domain_id == COMBAT_DOMAIN_ID``, or
+    fewer than two legal actions exist, returns ``model_log_probs`` unchanged.
+    """
+    if isinstance(epsilon, bool) or not math.isfinite(epsilon) or not 0.0 <= epsilon < 1.0:
+        raise ValueError("macro_branch_epsilon must be finite and in [0.0, 1.0)")
+    if epsilon == 0.0 or snapshot.domain_id == COMBAT_DOMAIN_ID:
+        return model_log_probs
+    mask_np = np.asarray(snapshot.action_mask, dtype=np.bool_)
+    legal_count = int(mask_np.sum())
+    if legal_count <= 1:
+        return model_log_probs
+    mask = torch.tensor(mask_np.tolist(), device=model_log_probs.device, dtype=torch.bool)
+    active_len = int(mask.numel())
+    branch_ids_np = np.asarray(snapshot.candidates.ids[:active_len, 13], dtype=np.int64)
+    legal_branches = branch_ids_np[mask_np]
+    unique_branches, counts = np.unique(legal_branches, return_counts=True)
+    branch_count = len(unique_branches)
+    branch_sizes = dict(zip(unique_branches.tolist(), counts.tolist(), strict=True))
+    uniform_np = np.zeros((active_len,), dtype=np.float64)
+    for idx in range(active_len):
+        if mask_np[idx]:
+            uniform_np[idx] = 1.0 / float(branch_count * branch_sizes[int(branch_ids_np[idx])])
+    uniform = torch.tensor(uniform_np.tolist(), device=model_log_probs.device, dtype=torch.float64)
+
+    head = model_log_probs[:active_len].double().masked_fill(~mask, -torch.inf)
+    head = head - torch.logsumexp(head, dim=0)
+    model_probs = head.exp().masked_fill(~mask, 0.0)
+    mixed_probs = (1.0 - float(epsilon)) * model_probs + float(epsilon) * uniform
+    mixed_logs = torch.full((active_len,), -torch.inf, device=model_log_probs.device, dtype=torch.float64)
+    mixed_logs[mask] = torch.log(mixed_probs[mask])
+    mixed_logs[mask] = mixed_logs[mask] - torch.logsumexp(mixed_logs[mask], dim=0)
+    converted = mixed_logs.to(dtype=model_log_probs.dtype)
+    if model_log_probs.numel() > active_len:
+        tail = torch.full(
+            (model_log_probs.numel() - active_len,),
+            -torch.inf,
+            device=model_log_probs.device,
+            dtype=model_log_probs.dtype,
+        )
+        return torch.cat([converted, tail], dim=0)
+    return converted
+
+
+@dataclass(frozen=True, slots=True)
+class MacroAfterstateNode:
+    """Verified deterministic post-state worlds for all legal candidates at one macro step."""
+
+    step_index: int
+    surface: str
+    candidate_branches: tuple[str, ...]
+    post_worlds: tuple[EncodedWorldSnapshot, ...]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.step_index, bool) or not isinstance(self.step_index, int) or self.step_index < 0:
+            raise ValueError("afterstate step_index must be a non-negative integer")
+        if not isinstance(self.surface, str) or not self.surface:
+            raise ValueError("afterstate surface must be non-empty")
+        if len(self.post_worlds) < 2 or len(self.candidate_branches) != len(self.post_worlds):
+            raise ValueError("afterstate node requires complete multi-candidate post_worlds and branches")
+        if any(not isinstance(branch, str) or not branch for branch in self.candidate_branches):
+            raise ValueError("afterstate candidate_branches must be non-empty strings")
+        if not all(isinstance(world, EncodedWorldSnapshot) for world in self.post_worlds):
+            raise ValueError("afterstate post_worlds must be EncodedWorldSnapshot instances")
+
+    def storage_nbytes(self) -> int:
+        seen: set[int] = set()
+        total = 0
+        for world in self.post_worlds:
+            if id(world) not in seen:
+                seen.add(id(world))
+                total += world.storage_nbytes()
+        return total
+
+
 @dataclass(frozen=True, slots=True)
 class MacroCreditTrajectory:
     trajectory_id: str
@@ -116,6 +200,8 @@ class MacroCreditTrajectory:
     root_intervened: bool = False
     data_partition: str = "training"
     continuation_policy: str = "frozen_stochastic"
+    afterstate_nodes: tuple[MacroAfterstateNode, ...] = ()
+    macro_branch_epsilon: float = 0.0
 
     def __post_init__(self) -> None:
         training_seed(self.seed)
@@ -131,6 +217,12 @@ class MacroCreditTrajectory:
             raise ValueError("only training-partition frozen stochastic continuations are learner inputs")
         if not isinstance(self.root_intervened, bool):
             raise ValueError("root_intervened must be boolean")
+        if (
+            isinstance(self.macro_branch_epsilon, bool)
+            or not math.isfinite(self.macro_branch_epsilon)
+            or not 0.0 <= self.macro_branch_epsilon < 1.0
+        ):
+            raise ValueError("macro_branch_epsilon must be finite and in [0.0, 1.0)")
         if not self.steps or not all(isinstance(step, HybridVTraceStep) for step in self.steps):
             raise ValueError("macro trajectory requires semantic steps")
         if not all(isinstance(snapshot, EncodedDecisionSnapshot) for snapshot in self.prefix):
@@ -170,6 +262,25 @@ class MacroCreditTrajectory:
             *((self.bootstrap_snapshot,) if self.bootstrap_snapshot else ()),
         ):
             snapshot.validate(expected_config=first.config, expected_fingerprint=first.encoding_fingerprint)
+        previous_step_index = -1
+        for node in self.afterstate_nodes:
+            if not isinstance(node, MacroAfterstateNode):
+                raise ValueError("afterstate_nodes must contain MacroAfterstateNode instances")
+            node.__post_init__()
+            if node.step_index <= previous_step_index or node.step_index >= len(self.steps):
+                raise ValueError("afterstate_nodes must reference strictly increasing valid step indices")
+            previous_step_index = node.step_index
+            target_step = self.steps[node.step_index]
+            if target_step.control_domain != "macro" or target_step.surface != node.surface:
+                raise ValueError("afterstate node must align with a macro step of the same surface")
+            if (
+                target_step.snapshot.candidate_count != len(node.post_worlds)
+                or not bool(target_step.snapshot.action_mask.all())
+                or target_step.branch != node.candidate_branches[target_step.action_index]
+            ):
+                raise ValueError("afterstate node must cover the complete legal candidate set of its step")
+            for world in node.post_worlds:
+                world.validate(expected_config=first.config, expected_fingerprint=first.encoding_fingerprint)
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,9 +382,12 @@ class MacroCreditCohort:
     teacher_version: int
     roots: tuple[MacroCounterfactualRoot, ...]
     version: str = MACRO_CREDIT_DATA_VERSION
+    # A game can genuinely end before reaching the configured reward root.
+    # Keep its natural evidence instead of censoring the worst failures.
+    natural_only: tuple[MacroCreditTrajectory, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.version != MACRO_CREDIT_DATA_VERSION or not self.cohort_id or not self.roots:
+        if self.version != MACRO_CREDIT_DATA_VERSION or not self.cohort_id or not (self.roots or self.natural_only):
             raise ValueError("macro cohort identity or roots are missing")
         if (
             isinstance(self.teacher_version, bool)
@@ -281,18 +395,27 @@ class MacroCreditCohort:
             or self.teacher_version < 0
         ):
             raise ValueError("macro cohort teacher version must be a non-negative integer")
-        if any(root.reference.teacher_version != self.teacher_version for root in self.roots):
+        if any(ref.teacher_version != self.teacher_version for ref in self.references):
             raise ValueError("macro cohort mixes teacher versions")
         if len({root.root_id for root in self.roots}) != len(self.roots):
             raise ValueError("macro cohort duplicates a root")
-        if len({root.reference.seed for root in self.roots}) != len(self.roots):
+        if len({ref.seed for ref in self.references}) != len(self.references):
             raise ValueError("cohort roots must use distinct training seeds")
+        for ref in self.natural_only:
+            ref.__post_init__()
+            if ref.ending != "factual_terminal" or ref.root_intervened or ref.prefix:
+                raise ValueError("rootless natural data must be a complete, uninterrupted factual game")
+
+    @property
+    def references(self) -> tuple[MacroCreditTrajectory, ...]:
+        return tuple(root.reference for root in self.roots) + self.natural_only
 
     def storage_nbytes(self) -> int:
         """Unique CPU array payload; shared prefixes are counted only once."""
-        return trajectory_storage_nbytes(
-            trajectory for root in self.roots for trajectory in (root.reference, *root.candidates)
-        )
+        return trajectory_storage_nbytes((
+            *(trajectory for root in self.roots for trajectory in (root.reference, *root.candidates)),
+            *self.natural_only,
+        ))
 
 
 def trajectory_storage_nbytes(trajectories: Iterable[MacroCreditTrajectory]) -> int:
@@ -307,15 +430,22 @@ def trajectory_storage_nbytes(trajectories: Iterable[MacroCreditTrajectory]) -> 
             if id(snapshot) not in seen:
                 seen.add(id(snapshot))
                 total += snapshot.storage_nbytes()
+        for node in trajectory.afterstate_nodes:
+            for world in node.post_worlds:
+                if id(world) not in seen:
+                    seen.add(id(world))
+                    total += world.storage_nbytes()
     return total
 
 
 __all__ = [
     "MACRO_CREDIT_DATA_VERSION",
+    "MacroAfterstateNode",
     "MacroCounterfactualRoot",
     "MacroCreditCohort",
     "MacroCreditTrajectory",
     "MacroRewardFacts",
+    "macro_mixture_log_probs",
     "snapshot_equal",
     "training_seed",
     "trajectory_storage_nbytes",

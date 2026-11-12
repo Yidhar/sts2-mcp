@@ -61,8 +61,12 @@ function Test-DashboardPython {
     }
     Push-Location $packageRoot
     try {
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = "SilentlyContinue"
         & $Candidate -c "import sts2_rl.monitor_dashboard" 2>$null
-        return $LASTEXITCODE -eq 0
+        $result = ($LASTEXITCODE -eq 0)
+        $ErrorActionPreference = $prevEAP
+        return $result
     }
     finally {
         Pop-Location

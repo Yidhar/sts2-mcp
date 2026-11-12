@@ -32,6 +32,7 @@ from sts2_rl.encoding import EncodedDecisionSnapshot, GroundedObservationEncoder
 from sts2_rl.joint.authority import HybridCollectionAuthority
 from sts2_rl.macro_root_evidence import TRANSPORT_IDENTITY_KEYS, canonical_facts, first_difference, reward_state
 from sts2_rl.macro_root_policy import FrozenMacroRootPolicy
+from sts2_rl.models.hybrid_actor_critic import hierarchical_greedy_action_index
 from sts2_rl.semantics.clock import DECISION_CLOCK_CONTRACT_VERSION, decision_discount
 from sts2_rl.semantics.forward import FORWARD_COMPILER_CONTRACT_VERSION, ForwardDecision, SemanticCandidate
 from sts2_rl.simulator_identity import verify_headless_simulator
@@ -145,6 +146,7 @@ class ProbeAuthority(HybridCollectionAuthority):
             seed=seed,
             evaluation_ownership=True,
         )
+        self._policy_ref = policy
         self.limits = limits
         self.semantic_count = 0
         self.reward_roots_seen = 0
@@ -159,6 +161,13 @@ class ProbeAuthority(HybridCollectionAuthority):
         if self.forward_retries:
             raise FloatingPointError("diagnostic refuses recovered non-finite policy forwards")
         assert self.last_q_values is not None
+        if getattr(self._policy_ref, "hierarchical_branch_greedy", False) and self.epsilon == 0.0:
+            selected = hierarchical_greedy_action_index(
+                torch.tensor(self.last_q_values.tolist(), dtype=torch.float32),
+                torch.tensor(snapshot.candidates.ids[:, 13].tolist(), dtype=torch.int64),
+                torch.tensor(snapshot.action_mask.tolist(), dtype=torch.bool),
+                domain_id=snapshot.domain_id,
+            )
         self.policy_event = {
             "hidden_before": before,
             "hidden_after": _tensor_evidence(self._hidden),
@@ -246,13 +255,13 @@ def _floor(state: EnvironmentResult) -> int:
     return floor
 
 
-def validate_course(config: TrainingConfig) -> int:
+def validate_course(config: TrainingConfig, *, allow_zero_budget: bool = False) -> int:
     if config.environment.backend != "headless" or config.environment.scenario != "full-run":
         raise ValueError("B0 requires the isolated headless full-run course")
     if config.curriculum.mode != "native-revival-preheat" or config.curriculum.reward_objective != "run":
         raise ValueError("B0 requires the native-revival-preheat run objective")
     budget = config.curriculum.revival_budget
-    if isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0 or (budget == 0 and not allow_zero_budget):
         raise ValueError("B0 reward-v9 requires a positive revival budget")
     return budget
 

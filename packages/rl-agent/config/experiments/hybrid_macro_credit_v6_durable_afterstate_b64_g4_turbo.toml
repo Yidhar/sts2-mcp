@@ -1,0 +1,82 @@
+# Durable Afterstate Macro Credit v2 — Colab G4 Max-Saturation Profile
+# Tuned for 48-thread AMD EPYC 9B45 + NVIDIA RTX PRO 6000 Blackwell (96 GB VRAM, 600W):
+# 48 persistent multi-process collector workers + 48-root low-variance cohorts +
+# pinned sparse-to-GPU scatter collation + shape-sorted 96-chunk TF32 BPTT batches.
+version = "sts2-synchronous-macro-credit-course-v1"
+
+[course]
+roots_per_cohort = 48
+seed_index_offset = 20000
+parallel_collectors = 48
+macro_branch_epsilon = 0.05
+maximum_root_snapshot_bytes = 536870912
+maximum_cohort_snapshot_bytes = 8589934592
+maximum_root_seconds = 3600.0
+maximum_cohort_seconds = 7200.0
+maximum_output_bytes = 68719476736
+minimum_free_disk_bytes = 2147483648
+
+[branches]
+root_surface = "reward"
+root_occurrence = 1
+continuation_macro_decisions = 0
+terminal_only = true
+max_native_steps = 8192
+max_candidates = 128
+timeout_seconds = 1200.0
+max_trace_bytes = 536870912
+policy_atol = 0.000001
+policy_rtol = 0.00001
+
+[learner]
+target_mode = "durable_afterstate_v2"
+learning_rate = 0.0001
+shared_learning_rate_scale = 0.5
+weight_decay = 0.01
+macro_trace_lambda = 0.95
+macro_kl = 0.03
+durable_warmup_updates = 6
+combat_actor_warmup_updates = 8
+macro_entropy_weight = 0.005
+durable_post_value_weight = 0.5
+chunk_steps = 16
+combat_unroll_steps = 16
+eval_batch_size = 48
+chunk_batch_size = 96
+allow_tf32 = true
+macro_policy_weight = 1.0
+macro_value_weight = 0.5
+combat_policy_weight = 1.0
+combat_value_weight = 0.5
+combat_entropy_weight = 0.02
+rho_clip = 1.1
+c_clip = 1.0
+policy_rho_clip = 1.1
+gradient_clip_norm = 1.0
+likelihood_tolerance = 0.005
+
+[training.transaction_learning]
+enabled = false
+
+[training.failure_credit]
+mode = "disabled"
+
+[training.episodic_learning]
+enabled = false
+
+[training.rollout]
+deterministic_probe_interval_episodes = 0
+deterministic_probe_environment_steps = []
+
+[training.curriculum]
+revival_budget = 64
+epsilon_start = 0.0
+epsilon_end = 0.0
+
+[training.runtime]
+rocm_sdpa_backend = "math"
+seed = 6700000
+evaluation_steps = []
+early_evaluation_steps = []
+final_audit_steps = []
+evaluation_liveness_guard_enabled = false

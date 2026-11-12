@@ -80,9 +80,44 @@ def test_real_protocol_collects_stochastic_complete_group_and_actual_bootstrap(t
 
 
 def test_factual_terminal_has_no_bootstrap(tmp_path: Path, config: Any) -> None:
-    root, _ = collect(tmp_path, config, limits=BranchLimits(terminal_only=True))
+    root, report = collect(tmp_path, config, limits=BranchLimits(terminal_only=True))
     assert root.reference.ending == "factual_terminal" and root.reference.bootstrap_snapshot is None
-    assert all(candidate.steps[-1].terminal and candidate.steps[-1].discount == 0 for candidate in root.candidates)
+    natural = root.reference.steps[root.root_step_index].action_index
+    assert root.candidates[natural].steps[-1].terminal
+    assert root.candidates[natural].steps[-1].discount == 0
+    # The natural run's eventual terminal must never be copied to unexecuted
+    # alternatives at an earlier nonterminal root.
+    for index, candidate in enumerate(root.candidates):
+        if index != natural:
+            assert not candidate.steps[0].terminal
+            assert candidate.bootstrap_snapshot is not None
+    episode = report["training_episode"]
+    assert episode["status"] == "complete"
+    assert episode["run_result"] == "victory"
+    assert episode["revival_budget"] == 64
+    assert episode["revivals_used"] == 0
+    assert episode["native_steps"] == 7
+    assert episode["seed"] % 2 == 0
+    assert "not factual" in report["alternative_candidate_scope"]
+
+
+def test_truncated_training_prefix_is_not_complete_game_score(tmp_path, config):
+    _, report = collect(tmp_path, config)
+    assert report["training_episode"]["status"] == "incomplete"
+    assert report["training_episode"]["ending"] == "macro_horizon"
+
+
+def test_complete_game_before_requested_root_is_not_discarded(tmp_path, config):
+    from sts2_rl.joint.macro_credit_data import MacroCreditTrajectory
+    reference, report = collect(tmp_path, config, limits=BranchLimits(terminal_only=True, root_occurrence=999))
+    assert isinstance(reference, MacroCreditTrajectory)
+    assert reference.ending == "factual_terminal"
+    assert reference.steps[-1].terminal
+    assert report["training_episode"]["status"] == "complete"
+    assert report["root_found"] is False
+    cohort = MacroCreditCohort("rootless", 0, (), natural_only=(reference,))
+    assert cohort.references == (reference,)
+    assert cohort.storage_nbytes() > 0
 
 
 def test_later_root_retains_and_reuses_exact_cpu_prefix(tmp_path: Path, config: Any) -> None:

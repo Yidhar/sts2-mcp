@@ -50,6 +50,14 @@ _PICKER_REVERSE_KINDS: Final[frozenset[str]] = frozenset(
         "combat_deselect_card",
     }
 )
+_STRICTLY_FREE_REWARD_CLAIM_BRANCHES: Final[frozenset[str]] = frozenset(
+    {
+        "claim_gold",
+        "claim_card",
+        "claim_special_card",
+        "claim_relic",
+    }
+)
 
 
 def _kind(action: Mapping[str, Any]) -> str:
@@ -96,7 +104,7 @@ def _card_matches(action: Mapping[str, Any], target: Mapping[str, Any] | None) -
         }
     except SemanticContractError:
         return False
-    shared = action_view.keys() & target_view.keys()
+    shared = (action_view.keys() & target_view.keys()) - {"upgrade_preview"}
     if "id" not in shared:
         return False
     return all(action_view[key] == target_view[key] for key in shared)
@@ -133,12 +141,16 @@ class MacroCollectionAuthority:
         seed: int = 0,
         evaluation_ownership: bool = False,
         control_domain: Literal["macro", "combat", "joint"] = "macro",
+        suppress_dominated_loot_leave: bool = True,
     ) -> None:
         if not math.isfinite(epsilon) or not 0.0 <= epsilon <= 1.0:
             raise ValueError("authority epsilon must be in [0, 1]")
+        if not isinstance(suppress_dominated_loot_leave, bool):
+            raise TypeError("suppress_dominated_loot_leave must be boolean")
         self.forward_q = forward_q
         self.initial_state = initial_state
         self.epsilon = epsilon
+        self.suppress_dominated_loot_leave = suppress_dominated_loot_leave
         # Stage-3 joined evaluation: macro ownership extends into
         # deterministic held-out collection (whole-segment ownership, §10).
         self.evaluation_ownership = bool(evaluation_ownership)
@@ -445,6 +457,12 @@ class MacroCollectionAuthority:
         if not executable:
             self.declined += 1
             return None
+        if self.suppress_dominated_loot_leave and decision_domain == "macro":
+            executable = self._filter_dominated_loot_leave(
+                decision,
+                executable,
+                observation,
+            )
         self._prepare_semantic_exploration(
             observation=observation,
             decision=decision,
@@ -701,6 +719,51 @@ class MacroCollectionAuthority:
             )
         self._hidden = hidden_after
         return values
+
+    @staticmethod
+    def _has_open_potion_slot(observation: Mapping[str, Any]) -> bool:
+        """Return whether the player observably has an empty potion belt slot."""
+        raw_player = observation.get("player")
+        if not isinstance(raw_player, Mapping):
+            return False
+        raw_open = raw_player.get("open_potion_slots")
+        if isinstance(raw_open, int) and not isinstance(raw_open, bool):
+            return raw_open >= 1
+        max_slots = raw_player.get("max_potion_slots", raw_player.get("potion_slots"))
+        potions = raw_player.get("potions")
+        if (
+            isinstance(max_slots, int)
+            and not isinstance(max_slots, bool)
+            and isinstance(potions, Sequence)
+            and not isinstance(potions, str | bytes)
+        ):
+            return len(potions) < max_slots
+        return False
+
+    @classmethod
+    def _filter_dominated_loot_leave(
+        cls,
+        decision: ForwardDecision,
+        candidates: list[SemanticCandidate],
+        observation: Mapping[str, Any],
+    ) -> list[SemanticCandidate]:
+        """Suppress premature ``reward:leave`` while strictly free loot remains."""
+        if decision.surface != "reward" or len(candidates) < 2:
+            return candidates
+        if not any(candidate.branch == "leave" for candidate in candidates):
+            return candidates
+        has_free_claim = any(
+            (candidate.branch in _STRICTLY_FREE_REWARD_CLAIM_BRANCHES)
+            or (
+                candidate.branch == "claim_potion"
+                and cls._has_open_potion_slot(observation)
+            )
+            for candidate in candidates
+        )
+        if not has_free_claim:
+            return candidates
+        filtered = [candidate for candidate in candidates if candidate.branch != "leave"]
+        return filtered if filtered else candidates
 
     @staticmethod
     def _executable_candidates(

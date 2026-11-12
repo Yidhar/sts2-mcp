@@ -11,6 +11,7 @@ import io
 import json
 import math
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +83,7 @@ def evaluate_episode(*, backend: Any, policy: Any, config: Any, seed: int,
         raise ValueError("full-game evaluation requires terminal_only; no macro horizon")
     output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
+    budget = getattr(getattr(config, "curriculum", None), "revival_budget", None)
     with (output / "trajectory.jsonl").open("x", encoding="utf-8") as handle:
         trace = EpisodeTrace(handle, limits.trace_limits(), progress_path=output / "progress.json")
         # Prefix evidence is not used for same-root comparison in this evaluator.
@@ -91,7 +93,8 @@ def evaluate_episode(*, backend: Any, policy: Any, config: Any, seed: int,
                                  "tail_value_used": False}
         try:
             passed = run_branch_pass(backend=backend, policy=policy, config=config, seed=seed,
-                                     limits=limits, trace=trace, prefix=prefix)
+                                     limits=limits, trace=trace, prefix=prefix,
+                                     allow_zero_budget=(budget == 0))
             result["ending"] = passed["ending"]
             metrics = trace.metrics()
             result["status"] = (
@@ -105,6 +108,17 @@ def evaluate_episode(*, backend: Any, policy: Any, config: Any, seed: int,
             result.update(status="failed", ending="execution_error", error_type=type(error).__name__, error=str(error))
         finally:
             result.update(trace.metrics(), elapsed_seconds=time.monotonic() - started)
+            if budget == 0:
+                counters = (trace.last_state or {}).get("observation", {}).get("_training", {})
+                evidence_valid = all(
+                    isinstance(counters.get(key), int) and not isinstance(counters.get(key), bool)
+                    and counters[key] == 0 for key in ("revival_budget", "revivals_used")
+                )
+                result.update(scope="natural greedy reset-to-terminal; strict permadeath",
+                              zero_revival_verified=evidence_valid)
+                if not evidence_valid:
+                    result.update(status="failed", ending="permadeath_contract_violation",
+                                  error="missing or nonzero simulator revival evidence")
             _json(output / "final-state.json", trace.last_state or {})
             _json(output / "summary.json", result)
             _json(output / "progress.json", result)
@@ -121,13 +135,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device", choices=("cpu", "cuda"), required=True)
     parser.add_argument("--timeout-seconds", type=float, default=600)
     parser.add_argument("--max-native-steps", type=int, default=8000)
+    parser.add_argument("--initialize-from-iql", action="store_true", default=False)
+    parser.add_argument("--initialize-from-macro-publication", action="store_true", default=False)
+    parser.add_argument("--revival-budget", type=int, default=None,
+                        help="evaluation-only environment budget; never changes training configuration")
+    parser.add_argument("--torch-threads", type=int, default=1)
     args = parser.parse_args(argv)
     config = load_macro_training_config(args.config).training
+    if args.torch_threads <= 0:
+        raise ValueError("--torch-threads must be positive")
+    import torch
+    torch.set_num_threads(args.torch_threads)
+    if args.revival_budget is not None:
+        if args.revival_budget < 0:
+            raise ValueError("evaluation revival budget must be non-negative")
+        config = replace(config, curriculum=replace(config.curriculum, revival_budget=args.revival_budget))
     output = resolve_artifact_path(args.output_dir)
     if output.exists():
         raise FileExistsError("evaluation refuses an existing output directory")
     simulator = verify_headless_simulator(resolve_headless_sim_exe(args.sim_exe))
-    policy = FrozenMacroRootPolicy(args.model_path, config, args.device)
+    policy = FrozenMacroRootPolicy(
+        args.model_path,
+        config,
+        args.device,
+        initialize_from_iql=bool(args.initialize_from_iql),
+        initialize_from_macro_publication=bool(args.initialize_from_macro_publication),
+        evaluation_only_allow_zero=(config.curriculum.revival_budget == 0),
+    )
     limits = BranchLimits(terminal_only=True, max_native_steps=args.max_native_steps,
                           timeout_seconds=args.timeout_seconds, max_candidates=64, max_trace_bytes=16 * 1024 * 1024)
     backend = HeadlessBackend(exe_path=simulator.executable, protocol_quarantine_dir=output / "protocol-incidents")

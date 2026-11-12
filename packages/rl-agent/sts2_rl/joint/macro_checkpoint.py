@@ -23,7 +23,7 @@ import torch
 from torch import nn
 from torch.optim import Optimizer
 
-from sts2_rl.artifacts import resolve_artifact_path
+from sts2_rl.artifacts import resolve_artifact_path, resolve_external_input_path
 from sts2_rl.macro_root_evidence import canonical_facts, first_difference
 
 MACRO_CHECKPOINT_FORMAT = "sts2-hybrid-macro-credit-checkpoint-v1"
@@ -391,3 +391,87 @@ def publish_macro_checkpoint(
     }
     _atomic_torch(destination, publication)
     return publication
+
+
+def migrate_macro_checkpoint_runtime(
+    source_path: Path,
+    *,
+    identity: MacroCheckpointIdentity,
+    model: nn.Module,
+    optimizer: Optimizer,
+    artifact_root: Path | None = None,
+    restore_rng: bool = True,
+) -> dict[str, Any]:
+    """Migrate model, optimizer, RNG, update, and seed cursor across runtime/throughput upgrades.
+
+    Enforces identical model architecture, reward identity, learner version,
+    grounded encoding ABI, compiler/clock/data versions, seed recipe, and
+    optimizer layout while allowing updated course throughput settings
+    (e.g. roots_per_cohort, parallel_collectors, batch sizes) and source hashes.
+    """
+    resolved = resolve_external_input_path(source_path, root=artifact_root)
+    raw = torch.load(resolved, map_location="cpu", weights_only=False)
+    if not isinstance(raw, Mapping) or raw.get("format") != MACRO_CHECKPOINT_FORMAT:
+        raise ValueError("not a macro-credit cohort checkpoint")
+    payload = dict(raw)
+    required_keys = {
+        "format", "boundary", "control_scores", "course_config", "model_config", "reward_identity",
+        "lineage_id", "learner_version", "model", "optimizer", "optimizer_layout", "update",
+        "next_seed_index", "runtime_environment", "rng", "initialization",
+    }
+    if set(payload) != required_keys:
+        raise ValueError("macro checkpoint fields differ")
+    expected_identity = identity.as_mapping()
+    for invariant_key in ("model_config", "reward_identity", "learner_version"):
+        if first_difference(expected_identity[invariant_key], payload.get(invariant_key)) is not None:
+            raise ValueError(f"macro checkpoint {invariant_key} differs; runtime migration forbidden")
+    src_course = payload.get("course_config")
+    dst_course = expected_identity["course_config"]
+    if not isinstance(src_course, Mapping):
+        raise ValueError("macro checkpoint missing course_config")
+    for course_invariant in ("encoding", "compiler", "decision_clock", "data", "seed_recipe"):
+        if first_difference(dst_course.get(course_invariant), src_course.get(course_invariant)) is not None:
+            raise ValueError(
+                f"macro checkpoint course_config.{course_invariant} differs; runtime migration forbidden"
+            )
+    for key in ("update", "next_seed_index"):
+        _nonnegative_int(payload.get(key), key)
+    if payload.get("boundary") != "committed-cohort" or payload.get("control_scores") != "policy_logits":
+        raise ValueError("macro checkpoint boundary/model ABI differs")
+    for key in ("model", "optimizer", "optimizer_layout", "runtime_environment", "initialization"):
+        if not isinstance(payload.get(key), Mapping):
+            raise ValueError(f"macro checkpoint missing {key}")
+    _snapshot(payload)
+    _validate_rng(payload.get("rng"), payload["runtime_environment"])
+
+    environment = _runtime_environment(model)
+    if first_difference(environment, payload["runtime_environment"]) is not None:
+        raise ValueError("macro checkpoint runtime environment differs")
+    if first_difference(_optimizer_layout(model, optimizer), payload["optimizer_layout"]) is not None:
+        raise ValueError("macro checkpoint optimizer layout differs")
+    _check_optimizer_state(payload["optimizer"], model, optimizer)
+    current_model = model.state_dict()
+    saved_model = payload["model"]
+    if set(saved_model) != set(current_model):
+        raise ValueError("macro checkpoint model state keys differ")
+    for name, current in current_model.items():
+        saved = saved_model[name]
+        if not isinstance(saved, torch.Tensor) or saved.shape != current.shape or saved.dtype != current.dtype:
+            raise ValueError(f"macro checkpoint model tensor differs: {name}")
+    current_rng = _rng_state(environment)
+    for saved, current in zip(payload["rng"]["torch_cuda"], current_rng["torch_cuda"], strict=True):
+        if saved.shape != current.shape:
+            raise ValueError("macro checkpoint CUDA RNG state shape differs")
+    previous_model = _snapshot(current_model)
+    previous_optimizer = _snapshot(optimizer.state_dict())
+    try:
+        optimizer.load_state_dict(payload["optimizer"])
+        model.load_state_dict(saved_model, strict=True)
+        if restore_rng:
+            _restore_rng(payload["rng"])
+    except Exception:
+        optimizer.load_state_dict(previous_optimizer)
+        model.load_state_dict(previous_model, strict=True)
+        _restore_rng(current_rng)
+        raise
+    return payload

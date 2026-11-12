@@ -16,11 +16,14 @@ import torch
 from torch import Tensor
 
 from sts2_baseline import (
+    ACT_FRONTLOADED_DEATH_REWARD_SPEC,
     absolute_death_price_reward_identity,
     act_frontloaded_death_reward_identity,
 )
 from sts2_rl.encoding.snapshot import EncodedDecisionSnapshot, collate_encoded_snapshots
 from sts2_rl.models.hybrid_actor_critic import (
+    HYBRID_ACTOR_CRITIC_V2_MODEL_VERSION,
+    V2_FRESH_TENSOR_PREFIXES,
     HybridActorCriticConfig,
     HybridDomainActorCriticModel,
     initialize_actor_critic_from_iql,
@@ -66,6 +69,9 @@ class FrozenMacroRootPolicy:
     tensors must be inherited, so missing parameters cannot silently introduce
     a randomly initialized policy.  The original source policy version is
     retained as provenance, not reported as a resumed V-trace learner version.
+
+    ``initialize_from_macro_publication=True`` transfers a trained macro credit
+    policy across curriculum boundaries (e.g. changing revival budgets).
     """
 
     def __init__(
@@ -74,6 +80,9 @@ class FrozenMacroRootPolicy:
         config: TrainingConfig,
         device: str,
         initialize_from_iql: bool = False,
+        initialize_from_macro_publication: bool = False,
+        evaluation_only_allow_zero: bool = False,
+        actor_critic_config: HybridActorCriticConfig | None = None,
     ) -> None:
         source_path = _model_file(model_path)
         resolved_device = "cuda" if device == "auto" and torch.cuda.is_available() else device
@@ -81,17 +90,35 @@ class FrozenMacroRootPolicy:
             resolved_device = "cpu"
         self.device = torch.device(resolved_device)
         self.encoding_config = config.model.to_encoding_config()
-        model_config = HybridActorCriticConfig(config.model.to_model_config())
         revival_budget = config.curriculum.revival_budget
-        if isinstance(revival_budget, bool) or not isinstance(revival_budget, int) or revival_budget <= 0:
+        if (isinstance(revival_budget, bool) or not isinstance(revival_budget, int)
+                or revival_budget < 0 or (revival_budget == 0 and not evaluation_only_allow_zero)):
             raise ValueError("frozen macro policy diagnostic requires a positive revival budget")
         reward_identity = act_frontloaded_death_reward_identity(revival_budget=revival_budget)
         payload = torch.load(source_path, map_location="cpu", weights_only=True)
         if not isinstance(payload, Mapping):
             raise ValueError("frozen macro policy publication must be a mapping")
+        grounded_cfg = config.model.to_model_config()
+        raw_pub_model_cfg = payload.get("model_config")
+        if actor_critic_config is not None:
+            model_config = actor_critic_config
+        elif (
+            not initialize_from_iql
+            and isinstance(raw_pub_model_cfg, dict)
+            and raw_pub_model_cfg.get("version") == HYBRID_ACTOR_CRITIC_V2_MODEL_VERSION
+        ):
+            model_config = HybridActorCriticConfig.from_mapping(
+                raw_pub_model_cfg,
+                fallback_grounded=grounded_cfg,
+            )
+        else:
+            model_config = HybridActorCriticConfig(grounded_cfg)
+        self.hierarchical_branch_greedy = model_config.enable_hierarchical_branch_policy
         allowed_formats = (
             (HYBRID_IQL_PUBLICATION,)
             if initialize_from_iql
+            else (HYBRID_MACRO_CREDIT_PUBLICATION,)
+            if initialize_from_macro_publication
             else (HYBRID_VTRACE_PUBLICATION, HYBRID_MACRO_CREDIT_PUBLICATION)
         )
         expected_format = payload.get("format")
@@ -101,15 +128,30 @@ class FrozenMacroRootPolicy:
                 "IQL parents require explicit initialize_from_iql=True"
             )
         source_model_config = (
-            HybridIQLConfig(config.model.to_model_config()).as_mapping()
+            HybridIQLConfig(grounded_cfg).as_mapping()
             if initialize_from_iql
             else model_config.as_mapping()
         )
         if payload.get("model_config") != source_model_config:
             raise ValueError("frozen macro policy publication model_config differs")
-        source_reward_identity = absolute_death_price_reward_identity() if initialize_from_iql else reward_identity
-        if payload.get("reward_identity") != source_reward_identity:
-            raise ValueError("frozen macro policy publication reward_identity differs")
+        if initialize_from_iql:
+            source_reward_identity = absolute_death_price_reward_identity()
+            if payload.get("reward_identity") != source_reward_identity:
+                raise ValueError("frozen macro policy publication reward_identity differs")
+        elif initialize_from_macro_publication:
+            pub_reward = payload.get("reward_identity")
+            if not isinstance(pub_reward, Mapping) or pub_reward.get("version") != ACT_FRONTLOADED_DEATH_REWARD_SPEC.version:
+                raise ValueError("frozen macro policy publication reward_identity is not reward-v9")
+            budget = pub_reward.get("revival_budget")
+            if isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
+                raise ValueError("frozen macro policy publication requires a positive revival budget")
+            if pub_reward != act_frontloaded_death_reward_identity(revival_budget=budget):
+                raise ValueError("frozen macro policy source reward_identity differs from its declared course")
+            source_reward_identity = dict(pub_reward)
+        else:
+            source_reward_identity = reward_identity
+            if payload.get("reward_identity") != source_reward_identity:
+                raise ValueError("frozen macro policy publication reward_identity differs")
         if (initialize_from_iql or expected_format == HYBRID_MACRO_CREDIT_PUBLICATION) and payload.get(
             "control_scores"
         ) != "policy_logits":
@@ -120,13 +162,23 @@ class FrozenMacroRootPolicy:
         online = _online_tensors(payload)
         configure_rocm_sdpa_backend(config.runtime.rocm_sdpa_backend, devices=(self.device,))
         self.model = HybridDomainActorCriticModel(model_config)
+        fresh_names: list[str] = []
         if initialize_from_iql:
             inherited = initialize_actor_critic_from_iql(self.model, online)
-            if inherited["fresh"]:
+            unexpected_fresh = [
+                name
+                for name in inherited["fresh"]
+                if not (
+                    model_config.has_v2_extensions
+                    and name.startswith(V2_FRESH_TENSOR_PREFIXES)
+                )
+            ]
+            if unexpected_fresh:
                 raise ValueError(
-                    "frozen IQL parent leaves actor-critic tensors uninitialized: " + ", ".join(inherited["fresh"])
+                    "frozen IQL parent leaves actor-critic tensors uninitialized: " + ", ".join(unexpected_fresh)
                 )
             loaded_names = list(inherited["inherited"])
+            fresh_names = list(inherited["fresh"])
         else:
             self.model.load_state_dict(online, strict=True)
             loaded_names = sorted(online)
@@ -144,8 +196,11 @@ class FrozenMacroRootPolicy:
             "source_path": str(source_path),
             "source_format": expected_format,
             "policy_version": policy_version,
-            "initialization_mode": "in_memory_model_initialization" if initialize_from_iql else "frozen_publication",
+            "initialization_mode": "in_memory_model_initialization"
+            if (initialize_from_iql or initialize_from_macro_publication)
+            else "frozen_publication",
             "exact_resume": False,
+            "evaluation_only_zero_budget": bool(revival_budget == 0 and evaluation_only_allow_zero),
             "source_model_config": source_model_config,
             "model_config": model_config.as_mapping(),
             "source_reward_identity": source_reward_identity,
@@ -153,7 +208,7 @@ class FrozenMacroRootPolicy:
             "loaded_tensor_count": len(loaded_names),
             "loaded_tensor_names": loaded_names,
             "ignored_source_tensor_names": sorted(set(online) - set(loaded_names)),
-            "fresh_tensor_names": [],
+            "fresh_tensor_names": fresh_names,
             "training_state_loaded": False,
             "device": str(self.device),
         }

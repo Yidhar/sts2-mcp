@@ -245,6 +245,11 @@ def _rest_candidates(
                 continue
             for card in targets:
                 facts = _card_facts(card)
+                picker_facts = {
+                    key: value
+                    for key, value in facts.items()
+                    if key != "upgrade_preview"
+                }
                 candidates.append(
                     SemanticCandidate(
                         branch="smith",
@@ -252,7 +257,7 @@ def _rest_candidates(
                         target=facts,
                         plan=(
                             NativeStep(kind="choose_rest_option", option_token=option_token),
-                            NativeStep(kind="select_card", target=facts),
+                            NativeStep(kind="select_card", target=picker_facts),
                             NativeStep(kind="confirm_selection"),
                         ),
                         semantic_action=_semantic_action(
@@ -357,21 +362,26 @@ def _shop_candidates(
                 continue
             for card in removable:
                 card_facts = _card_facts(card)
+                removal_card_facts = {
+                    key: value
+                    for key, value in card_facts.items()
+                    if key != "upgrade_preview"
+                }
                 candidates.append(
                     SemanticCandidate(
                         branch="remove",
-                        target_key=_target_key(card_facts),
+                        target_key=_target_key(removal_card_facts),
                         target=card_facts,
                         plan=(
                             NativeStep(kind="shop_purchase", target=facts),
-                            NativeStep(kind="select_card", target=card_facts),
+                            NativeStep(kind="select_card", target=removal_card_facts),
                             NativeStep(kind="confirm_selection"),
                         ),
                         semantic_action=_semantic_action(
                             action,
                             model_kind="shop",
                             branch="remove",
-                            target=card_facts,
+                            target=removal_card_facts,
                         ),
                         native_index=index,
                     )

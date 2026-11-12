@@ -215,13 +215,19 @@ def main(argv: list[str] | None = None) -> int:
                 cwd=source,
             )
 
-    executable = (
+    bin_dir = (
         project.parent
         / "bin"
         / REQUIRED_BUILD_CONFIGURATION
         / REQUIRED_TARGET_FRAMEWORK
-        / "HeadlessSim.exe"
-    ).resolve(strict=False)
+    )
+    primary_name = "HeadlessSim.exe" if os.name == "nt" else "HeadlessSim"
+    fallback_name = "HeadlessSim" if os.name == "nt" else "HeadlessSim.exe"
+    executable = (bin_dir / primary_name).resolve(strict=False)
+    if not executable.is_file():
+        fallback = (bin_dir / fallback_name).resolve(strict=False)
+        if fallback.is_file():
+            executable = fallback
     if not executable.is_file():
         raise SystemExit(f"Release HeadlessSim output is missing after build: {executable}")
     managed_assembly = executable.with_suffix(".dll")

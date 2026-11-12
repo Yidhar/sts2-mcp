@@ -234,11 +234,12 @@ class SparseTokenTable:
             raise ValueError("sparse token features must not store explicit zeros")
         if np.any(self.ids < 0):
             raise ValueError("sparse token IDs must be non-negative")
-        for row in range(self.token_count):
-            start = int(self.feature_indptr[row])
-            end = int(self.feature_indptr[row + 1])
-            indices = self.feature_indices[start:end]
-            if len(indices) > 1 and np.any(indices[1:] <= indices[:-1]):
+        if nonzero_count > 1:
+            same_token = np.ones(nonzero_count - 1, dtype=np.bool_)
+            row_starts = self.feature_indptr[1:-1]
+            valid_starts = row_starts[(row_starts > 0) & (row_starts < nonzero_count)]
+            same_token[valid_starts - 1] = False
+            if np.any((self.feature_indices[1:] <= self.feature_indices[:-1]) & same_token):
                 raise ValueError("sparse feature indices must be strictly increasing per token")
 
     def validate(
@@ -297,6 +298,76 @@ def sparse_token_table(
         feature_values=np.asarray(values, dtype=np.float32),
         ids=np.asarray(ids, dtype=np.int32).reshape(len(ids), id_width),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class EncodedWorldSnapshot:
+    """Candidate-independent sparse world input for durable state/afterstate valuation."""
+
+    config: GroundedEncodingConfig
+    encoding_fingerprint: str
+    world: SparseTokenTable
+    domain_id: int
+    version: str = ENCODED_DECISION_SNAPSHOT_VERSION
+
+    def __post_init__(self) -> None:
+        self.validate(
+            expected_config=self.config,
+            expected_fingerprint=self.encoding_fingerprint,
+        )
+
+    def validate(
+        self,
+        *,
+        expected_config: GroundedEncodingConfig,
+        expected_fingerprint: str,
+    ) -> None:
+        if not isinstance(self.config, GroundedEncodingConfig):
+            raise TypeError("encoded world snapshot config has the wrong type")
+        if not isinstance(self.world, SparseTokenTable):
+            raise TypeError("encoded world snapshot table has the wrong type")
+        if self.version != ENCODED_DECISION_SNAPSHOT_VERSION:
+            raise ValueError(f"unsupported encoded world snapshot: {self.version!r}")
+        if self.config != expected_config:
+            raise ValueError("encoded world snapshot config differs from active encoder")
+        if self.encoding_fingerprint != expected_fingerprint:
+            raise ValueError("encoded world snapshot fingerprint differs from active encoder")
+        if len(self.encoding_fingerprint) != 64 or any(
+            char not in "0123456789abcdef" for char in self.encoding_fingerprint
+        ):
+            raise ValueError("encoded world snapshot fingerprint must be lowercase SHA-256")
+        cfg = self.config
+        world_bounds = (
+            cfg.type_vocab_size,
+            cfg.role_vocab_size,
+            cfg.owner_vocab_size,
+            cfg.entity_vocab_size,
+            cfg.entity_vocab_size,
+            _INT32_ID_BOUND,
+            _INT32_ID_BOUND,
+            cfg.zone_vocab_size,
+            cfg.max_order_id,
+        )
+        self.world.validate(
+            feature_dim=cfg.feature_dim,
+            id_bounds=world_bounds,
+            label="world",
+        )
+        if not 0 < self.world.token_count <= cfg.max_world_tokens:
+            raise ValueError("encoded world token count is outside configured capacity")
+        if isinstance(self.domain_id, bool) or not isinstance(self.domain_id, int):
+            raise TypeError("encoded world domain_id must be an integer")
+        if not 0 <= self.domain_id < cfg.domain_count:
+            raise ValueError("encoded world domain_id exceeds configured vocabulary")
+
+    def storage_nbytes(self) -> int:
+        arrays = (
+            self.world.feature_indptr,
+            self.world.feature_indices,
+            self.world.feature_values,
+            self.world.ids,
+        )
+        return sum(int(array.nbytes) for array in arrays)
 
 
 @dataclass(frozen=True, slots=True)
@@ -479,12 +550,342 @@ def _tensor(array: npt.NDArray[Any], *, device: torch.device) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(array)).to(device=device)
 
 
+def _transfer_packed(
+    packed_i32: npt.NDArray[np.int32],
+    packed_f32: npt.NDArray[np.float32],
+    *,
+    dev: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    t_i32 = torch.from_numpy(packed_i32)
+    if dev.type == "cuda":
+        i32_gpu = t_i32.pin_memory().to(device=dev, non_blocking=True)
+        if packed_f32.size:
+            f32_gpu = torch.from_numpy(packed_f32).pin_memory().to(device=dev, non_blocking=True)
+        else:
+            f32_gpu = torch.empty((0,), device=dev, dtype=torch.float32)
+        return i32_gpu, f32_gpu
+    return t_i32.to(device=dev), torch.from_numpy(packed_f32).to(device=dev)
+
+
+def _collate_encoded_snapshots_scatter(
+    snapshots: tuple[EncodedDecisionSnapshot, ...],
+    *,
+    cfg: GroundedEncodingConfig,
+    dev: torch.device,
+) -> GroundedCandidateBatch:
+    """Pack flat sparse arrays into two pinned buffers and scatter on the target device."""
+
+    bsz = len(snapshots)
+    w_counts_list = [s.world.token_count for s in snapshots]
+    c_counts_list = [s.candidate_count for s in snapshots]
+    w_cap = max(w_counts_list)
+    c_cap = max(c_counts_list)
+    total_w = sum(w_counts_list)
+    total_c = sum(c_counts_list)
+    total_l = sum(s.locals.token_count for s in snapshots)
+
+    l_counts_np = (
+        np.concatenate([np.diff(s.local_offsets).astype(np.int32, copy=False) for s in snapshots])
+        if total_c
+        else np.empty((0,), dtype=np.int32)
+    )
+    l_cap = max(1, int(l_counts_np.max())) if l_counts_np.size else 1
+
+    w_ids_flat = np.concatenate([s.world.ids for s in snapshots], axis=0).reshape(-1)
+    w_nnz = np.concatenate([np.diff(s.world.feature_indptr).astype(np.int32, copy=False) for s in snapshots])
+    w_fidx = np.concatenate([s.world.feature_indices for s in snapshots]).astype(np.int32, copy=False)
+    w_fval = np.concatenate([s.world.feature_values for s in snapshots])
+    total_nnz_w = int(w_fval.size)
+
+    if total_c:
+        c_ids_flat = np.concatenate([s.candidates.ids for s in snapshots], axis=0).reshape(-1)
+        c_mask_i32 = np.concatenate([s.action_mask for s in snapshots]).astype(np.int32, copy=False)
+        c_nnz = np.concatenate(
+            [np.diff(s.candidates.feature_indptr).astype(np.int32, copy=False) for s in snapshots]
+        )
+        c_fidx = np.concatenate([s.candidates.feature_indices for s in snapshots]).astype(np.int32, copy=False)
+        c_fval = np.concatenate([s.candidates.feature_values for s in snapshots])
+    else:
+        c_ids_flat = np.empty((0,), dtype=np.int32)
+        c_mask_i32 = np.empty((0,), dtype=np.int32)
+        c_nnz = np.empty((0,), dtype=np.int32)
+        c_fidx = np.empty((0,), dtype=np.int32)
+        c_fval = np.empty((0,), dtype=np.float32)
+    total_nnz_c = int(c_fval.size)
+
+    meta_i32 = np.array(
+        [
+            *w_counts_list,
+            *c_counts_list,
+            *(s.domain_id for s in snapshots),
+            *(s.macro_economic_surface_id for s in snapshots),
+        ],
+        dtype=np.int32,
+    )
+    i32_parts: list[npt.NDArray[np.int32]] = [
+        meta_i32,
+        w_ids_flat,
+        w_nnz,
+        w_fidx,
+        c_ids_flat,
+        c_mask_i32,
+        c_nnz,
+        c_fidx,
+        l_counts_np,
+    ]
+    f32_parts: list[npt.NDArray[np.float32]] = [w_fval, c_fval]
+
+    total_nnz_l = 0
+    if total_l > 0:
+        l_snaps = [s for s in snapshots if s.locals.token_count]
+        l_ids_flat = np.concatenate([s.locals.ids for s in l_snaps], axis=0).reshape(-1)
+        l_nnz = np.concatenate(
+            [np.diff(s.locals.feature_indptr).astype(np.int32, copy=False) for s in l_snaps]
+        )
+        l_fidx = np.concatenate([s.locals.feature_indices for s in l_snaps]).astype(np.int32, copy=False)
+        l_fval = np.concatenate([s.locals.feature_values for s in l_snaps])
+        total_nnz_l = int(l_fval.size)
+        i32_parts.extend((l_ids_flat, l_nnz, l_fidx))
+        if total_nnz_l > 0:
+            f32_parts.append(l_fval)
+
+    packed_i32 = np.concatenate(i32_parts)
+    packed_f32 = (
+        np.concatenate([p for p in f32_parts if p.size])
+        if any(p.size for p in f32_parts)
+        else np.empty((0,), dtype=np.float32)
+    )
+    i32_dev, f32_dev = _transfer_packed(packed_i32, packed_f32, dev=dev)
+
+    cursor = 0
+    w_counts_t = i32_dev[cursor : cursor + bsz].long()
+    cursor += bsz
+    c_counts_t = i32_dev[cursor : cursor + bsz].long()
+    cursor += bsz
+    domain_ids_t = i32_dev[cursor : cursor + bsz].long()
+    cursor += bsz
+    surface_ids_t = i32_dev[cursor : cursor + bsz].long()
+    cursor += bsz
+
+    w_ids_len = total_w * _WORLD_ID_WIDTH
+    w_ids_src = i32_dev[cursor : cursor + w_ids_len].reshape(total_w, _WORLD_ID_WIDTH).long()
+    cursor += w_ids_len
+    w_nnz_t = i32_dev[cursor : cursor + total_w].long()
+    cursor += total_w
+    w_fidx_t = i32_dev[cursor : cursor + total_nnz_w].long()
+    cursor += total_nnz_w
+
+    c_ids_len = total_c * _CANDIDATE_ID_WIDTH
+    c_ids_src = i32_dev[cursor : cursor + c_ids_len].reshape(total_c, _CANDIDATE_ID_WIDTH).long()
+    cursor += c_ids_len
+    c_mask_src = i32_dev[cursor : cursor + total_c].ne(0)
+    cursor += total_c
+    c_nnz_t = i32_dev[cursor : cursor + total_c].long()
+    cursor += total_c
+    c_fidx_t = i32_dev[cursor : cursor + total_nnz_c].long()
+    cursor += total_nnz_c
+    l_counts_t = i32_dev[cursor : cursor + total_c].long()
+    cursor += total_c
+
+    f_cursor = 0
+    w_fval_t = f32_dev[f_cursor : f_cursor + total_nnz_w]
+    f_cursor += total_nnz_w
+    c_fval_t = f32_dev[f_cursor : f_cursor + total_nnz_c]
+    f_cursor += total_nnz_c
+
+    arange_b = torch.arange(bsz, device=dev, dtype=torch.long)
+
+    # Scatter World
+    world_mask = torch.arange(w_cap, device=dev, dtype=torch.long).unsqueeze(0) < w_counts_t.unsqueeze(1)
+    world_ids_tensor = torch.zeros((bsz, w_cap, _WORLD_ID_WIDTH), device=dev, dtype=torch.long)
+    world_features = torch.zeros((bsz, w_cap, cfg.feature_dim), device=dev, dtype=torch.float32)
+    if total_w > 0:
+        b_of_w = torch.repeat_interleave(arange_b, w_counts_t, output_size=total_w)
+        cum_w = w_counts_t.cumsum(0) - w_counts_t
+        t_of_w = torch.arange(total_w, device=dev, dtype=torch.long) - cum_w[b_of_w]
+        world_ids_tensor[b_of_w, t_of_w] = w_ids_src
+        if total_nnz_w > 0:
+            tok_w_nz = torch.repeat_interleave(
+                torch.arange(total_w, device=dev, dtype=torch.long),
+                w_nnz_t,
+                output_size=total_nnz_w,
+            )
+            world_features[b_of_w[tok_w_nz], t_of_w[tok_w_nz], w_fidx_t] = w_fval_t
+
+    # Scatter Candidates & Locals
+    candidate_ids_tensor = torch.zeros((bsz, c_cap, _CANDIDATE_ID_WIDTH), device=dev, dtype=torch.long)
+    action_mask = torch.zeros((bsz, c_cap), device=dev, dtype=torch.bool)
+    candidate_features = torch.zeros((bsz, c_cap, cfg.feature_dim), device=dev, dtype=torch.float32)
+    local_mask = torch.zeros((bsz, c_cap, l_cap), device=dev, dtype=torch.bool)
+    local_ids_tensor = torch.zeros((bsz, c_cap, l_cap, _LOCAL_ID_WIDTH), device=dev, dtype=torch.long)
+    local_features = torch.zeros((bsz, c_cap, l_cap, cfg.feature_dim), device=dev, dtype=torch.float32)
+
+    if total_c > 0:
+        b_of_c = torch.repeat_interleave(arange_b, c_counts_t, output_size=total_c)
+        cum_c = c_counts_t.cumsum(0) - c_counts_t
+        t_of_c = torch.arange(total_c, device=dev, dtype=torch.long) - cum_c[b_of_c]
+        candidate_ids_tensor[b_of_c, t_of_c] = c_ids_src
+        action_mask[b_of_c, t_of_c] = c_mask_src
+        if total_nnz_c > 0:
+            tok_c_nz = torch.repeat_interleave(
+                torch.arange(total_c, device=dev, dtype=torch.long),
+                c_nnz_t,
+                output_size=total_nnz_c,
+            )
+            candidate_features[b_of_c[tok_c_nz], t_of_c[tok_c_nz], c_fidx_t] = c_fval_t
+
+        if total_l > 0:
+            l_ids_len = total_l * _LOCAL_ID_WIDTH
+            l_ids_src = i32_dev[cursor : cursor + l_ids_len].reshape(total_l, _LOCAL_ID_WIDTH).long()
+            cursor += l_ids_len
+            l_nnz_t = i32_dev[cursor : cursor + total_l].long()
+            cursor += total_l
+            l_fidx_t = i32_dev[cursor : cursor + total_nnz_l].long()
+            cursor += total_nnz_l
+
+            cand_of_l = torch.repeat_interleave(
+                torch.arange(total_c, device=dev, dtype=torch.long),
+                l_counts_t,
+                output_size=total_l,
+            )
+            cum_l = l_counts_t.cumsum(0) - l_counts_t
+            pos_of_l = torch.arange(total_l, device=dev, dtype=torch.long) - cum_l[cand_of_l]
+            b_of_l = b_of_c[cand_of_l]
+            c_of_l = t_of_c[cand_of_l]
+            local_mask[b_of_l, c_of_l, pos_of_l] = True
+            local_ids_tensor[b_of_l, c_of_l, pos_of_l] = l_ids_src
+            if total_nnz_l > 0:
+                l_fval_t = f32_dev[f_cursor : f_cursor + total_nnz_l]
+                tok_l_nz = torch.repeat_interleave(
+                    torch.arange(total_l, device=dev, dtype=torch.long),
+                    l_nnz_t,
+                    output_size=total_nnz_l,
+                )
+                local_features[
+                    b_of_l[tok_l_nz],
+                    c_of_l[tok_l_nz],
+                    pos_of_l[tok_l_nz],
+                    l_fidx_t,
+                ] = l_fval_t
+
+    return GroundedCandidateBatch(
+        world=WorldTokenBatch(
+            features=world_features,
+            mask=world_mask,
+            type_ids=world_ids_tensor[:, :, 0],
+            role_ids=world_ids_tensor[:, :, 1],
+            owner_ids=world_ids_tensor[:, :, 2],
+            entity_ids=world_ids_tensor[:, :, 3],
+            entity_aux_ids=world_ids_tensor[:, :, 4],
+            definition_binding_ids=world_ids_tensor[:, :, 5],
+            relation_binding_ids=world_ids_tensor[:, :, 6],
+            zone_ids=world_ids_tensor[:, :, 7],
+            order_ids=world_ids_tensor[:, :, 8],
+        ),
+        candidates=CandidateTokenBatch(
+            features=candidate_features,
+            type_ids=candidate_ids_tensor[:, :, 0],
+            role_ids=candidate_ids_tensor[:, :, 1],
+            owner_ids=candidate_ids_tensor[:, :, 2],
+            entity_ids=candidate_ids_tensor[:, :, 3],
+            entity_aux_ids=candidate_ids_tensor[:, :, 4],
+            definition_binding_ids=candidate_ids_tensor[:, :, 5],
+            relation_binding_ids=candidate_ids_tensor[:, :, 6],
+            zone_ids=candidate_ids_tensor[:, :, 7],
+            target_owner_ids=candidate_ids_tensor[:, :, 8],
+            target_entity_ids=candidate_ids_tensor[:, :, 9],
+            target_entity_aux_ids=candidate_ids_tensor[:, :, 10],
+            target_definition_binding_ids=candidate_ids_tensor[:, :, 11],
+            target_relation_binding_ids=candidate_ids_tensor[:, :, 12],
+            policy_branch_ids=candidate_ids_tensor[:, :, 13],
+            local_features=local_features,
+            local_mask=local_mask,
+            local_type_ids=local_ids_tensor[:, :, :, 0],
+            local_role_ids=local_ids_tensor[:, :, :, 1],
+            local_owner_ids=local_ids_tensor[:, :, :, 2],
+            local_entity_ids=local_ids_tensor[:, :, :, 3],
+            local_entity_aux_ids=local_ids_tensor[:, :, :, 4],
+            local_definition_binding_ids=local_ids_tensor[:, :, :, 5],
+            local_relation_binding_ids=local_ids_tensor[:, :, :, 6],
+            local_zone_ids=local_ids_tensor[:, :, :, 7],
+            local_order_ids=local_ids_tensor[:, :, :, 8],
+            action_mask=action_mask,
+        ),
+        domain_ids=domain_ids_t,
+        macro_economic_surface_ids=surface_ids_t,
+    )
+
+
+def _collate_encoded_worlds_scatter(
+    snapshots: tuple[EncodedWorldSnapshot, ...],
+    *,
+    cfg: GroundedEncodingConfig,
+    dev: torch.device,
+) -> tuple[WorldTokenBatch, torch.Tensor]:
+    bsz = len(snapshots)
+    w_counts_list = [s.world.token_count for s in snapshots]
+    w_cap = max(w_counts_list)
+    total_w = sum(w_counts_list)
+    w_ids_flat = np.concatenate([s.world.ids for s in snapshots], axis=0).reshape(-1)
+    w_nnz = np.concatenate([np.diff(s.world.feature_indptr).astype(np.int32, copy=False) for s in snapshots])
+    w_fidx = np.concatenate([s.world.feature_indices for s in snapshots]).astype(np.int32, copy=False)
+    w_fval = np.concatenate([s.world.feature_values for s in snapshots])
+    total_nnz_w = int(w_fval.size)
+
+    meta_i32 = np.array([*w_counts_list, *(s.domain_id for s in snapshots)], dtype=np.int32)
+    packed_i32 = np.concatenate([meta_i32, w_ids_flat, w_nnz, w_fidx])
+    i32_dev, f32_dev = _transfer_packed(packed_i32, w_fval, dev=dev)
+
+    w_counts_t = i32_dev[:bsz].long()
+    domain_ids_t = i32_dev[bsz : 2 * bsz].long()
+    cursor = 2 * bsz
+    w_ids_len = total_w * _WORLD_ID_WIDTH
+    w_ids_src = i32_dev[cursor : cursor + w_ids_len].reshape(total_w, _WORLD_ID_WIDTH).long()
+    cursor += w_ids_len
+    w_nnz_t = i32_dev[cursor : cursor + total_w].long()
+    cursor += total_w
+    w_fidx_t = i32_dev[cursor : cursor + total_nnz_w].long()
+
+    world_mask = torch.arange(w_cap, device=dev, dtype=torch.long).unsqueeze(0) < w_counts_t.unsqueeze(1)
+    world_ids_tensor = torch.zeros((bsz, w_cap, _WORLD_ID_WIDTH), device=dev, dtype=torch.long)
+    world_features = torch.zeros((bsz, w_cap, cfg.feature_dim), device=dev, dtype=torch.float32)
+    if total_w > 0:
+        arange_b = torch.arange(bsz, device=dev, dtype=torch.long)
+        b_of_w = torch.repeat_interleave(arange_b, w_counts_t, output_size=total_w)
+        cum_w = w_counts_t.cumsum(0) - w_counts_t
+        t_of_w = torch.arange(total_w, device=dev, dtype=torch.long) - cum_w[b_of_w]
+        world_ids_tensor[b_of_w, t_of_w] = w_ids_src
+        if total_nnz_w > 0:
+            tok_w_nz = torch.repeat_interleave(
+                torch.arange(total_w, device=dev, dtype=torch.long),
+                w_nnz_t,
+                output_size=total_nnz_w,
+            )
+            world_features[b_of_w[tok_w_nz], t_of_w[tok_w_nz], w_fidx_t] = f32_dev[:total_nnz_w]
+
+    world_batch = WorldTokenBatch(
+        features=world_features,
+        mask=world_mask,
+        type_ids=world_ids_tensor[:, :, 0],
+        role_ids=world_ids_tensor[:, :, 1],
+        owner_ids=world_ids_tensor[:, :, 2],
+        entity_ids=world_ids_tensor[:, :, 3],
+        entity_aux_ids=world_ids_tensor[:, :, 4],
+        definition_binding_ids=world_ids_tensor[:, :, 5],
+        relation_binding_ids=world_ids_tensor[:, :, 6],
+        zone_ids=world_ids_tensor[:, :, 7],
+        order_ids=world_ids_tensor[:, :, 8],
+    )
+    return world_batch, domain_ids_t
+
+
 def collate_encoded_snapshots(
     snapshots: tuple[EncodedDecisionSnapshot, ...],
     *,
     expected_config: GroundedEncodingConfig,
     expected_fingerprint: str,
     device: torch.device | str | None,
+    validate: bool = True,
 ) -> GroundedCandidateBatch:
     """Materialize tensors trimmed to the active capacity of this batch.
 
@@ -498,10 +899,18 @@ def collate_encoded_snapshots(
 
     if not snapshots:
         raise ValueError("at least one encoded decision snapshot is required")
-    for snapshot in snapshots:
-        snapshot.validate(
-            expected_config=expected_config,
-            expected_fingerprint=expected_fingerprint,
+    if validate:
+        for snapshot in snapshots:
+            snapshot.validate(
+                expected_config=expected_config,
+                expected_fingerprint=expected_fingerprint,
+            )
+    dev = torch.device(device) if device is not None else torch.device("cpu")
+    if dev.type == "cuda" or len(snapshots) >= 8:
+        return _collate_encoded_snapshots_scatter(
+            snapshots,
+            cfg=expected_config,
+            dev=dev,
         )
     cfg = expected_config
     batch_size = len(snapshots)
@@ -660,11 +1069,79 @@ def collate_encoded_snapshots(
     )
 
 
+def collate_encoded_worlds(
+    snapshots: tuple[EncodedWorldSnapshot, ...],
+    *,
+    expected_config: GroundedEncodingConfig,
+    expected_fingerprint: str,
+    device: torch.device | str | None,
+    validate: bool = True,
+) -> tuple[WorldTokenBatch, torch.Tensor]:
+    """Materialize world tensors trimmed to the active world capacity of this batch."""
+
+    if not snapshots:
+        raise ValueError("at least one encoded world snapshot is required")
+    if validate:
+        for snapshot in snapshots:
+            snapshot.validate(
+                expected_config=expected_config,
+                expected_fingerprint=expected_fingerprint,
+            )
+    dev = torch.device(device) if device is not None else torch.device("cpu")
+    if dev.type == "cuda" or len(snapshots) >= 8:
+        return _collate_encoded_worlds_scatter(
+            snapshots,
+            cfg=expected_config,
+            dev=dev,
+        )
+    cfg = expected_config
+    batch_size = len(snapshots)
+    world_capacity = max(snapshot.world.token_count for snapshot in snapshots)
+    world_features = np.zeros((batch_size, world_capacity, cfg.feature_dim), dtype=np.float32)
+    world_mask = np.zeros((batch_size, world_capacity), dtype=np.bool_)
+    world_ids = np.zeros((batch_size, world_capacity, _WORLD_ID_WIDTH), dtype=np.int64)
+    domain_ids = np.zeros((batch_size,), dtype=np.int64)
+
+    for batch_index, snapshot in enumerate(snapshots):
+        world_count = snapshot.world.token_count
+        world_mask[batch_index, :world_count] = True
+        world_ids[batch_index, :world_count] = snapshot.world.ids
+        world_rows = np.repeat(
+            np.arange(world_count),
+            np.diff(snapshot.world.feature_indptr).astype(np.int64),
+        )
+        world_features[
+            batch_index,
+            world_rows,
+            snapshot.world.feature_indices,
+        ] = snapshot.world.feature_values
+        domain_ids[batch_index] = snapshot.domain_id
+
+    dev = torch.device(device) if device is not None else torch.device("cpu")
+    world_ids_tensor = _tensor(world_ids, device=dev)
+    world_batch = WorldTokenBatch(
+        features=_tensor(world_features, device=dev),
+        mask=_tensor(world_mask, device=dev),
+        type_ids=world_ids_tensor[:, :, 0],
+        role_ids=world_ids_tensor[:, :, 1],
+        owner_ids=world_ids_tensor[:, :, 2],
+        entity_ids=world_ids_tensor[:, :, 3],
+        entity_aux_ids=world_ids_tensor[:, :, 4],
+        definition_binding_ids=world_ids_tensor[:, :, 5],
+        relation_binding_ids=world_ids_tensor[:, :, 6],
+        zone_ids=world_ids_tensor[:, :, 7],
+        order_ids=world_ids_tensor[:, :, 8],
+    )
+    return world_batch, _tensor(domain_ids, device=dev)
+
+
 __all__ = [
     "ENCODED_DECISION_SNAPSHOT_VERSION",
     "EncodedDecisionSnapshot",
+    "EncodedWorldSnapshot",
     "GroundedEncodingConfig",
     "SparseTokenTable",
     "collate_encoded_snapshots",
+    "collate_encoded_worlds",
     "sparse_token_table",
 ]

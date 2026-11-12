@@ -45,3 +45,20 @@ def test_terminal_censoring_and_errors_are_separate(tmp_path: Path, monkeypatch,
     assert result["status"] == expected
     assert result["revivals_used"] == 3
     assert (tmp_path / "episode/final-state.json").is_file()
+
+
+@pytest.mark.parametrize("budget,revivals,verified", [(0, 0, True), (1, 0, False), (None, 0, False), (0, 1, False)])
+def test_permadeath_requires_explicit_simulator_evidence(tmp_path, monkeypatch, budget, revivals, verified):
+    from types import SimpleNamespace
+    def run(**kwargs):
+        assert kwargs["allow_zero_budget"] is True
+        facts = _facts(terminal=True, outcome="victory")
+        facts["state"]["observation"]["_training"].update(revival_budget=budget, revivals_used=revivals)
+        kwargs["trace"].record("transition", facts)
+        return {"ending": "factual_terminal"}
+    monkeypatch.setattr(evaluation, "run_branch_pass", run)
+    result = evaluation.evaluate_episode(backend=None, policy=None,
+        config=SimpleNamespace(curriculum=SimpleNamespace(revival_budget=0)), seed=101,
+        output=tmp_path / "episode", limits=BranchLimits(terminal_only=True))
+    assert result["zero_revival_verified"] is verified
+    assert result["status"] == ("complete" if verified else "failed")

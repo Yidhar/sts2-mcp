@@ -35,13 +35,23 @@ def _headless_sim_candidates() -> tuple[Path, ...]:
         source_root = artifact_root() / "dependencies" / "sts2-ai"
     roots.append(source_root / "STS2AI" / "ENV" / "Sim")
 
-    relative_candidates = (
-        Path("HeadlessSim/bin/Release/net9.0/HeadlessSim.exe"),
-        Path("HeadlessSim/bin/Debug/net9.0/HeadlessSim.exe"),
-        Path("Runtime/HeadlessSim/bin/Release/net9.0/HeadlessSim.exe"),
-        Path("Runtime/HeadlessSim/bin/Debug/net9.0/HeadlessSim.exe"),
+    exe_names = (
+        ("HeadlessSim.exe", "HeadlessSim")
+        if os.name == "nt"
+        else ("HeadlessSim", "HeadlessSim.exe")
     )
-    return tuple(root / candidate for root in roots for candidate in relative_candidates)
+    relative_dirs = (
+        Path("HeadlessSim/bin/Release/net9.0"),
+        Path("HeadlessSim/bin/Debug/net9.0"),
+        Path("Runtime/HeadlessSim/bin/Release/net9.0"),
+        Path("Runtime/HeadlessSim/bin/Debug/net9.0"),
+    )
+    return tuple(
+        root / rel_dir / exe_name
+        for root in roots
+        for rel_dir in relative_dirs
+        for exe_name in exe_names
+    )
 
 
 def resolve_headless_sim_exe(exe_path: str | Path | None = None) -> Path:

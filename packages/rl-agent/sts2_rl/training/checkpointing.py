@@ -243,6 +243,20 @@ _V16_ENCODING_IDENTITY = {
     # dimensions stay fixed, but replay/snapshot semantics do not.
     "fingerprint_sha256": "3cc73fd8910b005702ee4b408116b18b1c08a3d810f7301641c09fa3957ca70a",
 }
+_V18_ENCODING_IDENTITY = {
+    "version": "grounded-relational-runtime-encoding-v18",
+    "min_token_feature_dim": 224,
+    "feature_abi_end": 215,
+    "fingerprint_sha256": "7549a7663bd900305b22f75e7a5169ca6b827c26bcc140e341c3a17e7dc0886c",
+}
+_V19_ENCODING_IDENTITY = {
+    "version": "grounded-relational-runtime-encoding-v19",
+    "min_token_feature_dim": 224,
+    "feature_abi_end": 219,
+    # V19 assigns fixed zone 26 to upgrade_preview and writes trailing
+    # upgrade-difference features 215..218 only on upgrade_preview tokens.
+    "fingerprint_sha256": "b8bf849f2ee4f44fc9e8eabb7f4563764930246e16aff5f5889eab7f05435216",
+}
 _REVIEWED_MODEL_INITIALIZATION_ENCODING_MIGRATIONS = (
     (
         _V12_ENCODING_IDENTITY,
@@ -259,6 +273,10 @@ _REVIEWED_MODEL_INITIALIZATION_ENCODING_MIGRATIONS = (
     (
         _V15_ENCODING_IDENTITY,
         _V16_ENCODING_IDENTITY,
+    ),
+    (
+        _V18_ENCODING_IDENTITY,
+        _V19_ENCODING_IDENTITY,
     ),
 )
 

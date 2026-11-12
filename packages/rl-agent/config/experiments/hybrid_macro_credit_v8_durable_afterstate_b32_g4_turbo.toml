@@ -1,0 +1,106 @@
+# Durable Afterstate Macro Credit v4.2 (b32) — Exact FP32 Recurrence + Loot Collection Guard + Identity-Pure V_durable
+# Tuned for 48-thread AMD EPYC 9B45 + NVIDIA RTX PRO 6000 Blackwell (96 GB VRAM, 600W):
+# 1. Asymmetric Revival Critic (enable_asymmetric_revival_critic = true, revival_budget = 32):
+#    Feeds training-only revival survival context exclusively into Critic heads (never Actor logits),
+#    eliminating Simpson's Paradox on bailout HP resets so V_durable(higher HP | same revivals) > V_durable(lower HP).
+# 2. Identity-Pure Persistent V_durable (enable_persistent_only_durable_value = true):
+#    Masks WorldTokenBatch strictly to player-owned persistent build zones with domain_id=0 and zeroes out
+#    identity-blind deck/modifier scalar counts in raw_vitals so raw_vitals(take(card)) == raw_vitals(skip),
+#    forcing card-reward/remove evaluation through card-identity-aware WorldEncoder + persistent_build_attn.
+# 3. Salient-Bilinear Branch Actor + Cardinality-Neutral Macro Entropy + Within-Branch Non-Afterstate PG Entropy:
+#    Couples branch embeddings directly with observable salient HP/gold vitals, eliminates +ln(K) multi-item
+#    branch entropy bias, and sets macro_pg_within_branch_entropy_only = true so non-afterstate PG steps never
+#    push refusal probability up while preserving full within-branch map/event exploration.
+# 4. Exact IEEE-754 FP32 Recurrence (allow_tf32 = false, likelihood_tolerance = 0.02):
+#    Eliminates variable-batch TF32 teacher vs learner drift over 700-900 recurrent steps (<1% wall-clock cost).
+# 5. Zero Macro Pace Tax + Per-Episode Stalemate Seed Quarantine (revival_budget = 32, seed_index_offset = 90000).
+version = "sts2-synchronous-macro-credit-course-v1"
+
+[course]
+roots_per_cohort = 48
+seed_index_offset = 90000
+parallel_collectors = 48
+macro_branch_epsilon = 0.04
+maximum_root_snapshot_bytes = 536870912
+maximum_cohort_snapshot_bytes = 8589934592
+maximum_root_seconds = 3600.0
+maximum_cohort_seconds = 7200.0
+maximum_output_bytes = 68719476736
+minimum_free_disk_bytes = 2147483648
+
+[branches]
+root_surface = "reward"
+root_occurrence = 1
+continuation_macro_decisions = 0
+terminal_only = true
+max_native_steps = 8192
+max_candidates = 128
+timeout_seconds = 1200.0
+max_trace_bytes = 536870912
+policy_atol = 0.000001
+policy_rtol = 0.00001
+
+[learner]
+target_mode = "durable_afterstate_v2"
+enable_direct_vitals_context = true
+enable_macro_branch_prior = true
+enable_persistent_only_durable_value = true
+enable_asymmetric_revival_critic = true
+revival_budget = 32
+zero_macro_pace_penalty = true
+clip_macro_pg_fallback = true
+macro_pg_clip_eps = 0.20
+macro_pg_adv_clip = 0.25
+macro_pg_kl_weight = 0.05
+macro_pg_within_branch_entropy_only = true
+separate_value_grad_clip = true
+learning_rate = 0.00015
+shared_learning_rate_scale = 0.25
+weight_decay = 0.01
+macro_trace_lambda = 0.95
+macro_kl = 0.04
+durable_warmup_updates = 5
+combat_actor_warmup_updates = 15
+macro_entropy_weight = 0.015
+durable_post_value_weight = 0.5
+chunk_steps = 16
+combat_unroll_steps = 16
+eval_batch_size = 48
+chunk_batch_size = 96
+allow_tf32 = false
+macro_policy_weight = 1.0
+macro_value_weight = 0.5
+combat_policy_weight = 0.25
+combat_value_weight = 0.5
+combat_entropy_weight = 0.0005
+rho_clip = 1.1
+c_clip = 1.0
+policy_rho_clip = 1.1
+gradient_clip_norm = 1.0
+likelihood_tolerance = 0.02
+
+[training.transaction_learning]
+enabled = false
+
+[training.failure_credit]
+mode = "disabled"
+
+[training.episodic_learning]
+enabled = false
+
+[training.rollout]
+deterministic_probe_interval_episodes = 0
+deterministic_probe_environment_steps = []
+
+[training.curriculum]
+revival_budget = 32
+epsilon_start = 0.0
+epsilon_end = 0.0
+
+[training.runtime]
+rocm_sdpa_backend = "math"
+seed = 6700000
+evaluation_steps = []
+early_evaluation_steps = []
+final_audit_steps = []
+evaluation_liveness_guard_enabled = false

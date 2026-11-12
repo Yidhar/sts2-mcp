@@ -1369,10 +1369,10 @@ def test_encoder_rejects_feature_dimensions_below_versioned_abi() -> None:
 def test_encoding_contract_has_stable_checkpoint_identity() -> None:
     identity = grounding_encoding_identity()
 
-    assert identity["version"] == "grounded-relational-runtime-encoding-v18"
+    assert identity["version"] == "grounded-relational-runtime-encoding-v19"
     assert identity["version"] == GROUNDING_ENCODING_VERSION
     assert identity["min_token_feature_dim"] == 224
-    assert identity["feature_abi_end"] == 215
+    assert identity["feature_abi_end"] == 219
     assert len(identity["fingerprint_sha256"]) == 64
     assert set(identity["fingerprint_sha256"]) <= set("0123456789abcdef")
     assert grounding_encoding_identity() == identity

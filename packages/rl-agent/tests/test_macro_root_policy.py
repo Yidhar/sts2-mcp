@@ -95,6 +95,30 @@ def _snapshot(config: TrainingConfig) -> Any:
     )
 
 
+def test_zero_budget_requires_evaluation_opt_in_and_preserves_training_contract(tmp_path, config):
+    from sts2_rl.macro_root_diagnostic import validate_course
+    payload, _ = _publication(config, iql=True)
+    path = _save(tmp_path, payload)
+    zero = replace(config, curriculum=replace(config.curriculum, revival_budget=0))
+    with pytest.raises(ValueError, match="positive"):
+        FrozenMacroRootPolicy(path, zero, "cpu", initialize_from_iql=True)
+    with pytest.raises(ValueError):
+        validate_course(zero)
+    assert validate_course(zero, allow_zero_budget=True) == 0
+    policy = FrozenMacroRootPolicy(path, zero, "cpu", initialize_from_iql=True, evaluation_only_allow_zero=True)
+    assert policy.provenance["evaluation_only_zero_budget"] is True
+    assert policy.provenance["reward_identity"]["revival_budget"] == 0
+    assert all(not p.requires_grad for p in policy.model.parameters())
+
+
+def test_macro_transfer_rejects_incorrect_source_reward_contract(tmp_path, config):
+    payload, _ = _publication(config)
+    payload.update(format="sts2-hybrid-macro-credit-publication-v1", control_scores="policy_logits")
+    payload["reward_identity"]["tampered"] = True
+    with pytest.raises(ValueError, match="source reward_identity"):
+        FrozenMacroRootPolicy(_save(tmp_path, payload), config, "cpu", initialize_from_macro_publication=True)
+
+
 @pytest.mark.parametrize("iql", [False, True])
 def test_frozen_policy_matches_source_without_training_resources_or_writes(
     tmp_path: Path, config: TrainingConfig, monkeypatch: pytest.MonkeyPatch, iql: bool
@@ -238,3 +262,21 @@ def test_macro_credit_publication_has_distinct_provenance_and_same_inference(
     assert torch.isfinite(logits).all() and torch.isfinite(hidden).all()
     for name, tensor in source.state_dict().items():
         torch.testing.assert_close(policy.model.state_dict()[name], tensor, rtol=0, atol=0)
+
+
+def test_macro_credit_publication_curriculum_transfer(
+    tmp_path: Path, config: TrainingConfig
+) -> None:
+    payload, source = _publication(config)
+    payload.update(format="sts2-hybrid-macro-credit-publication-v1", control_scores="policy_logits")
+    saved_path = _save(tmp_path, payload)
+    new_course = replace(config, curriculum=replace(config.curriculum, revival_budget=48))
+    # Direct load fails because course reward_identity differs
+    with pytest.raises(ValueError, match="reward_identity differs"):
+        FrozenMacroRootPolicy(saved_path, new_course, "cpu", initialize_from_macro_publication=False)
+    # Curriculum transfer succeeds
+    policy = FrozenMacroRootPolicy(saved_path, new_course, "cpu", initialize_from_macro_publication=True)
+    assert policy.provenance["source_kind"] == "hybrid_macro_credit_publication"
+    assert policy.provenance["initialization_mode"] == "in_memory_model_initialization"
+    assert policy.provenance["source_reward_identity"]["revival_budget"] == 64
+    assert policy.provenance["reward_identity"]["revival_budget"] == 48

@@ -164,7 +164,7 @@ def test_pre_v12_model_initialization_cannot_jump_to_current_encoding(
 ) -> None:
     config = _config()
     current = grounding_encoding_identity()
-    assert current["version"] == "grounded-relational-runtime-encoding-v18"
+    assert current["version"] == "grounded-relational-runtime-encoding-v19"
     assert current != _V16_ENCODING
     archived = _validated_metadata(
         tmp_path,

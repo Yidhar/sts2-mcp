@@ -49,8 +49,10 @@ from sts2_rl.semantics.grouping import (
 from .snapshot import (
     ENCODED_DECISION_SNAPSHOT_VERSION,
     EncodedDecisionSnapshot,
+    EncodedWorldSnapshot,
     GroundedEncodingConfig,
     collate_encoded_snapshots,
+    collate_encoded_worlds,
     sparse_token_table,
 )
 
@@ -665,6 +667,7 @@ _ZONE_IDS: Final[dict[str, int]] = {
     "combat": 23,
     "candidate": 24,
     "world": 25,
+    "upgrade_preview": 26,
 }
 _UNKNOWN_ZONE_HASH_START: Final = max(_ZONE_IDS.values()) + 1
 
@@ -700,14 +703,16 @@ _V8_FEATURE_ABI_END: Final = _DYNAMIC_SLOT_START + _DYNAMIC_SLOT_COUNT
 # previously unused trailing feature rather than entering the sorted numeric
 # table and shifting all later learned meanings.
 _ACTION_GROUP_MULTIPLICITY_SLOT: Final = _V8_FEATURE_ABI_END
-_FEATURE_ABI_END: Final = _ACTION_GROUP_MULTIPLICITY_SLOT + 1
-# V17 makes the shared strategic-card projection part of the active decision
-# ABI.  Physical card instance/position fields and transient picker membership
-# no longer split otherwise identical semantic candidates, while every visible
-# strategic fact (including nested upgrade previews and enchantments) remains
-# represented.  Tensor shapes are unchanged, but candidate identities and
-# replay action indices are not compatible with earlier encoders.
-GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v18"
+_UPGRADE_COST_DELTA_SLOT: Final = _ACTION_GROUP_MULTIPLICITY_SLOT + 1
+_UPGRADE_VAR_SUM_DELTA_SLOT: Final = _ACTION_GROUP_MULTIPLICITY_SLOT + 2
+_UPGRADE_VAR_MAX_DELTA_SLOT: Final = _ACTION_GROUP_MULTIPLICITY_SLOT + 3
+_UPGRADE_KEYWORD_DELTA_SLOT: Final = _ACTION_GROUP_MULTIPLICITY_SLOT + 4
+_FEATURE_ABI_END: Final = _UPGRADE_KEYWORD_DELTA_SLOT + 1
+# V19 isolates ``upgrade_preview`` into its own fixed zone ID and populates
+# trailing slots 215..218 strictly on ``upgrade_preview`` tokens with generic
+# structural ``preview - source_card`` deltas while keeping slots 0..214
+# untouched on every token.
+GROUNDING_ENCODING_VERSION: Final = "grounded-relational-runtime-encoding-v19"
 
 # This table is executable encoder semantics, not parser convenience. Keep it
 # immutable and include it verbatim in the grounding identity payload so any
@@ -762,6 +767,12 @@ def _grounding_encoding_contract() -> dict[str, Any]:
         "dynamic_hash_slot_start": _DYNAMIC_HASH_SLOT_START,
         "dynamic_hash_slot_count": _DYNAMIC_HASH_SLOT_COUNT,
         "action_group_multiplicity_slot": _ACTION_GROUP_MULTIPLICITY_SLOT,
+        "upgrade_delta_slots": {
+            "cost": _UPGRADE_COST_DELTA_SLOT,
+            "var_sum": _UPGRADE_VAR_SUM_DELTA_SLOT,
+            "var_max": _UPGRADE_VAR_MAX_DELTA_SLOT,
+            "keyword": _UPGRADE_KEYWORD_DELTA_SLOT,
+        },
         "world_excluded_keys": sorted(_WORLD_EXCLUDED_KEYS),
         "candidate_excluded_keys": sorted(_CANDIDATE_EXCLUDED_KEYS),
         "engineered_key_fragments": list(_ENGINEERED_KEY_FRAGMENTS),
@@ -1039,6 +1050,7 @@ def _stable_zone_id(value: Any, size: int) -> int:
         "relics": "relic",
         "potions": "potion",
         "decision": "selection",
+        "upgrade_previews": "upgrade_preview",
     }
     canonical = aliases.get(normalized, normalized)
     stable = _ZONE_IDS.get(canonical)
@@ -1159,6 +1171,7 @@ def _zone_label(value: Mapping[str, Any], path: tuple[str, ...]) -> str:
             "relics",
             "potions",
             "decision",
+            "upgrade_previews",
         }:
             return normalized
     return path[-1] if path else "unknown"
@@ -1173,6 +1186,92 @@ def _bounded_number(value: Any) -> float | None:
     if not math.isfinite(number):
         raise ValueError("numeric model input must be finite")
     return math.copysign(min(1.0, math.log1p(abs(number)) / 10.0), number)
+
+
+def _dynamic_var_map(card: Mapping[str, Any]) -> dict[str, float]:
+    raw_vars = card.get("dynamic_vars")
+    if not isinstance(raw_vars, Sequence) or isinstance(raw_vars, str | bytes):
+        return {}
+    result: dict[str, float] = {}
+    for index, entry in enumerate(raw_vars):
+        if not isinstance(entry, Mapping):
+            continue
+        key = str(entry.get("id") or entry.get("var_type") or entry.get("type") or index).strip().lower()
+        for value_key in ("current_value", "base_value", "int_value"):
+            raw_val = entry.get(value_key)
+            if isinstance(raw_val, int | float) and not isinstance(raw_val, bool) and math.isfinite(float(raw_val)):
+                result[key] = float(raw_val)
+                break
+    return result
+
+
+def _label_count(card: Mapping[str, Any]) -> int:
+    total = 0
+    for field in ("keywords", "tags"):
+        raw = card.get(field)
+        if isinstance(raw, Sequence) and not isinstance(raw, str | bytes):
+            total += len(raw)
+    return total
+
+
+def _structural_upgrade_deltas(
+    source: Mapping[str, Any],
+    preview: Mapping[str, Any],
+) -> tuple[float, float, float, float]:
+    """Generic card-ID-free numeric & label deltas from source card to preview."""
+
+    src_cost = source.get("cost")
+    prv_cost = preview.get("cost")
+    if (
+        isinstance(src_cost, int | float)
+        and not isinstance(src_cost, bool)
+        and isinstance(prv_cost, int | float)
+        and not isinstance(prv_cost, bool)
+        and math.isfinite(float(src_cost))
+        and math.isfinite(float(prv_cost))
+    ):
+        cost_delta = max(-1.0, min(1.0, (float(prv_cost) - float(src_cost)) / 4.0))
+    else:
+        cost_delta = 0.0
+
+    src_vars = _dynamic_var_map(source)
+    prv_vars = _dynamic_var_map(preview)
+    shared = [prv_vars[key] - src_vars[key] for key in sorted(set(src_vars) & set(prv_vars))]
+    if shared:
+        var_sum_delta = max(-1.0, min(1.0, sum(shared) / 16.0))
+        var_max_delta = max(-1.0, min(1.0, max(shared) / 16.0))
+    else:
+        var_sum_delta = 0.0
+        var_max_delta = 0.0
+
+    kw_delta = max(-1.0, min(1.0, float(_label_count(preview) - _label_count(source)) / 4.0))
+    return (cost_delta, var_sum_delta, var_max_delta, kw_delta)
+
+
+def _with_upgrade_deltas(
+    token: _Token,
+    deltas: tuple[float, float, float, float],
+) -> _Token:
+    if all(value == 0.0 for value in deltas):
+        return token
+    features = list(token.features)
+    features[_UPGRADE_COST_DELTA_SLOT] = deltas[0]
+    features[_UPGRADE_VAR_SUM_DELTA_SLOT] = deltas[1]
+    features[_UPGRADE_VAR_MAX_DELTA_SLOT] = deltas[2]
+    features[_UPGRADE_KEYWORD_DELTA_SLOT] = deltas[3]
+    return _Token(
+        features=tuple(features),
+        type_id=token.type_id,
+        role_id=token.role_id,
+        owner_id=token.owner_id,
+        entity_id=token.entity_id,
+        entity_aux_id=token.entity_aux_id,
+        entity_key=token.entity_key,
+        entity_aux_key=token.entity_aux_key,
+        entity_aux_is_relation=token.entity_aux_is_relation,
+        zone_id=token.zone_id,
+        order_id=token.order_id,
+    )
 
 
 def _string_field(value: Mapping[str, Any], keys: Sequence[str]) -> str:
@@ -3281,6 +3380,80 @@ class GroundedObservationEncoder:
             device=device,
         )
 
+    def encode_world_snapshot(
+        self,
+        observation: Mapping[str, Any],
+    ) -> EncodedWorldSnapshot:
+        """Encode world/domain state only without any candidate tokens."""
+
+        if not isinstance(observation, Mapping):
+            raise TypeError("observation must be a mapping")
+        model_observation = _canonical_model_observation(observation)
+        return self.encode_canonical_world_snapshot(model_observation)
+
+    def encode_canonical_world_snapshot(
+        self,
+        model_observation: Mapping[str, Any],
+    ) -> EncodedWorldSnapshot:
+        """Encode an already-canonicalized model observation into a world snapshot."""
+
+        if not isinstance(model_observation, Mapping):
+            raise TypeError("model_observation must be a mapping")
+        world_tokens = self._world_tokens(model_observation)
+        bindings = self._entity_binding_allocation(world_tokens, ())
+        domain_id = self._domain_id(model_observation)
+        fingerprint = grounding_encoding_identity()["fingerprint_sha256"]
+
+        def definition_binding(value: str) -> int:
+            key = self._definition_binding_key(value)
+            return bindings.definitions[key] if key else 1
+
+        def relation_binding(value: str, is_relation: bool) -> int:
+            key = self._relation_binding_key(value, is_relation)
+            return bindings.relations[key] if key[0] else 1
+
+        world = sparse_token_table(
+            features=tuple(token.features for token in world_tokens),
+            ids=tuple(
+                (
+                    token.type_id,
+                    token.role_id,
+                    token.owner_id,
+                    token.entity_id,
+                    token.entity_aux_id,
+                    definition_binding(token.entity_key),
+                    relation_binding(
+                        token.entity_aux_key,
+                        token.entity_aux_is_relation,
+                    ),
+                    token.zone_id,
+                    token.order_id,
+                )
+                for token in world_tokens
+            ),
+            feature_dim=self.config.feature_dim,
+            id_width=9,
+        )
+        return EncodedWorldSnapshot(
+            config=self.config,
+            encoding_fingerprint=fingerprint,
+            world=world,
+            domain_id=domain_id,
+        )
+
+    def collate_world_snapshots(
+        self,
+        snapshots: Sequence[EncodedWorldSnapshot],
+        *,
+        device: torch.device | str | None = None,
+    ) -> tuple[Any, torch.Tensor]:
+        return collate_encoded_worlds(
+            tuple(snapshots),
+            expected_config=self.config,
+            expected_fingerprint=grounding_encoding_identity()["fingerprint_sha256"],
+            device=device,
+        )
+
     def _snapshot(
         self,
         world_tokens: Sequence[_Token],
@@ -3457,13 +3630,68 @@ class GroundedObservationEncoder:
             return _DOMAIN_IDS["route"]
         return _DOMAIN_IDS["unknown"]
 
+    @staticmethod
+    def _world_upgrade_source_lookup(
+        observation: Mapping[str, Any],
+    ) -> tuple[dict[str, Mapping[str, Any]], dict[str, Mapping[str, Any]]]:
+        raw_decision = observation.get("decision")
+        if not isinstance(raw_decision, Mapping):
+            return {}, {}
+        raw_selection = raw_decision.get("selection")
+        if not isinstance(raw_selection, Mapping):
+            return {}, {}
+        by_instance: dict[str, Mapping[str, Any]] = {}
+        by_id: dict[str, Mapping[str, Any]] = {}
+        for key in ("selectable_cards", "selected_cards"):
+            raw_cards = raw_selection.get(key)
+            if not isinstance(raw_cards, Sequence) or isinstance(raw_cards, str | bytes):
+                continue
+            for card in raw_cards:
+                if not isinstance(card, Mapping):
+                    continue
+                inst = str(card.get("instance_id") or "").strip()
+                if inst and inst not in by_instance:
+                    by_instance[inst] = card
+                cid = str(card.get("id") or "").strip()
+                if cid and cid not in by_id:
+                    by_id[cid] = card
+        raw_player = observation.get("player")
+        if isinstance(raw_player, Mapping):
+            raw_deck = raw_player.get("deck_cards")
+            if isinstance(raw_deck, Sequence) and not isinstance(raw_deck, str | bytes):
+                for card in raw_deck:
+                    if not isinstance(card, Mapping):
+                        continue
+                    inst = str(card.get("instance_id") or "").strip()
+                    if inst and inst not in by_instance:
+                        by_instance[inst] = card
+                    cid = str(card.get("id") or "").strip()
+                    if cid and cid not in by_id:
+                        by_id[cid] = card
+        return by_instance, by_id
+
     def _world_tokens(self, observation: Mapping[str, Any]) -> tuple[_Token, ...]:
+        by_instance, by_id = self._world_upgrade_source_lookup(observation)
         queue: deque[_WalkItem] = deque([_WalkItem(observation, ("world",), "neutral", "", 0, 0)])
         result: list[_Token] = []
         branch_tokens: Counter[str] = Counter()
         while queue and len(result) < self.config.max_world_tokens:
             item = queue.popleft()
             token, children = self._tokenize_node(item, excluded=_WORLD_EXCLUDED_KEYS)
+            if (
+                isinstance(item.value, Mapping)
+                and len(item.path) >= 2
+                and _normalize_key(item.path[-2]) == "upgrade_previews"
+                and _normalize_key(item.path[-1]) == "item"
+            ):
+                inst = str(item.value.get("instance_id") or "").strip()
+                cid = str(item.value.get("id") or "").strip()
+                matched_src = by_instance.get(inst) or by_id.get(cid)
+                if matched_src is not None:
+                    token = _with_upgrade_deltas(
+                        token,
+                        _structural_upgrade_deltas(matched_src, item.value),
+                    )
             result.append(token)
             branch_tokens[item.path[1] if len(item.path) > 1 else "world"] += 1
             queue.extend(children)
@@ -3600,9 +3828,19 @@ class GroundedObservationEncoder:
                         1,
                     )
                 )
+        source_card = roots.get("card")
         while queue and len(locals_) < self.config.max_candidate_local_tokens:
             item = queue.popleft()
             local, children = self._tokenize_node(item, excluded=_CANDIDATE_EXCLUDED_KEYS)
+            if (
+                item.path == ("candidate", "upgrade_preview")
+                and isinstance(item.value, Mapping)
+                and isinstance(source_card, Mapping)
+            ):
+                local = _with_upgrade_deltas(
+                    local,
+                    _structural_upgrade_deltas(source_card, item.value),
+                )
             locals_.append(local)
             queue.extend(children)
         if queue:
@@ -3982,8 +4220,10 @@ __all__ = [
     "ActionReference",
     "EncodedDecision",
     "EncodedDecisionSnapshot",
+    "EncodedWorldSnapshot",
     "GroundedEncodingConfig",
     "GroundedObservationEncoder",
     "SemanticActionGroup",
+    "collate_encoded_worlds",
     "grounding_encoding_identity",
 ]

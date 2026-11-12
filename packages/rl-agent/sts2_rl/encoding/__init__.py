@@ -6,9 +6,11 @@ from .grounded import (
     ActionReference,
     EncodedDecision,
     EncodedDecisionSnapshot,
+    EncodedWorldSnapshot,
     GroundedEncodingConfig,
     GroundedObservationEncoder,
     SemanticActionGroup,
+    collate_encoded_worlds,
     grounding_encoding_identity,
 )
 
@@ -18,8 +20,10 @@ __all__ = [
     "ActionReference",
     "EncodedDecision",
     "EncodedDecisionSnapshot",
+    "EncodedWorldSnapshot",
     "GroundedEncodingConfig",
     "GroundedObservationEncoder",
     "SemanticActionGroup",
+    "collate_encoded_worlds",
     "grounding_encoding_identity",
 ]
