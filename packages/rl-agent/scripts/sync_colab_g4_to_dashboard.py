@@ -18,13 +18,15 @@ That enables full drill-down in ``http://127.0.0.1:8765/`` including:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import math
 import os
-import shlex
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -196,6 +198,144 @@ def _extract_marked_json(stdout: str, begin_marker: str, end_marker: str) -> dic
     return parsed
 
 
+_WSL_BRIDGE_SERVER_SCRIPT = """
+import json, os, shutil, subprocess, sys, tempfile
+from pathlib import Path
+
+colab_bin = os.environ.get("COLAB_BIN") or str(Path.home() / ".local" / "bin" / "colab")
+if not Path(colab_bin).is_file():
+    colab_bin = shutil.which("colab") or colab_bin
+
+for raw_line in sys.stdin:
+    line = raw_line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    session = str(req["session"])
+    timeout_s = int(req["timeout_seconds"])
+    script = str(req["script"])
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as handle:
+        handle.write(script)
+        tmp_path = Path(handle.name)
+    try:
+        proc = subprocess.run(
+            [colab_bin, "exec", "-s", session, "--timeout", str(timeout_s), "-f", str(tmp_path)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_s + 20,
+            check=False,
+        )
+        resp = {
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+        }
+    except Exception as exc:
+        resp = {
+            "returncode": -1,
+            "stdout": "",
+            "stderr": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    sys.stdout.write(json.dumps(resp, separators=(",", ":")) + "\\n")
+    sys.stdout.flush()
+"""
+
+
+class _PersistentWslColabBridge:
+    """Keep a single WSL worker alive on Windows to avoid WSL2 hvsocket exhaustion (0x80072747)."""
+
+    def __init__(self) -> None:
+        self._proc: subprocess.Popen[str] | None = None
+        self._out_queue: queue.Queue[str | None] = queue.Queue()
+        self._reader_thread: threading.Thread | None = None
+
+    def _ensure_started(self) -> subprocess.Popen[str]:
+        if self._proc is not None and self._proc.poll() is None:
+            return self._proc
+        self.close()
+        self._out_queue = queue.Queue()
+        proc = subprocess.Popen(
+            ["wsl", "-e", "python3", "-u", "-c", _WSL_BRIDGE_SERVER_SCRIPT],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        self._proc = proc
+        out_q = self._out_queue
+
+        def _reader() -> None:
+            assert proc.stdout is not None
+            try:
+                for line in proc.stdout:
+                    out_q.put(line)
+            finally:
+                out_q.put(None)
+
+        thread = threading.Thread(target=_reader, daemon=True)
+        thread.start()
+        self._reader_thread = thread
+        return proc
+
+    def close(self) -> None:
+        proc = self._proc
+        self._proc = None
+        if proc is not None:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def exec_script(self, *, session: str, script: str, timeout_seconds: int) -> tuple[int, str, str]:
+        proc = self._ensure_started()
+        assert proc.stdin is not None
+        payload = json.dumps(
+            {"session": session, "timeout_seconds": int(timeout_seconds), "script": script},
+            separators=(",", ":"),
+        )
+        try:
+            proc.stdin.write(payload + "\n")
+            proc.stdin.flush()
+            raw = self._out_queue.get(timeout=timeout_seconds + 25)
+        except Exception:
+            self.close()
+            raise
+        if raw is None:
+            self.close()
+            raise RuntimeError("persistent WSL colab bridge closed unexpectedly")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            self.close()
+            raise RuntimeError(f"persistent WSL colab bridge non-JSON output: {raw.strip()[-400:]}") from exc
+        return (
+            int(parsed.get("returncode", -1)),
+            str(parsed.get("stdout") or ""),
+            str(parsed.get("stderr") or ""),
+        )
+
+
+_WSL_BRIDGE = _PersistentWslColabBridge()
+atexit.register(_WSL_BRIDGE.close)
+
+
 def _fetch_remote_bundle(
     *,
     session: str,
@@ -212,25 +352,10 @@ def _fetch_remote_bundle(
         .replace("__ALREADY_JOURNALS__", json.dumps([int(x) for x in already_journals]))
     )
     if os.name == "nt":
-        bash_cmd = (
-            "set -euo pipefail; "
-            'colab_bin="${COLAB_BIN:-$HOME/.local/bin/colab}"; '
-            'if [ ! -x "$colab_bin" ]; then colab_bin="$(command -v colab)"; fi; '
-            "tmpf=$(mktemp /tmp/sts2_g4_dash_sync_XXXXXX.py); "
-            'trap \'rm -f "$tmpf"\' EXIT; '
-            'cat > "$tmpf"; '
-            f'"$colab_bin" exec -s {shlex.quote(session)} '
-            f'--timeout {int(timeout_seconds)} -f "$tmpf" < /dev/null'
-        )
-        proc = subprocess.run(
-            ["wsl", "-e", "bash", "-lc", bash_cmd],
-            input=script,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_seconds + 20,
-            check=False,
+        returncode, stdout, stderr = _WSL_BRIDGE.exec_script(
+            session=session,
+            script=script,
+            timeout_seconds=int(timeout_seconds),
         )
     else:
         colab_bin = os.environ.get("COLAB_BIN") or str(Path.home() / ".local" / "bin" / "colab")
@@ -247,13 +372,14 @@ def _fetch_remote_bundle(
                 timeout=timeout_seconds + 20,
                 check=False,
             )
+            returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
         finally:
             tmp_path.unlink(missing_ok=True)
 
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip()[-600:]
-        raise RuntimeError(f"colab exec failed (exit {proc.returncode}): {detail}")
-    return _extract_marked_json(proc.stdout, "PULLED_JSON_START", "PULLED_JSON_END")
+    if returncode != 0:
+        detail = (stderr or stdout).strip()[-600:]
+        raise RuntimeError(f"colab exec failed (exit {returncode}): {detail}")
+    return _extract_marked_json(stdout, "PULLED_JSON_START", "PULLED_JSON_END")
 
 
 def _load_seed_pull_cache(path: Path | None) -> dict[str, Any]:
