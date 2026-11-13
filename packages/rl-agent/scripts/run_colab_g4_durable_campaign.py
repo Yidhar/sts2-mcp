@@ -333,7 +333,8 @@ def _probe_prune_and_sync(
         ],
         "smith_vs_remove_jsd": probe_report["smith_vs_remove_divergence"]["mean_smith_remove_jsd"],
         "smith_vs_remove_spearman": probe_report["smith_vs_remove_divergence"]["mean_smith_remove_spearman"],
-        "multiset_split_max_abs_diff": split_inv.get("max_durable_value_abs_diff"),
+        "grouped_vs_split_abs_diff": split_inv.get("grouped_vs_split_abs_diff"),
+        "smith_high_delta_minus_basic_adv": split_inv.get("smith_high_delta_minus_basic_adv"),
         "episode_macro_discipline": probe_report["episode_macro_discipline"],
     }
     _append_jsonl(output_dir / "campaign_history.jsonl", history_entry)
@@ -356,7 +357,8 @@ def _probe_prune_and_sync(
                 "campfire_low_minus_high_rest_prob": history_entry["campfire_low_minus_high_rest_prob"],
                 "smith_vs_remove_jsd": history_entry["smith_vs_remove_jsd"],
                 "smith_vs_remove_spearman": history_entry["smith_vs_remove_spearman"],
-                "multiset_split_max_abs_diff": history_entry["multiset_split_max_abs_diff"],
+                "grouped_vs_split_abs_diff": history_entry["grouped_vs_split_abs_diff"],
+                "smith_high_delta_minus_basic_adv": history_entry["smith_high_delta_minus_basic_adv"],
             },
             sort_keys=True,
         ),
