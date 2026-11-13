@@ -27,6 +27,7 @@ from sts2_rl.models.hybrid_actor_critic import (
     HybridActorCriticConfig,
     HybridDomainActorCriticModel,
     initialize_actor_critic_from_iql,
+    initialize_actor_critic_from_macro_publication,
 )
 from sts2_rl.models.hybrid_iql import HybridIQLConfig
 from sts2_rl.training.config import TrainingConfig
@@ -127,13 +128,49 @@ class FrozenMacroRootPolicy:
                 f"frozen macro policy expected {allowed_formats}; "
                 "IQL parents require explicit initialize_from_iql=True"
             )
-        source_model_config = (
-            HybridIQLConfig(grounded_cfg).as_mapping()
-            if initialize_from_iql
-            else model_config.as_mapping()
-        )
-        if payload.get("model_config") != source_model_config:
-            raise ValueError("frozen macro policy publication model_config differs")
+        parsed_macro_source_cfg: HybridActorCriticConfig | None = None
+        if initialize_from_iql:
+            source_model_config = HybridIQLConfig(grounded_cfg).as_mapping()
+            if payload.get("model_config") != source_model_config:
+                raise ValueError("frozen macro policy publication model_config differs")
+        elif initialize_from_macro_publication:
+            if not isinstance(raw_pub_model_cfg, dict):
+                raise ValueError("frozen macro policy publication model_config differs")
+            try:
+                parsed_macro_source_cfg = HybridActorCriticConfig.from_mapping(
+                    raw_pub_model_cfg,
+                    fallback_grounded=grounded_cfg,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("frozen macro policy publication model_config differs") from exc
+            if parsed_macro_source_cfg.as_mapping() != raw_pub_model_cfg:
+                raise ValueError("frozen macro policy publication model_config differs")
+            if (
+                parsed_macro_source_cfg.grounded != model_config.grounded
+                or parsed_macro_source_cfg.domain_layers != model_config.domain_layers
+                or parsed_macro_source_cfg.joint_layers != model_config.joint_layers
+            ):
+                raise ValueError("frozen macro policy publication model_config differs")
+            for flag_name in (
+                "enable_hierarchical_branch_policy",
+                "enable_durable_value_head",
+                "enable_persistent_build_context",
+                "enable_direct_vitals_context",
+                "enable_macro_branch_prior",
+                "enable_persistent_only_durable_value",
+                "enable_asymmetric_revival_critic",
+                "enable_draw_weighted_durable_value",
+                "enable_role_conditioned_candidate_policy",
+            ):
+                if getattr(parsed_macro_source_cfg, flag_name) and not getattr(model_config, flag_name):
+                    raise ValueError(
+                        f"macro publication hot-start cannot disable parent flag {flag_name}"
+                    )
+            source_model_config = parsed_macro_source_cfg.as_mapping()
+        else:
+            source_model_config = model_config.as_mapping()
+            if payload.get("model_config") != source_model_config:
+                raise ValueError("frozen macro policy publication model_config differs")
         if initialize_from_iql:
             source_reward_identity = absolute_death_price_reward_identity()
             if payload.get("reward_identity") != source_reward_identity:
@@ -177,6 +214,14 @@ class FrozenMacroRootPolicy:
                 raise ValueError(
                     "frozen IQL parent leaves actor-critic tensors uninitialized: " + ", ".join(unexpected_fresh)
                 )
+            loaded_names = list(inherited["inherited"])
+            fresh_names = list(inherited["fresh"])
+        elif (
+            initialize_from_macro_publication
+            and parsed_macro_source_cfg is not None
+            and model_config != parsed_macro_source_cfg
+        ):
+            inherited = initialize_actor_critic_from_macro_publication(self.model, online)
             loaded_names = list(inherited["inherited"])
             fresh_names = list(inherited["fresh"])
         else:

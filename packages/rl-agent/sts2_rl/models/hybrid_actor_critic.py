@@ -11,6 +11,7 @@ the value regression.
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Final
 
@@ -36,10 +37,16 @@ HYBRID_ACTOR_CRITIC_V2_MODEL_VERSION: Final = "sts2-hybrid-domain-actor-critic-v
 # Fixed zone IDs from encoding.grounded._ZONE_IDS representing persistent build
 # facts (deck=2, player=13, relic=15, potion=16, modifier=20, run=22), isolated
 # from variable-size map graphs and transient picker containers.
+DECK_ZONE_ID: Final = 2
 PLAYER_ZONE_ID: Final = 13
+MODIFIER_ZONE_ID: Final = 20
 RUN_ZONE_ID: Final = 22
 NUMERIC_FACT_SLOT_START: Final = 6
 NUMERIC_FACT_SLOT_END: Final = 166
+DECK_FLOOR_ADDED_SLOT: Final = 52
+DECK_QUANTITY_SLOT: Final = 131
+DECK_REFERENCE_SIZE: Final = 12.0
+DURABLE_DECK_SIZE_DIM: Final = 4
 PLAYER_CURRENT_HP_OFFSET: Final = 34 - NUMERIC_FACT_SLOT_START
 PLAYER_GOLD_OFFSET: Final = 54 - NUMERIC_FACT_SLOT_START
 PLAYER_HP_OFFSET: Final = 62 - NUMERIC_FACT_SLOT_START
@@ -51,6 +58,8 @@ IDENTITY_BLIND_CARD_COUNT_ZONE_IDS: Final[frozenset[int]] = frozenset({2, 20})
 V2_FRESH_TENSOR_PREFIXES: Final[tuple[str, ...]] = (
     "branch_policy_head.",
     "branch_vitals_",
+    "candidate_role_",
+    "durable_deck_",
     "durable_revival_",
     "durable_value_head.",
     "durable_vitals_",
@@ -72,6 +81,8 @@ class HybridActorCriticConfig:
     enable_macro_branch_prior: bool = False
     enable_persistent_only_durable_value: bool = False
     enable_asymmetric_revival_critic: bool = False
+    enable_draw_weighted_durable_value: bool = False
+    enable_role_conditioned_candidate_policy: bool = False
 
     def __post_init__(self) -> None:
         HybridCandidateQConfig(
@@ -87,9 +98,15 @@ class HybridActorCriticConfig:
             "enable_macro_branch_prior",
             "enable_persistent_only_durable_value",
             "enable_asymmetric_revival_critic",
+            "enable_draw_weighted_durable_value",
+            "enable_role_conditioned_candidate_policy",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"hybrid actor-critic {name} must be boolean")
+        if self.enable_draw_weighted_durable_value and not self.enable_persistent_only_durable_value:
+            raise ValueError(
+                "enable_draw_weighted_durable_value requires enable_persistent_only_durable_value=True"
+            )
 
     @property
     def has_v2_extensions(self) -> bool:
@@ -101,6 +118,8 @@ class HybridActorCriticConfig:
             or self.enable_macro_branch_prior
             or self.enable_persistent_only_durable_value
             or self.enable_asymmetric_revival_critic
+            or self.enable_draw_weighted_durable_value
+            or self.enable_role_conditioned_candidate_policy
         )
 
     @classmethod
@@ -161,6 +180,29 @@ class HybridActorCriticConfig:
         )
 
     @classmethod
+    def durable_v5(
+        cls,
+        grounded: GroundedCandidateConfig | None = None,
+        *,
+        domain_layers: int = 1,
+        joint_layers: int = 2,
+    ) -> HybridActorCriticConfig:
+        return cls(
+            grounded=grounded or GroundedCandidateConfig(),
+            domain_layers=domain_layers,
+            joint_layers=joint_layers,
+            enable_hierarchical_branch_policy=True,
+            enable_durable_value_head=True,
+            enable_persistent_build_context=True,
+            enable_direct_vitals_context=True,
+            enable_macro_branch_prior=True,
+            enable_persistent_only_durable_value=True,
+            enable_asymmetric_revival_critic=True,
+            enable_draw_weighted_durable_value=True,
+            enable_role_conditioned_candidate_policy=True,
+        )
+
+    @classmethod
     def from_mapping(
         cls,
         mapping: dict[str, Any],
@@ -200,6 +242,12 @@ class HybridActorCriticConfig:
                 enable_asymmetric_revival_critic=bool(
                     mapping.get("enable_asymmetric_revival_critic", False)
                 ),
+                enable_draw_weighted_durable_value=bool(
+                    mapping.get("enable_draw_weighted_durable_value", False)
+                ),
+                enable_role_conditioned_candidate_policy=bool(
+                    mapping.get("enable_role_conditioned_candidate_policy", False)
+                ),
             )
         raise ValueError(f"unsupported hybrid actor-critic model_config version: {version!r}")
 
@@ -235,6 +283,18 @@ class HybridActorCriticConfig:
                     ),
                     enable_asymmetric_revival_critic=(
                         self.enable_asymmetric_revival_critic
+                    ),
+                )
+            if (
+                self.enable_draw_weighted_durable_value
+                or self.enable_role_conditioned_candidate_policy
+            ):
+                base.update(
+                    enable_draw_weighted_durable_value=(
+                        self.enable_draw_weighted_durable_value
+                    ),
+                    enable_role_conditioned_candidate_policy=(
+                        self.enable_role_conditioned_candidate_policy
                     ),
                 )
         return base
@@ -333,6 +393,17 @@ def hierarchical_greedy_action_index(
     return int(within_scores.argmax(dim=0).item())
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedPersistentWorld:
+    world: WorldTokenBatch
+    token_weights: Tensor  # [B, W]
+    deck_card_mask: Tensor  # [B, W]
+    draw_prob: Tensor  # [B, W]
+    deck_size: Tensor  # [B]
+    has_deck: Tensor  # [B]
+    child_uv: Tensor  # [B, W, W], (child u, parent card v)
+
+
 class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
     """Hybrid dual-stream representation with optional v2 durable/branch extensions."""
 
@@ -346,12 +417,32 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         self._player_owner_id = 2 + int.from_bytes(player_owner_digest[:8], "big") % (
             cfg.owner_vocab_size - 2
         )
+        mapping_item_digest = hashlib.sha256(b"type\0mapping:item").digest()
+        self._mapping_item_type_id = 2 + int.from_bytes(mapping_item_digest[:8], "big") % (
+            cfg.type_vocab_size - 2
+        )
         control_input = cfg.d_model * 2 + cfg.recurrent_hidden_dim
         self.candidate_policy_head = nn.Sequential(
             nn.Linear(control_input, cfg.ffn_dim),
             nn.SiLU(),
             nn.Linear(cfg.ffn_dim, 1),
         )
+        if actor_critic.enable_role_conditioned_candidate_policy:
+            self.candidate_role_gate = nn.Linear(cfg.d_model, cfg.d_model)
+            nn.init.normal_(self.candidate_role_gate.weight, mean=0.0, std=0.15)
+            nn.init.zeros_(self.candidate_role_gate.bias)
+            role_fc1 = nn.Linear(cfg.d_model * 4, cfg.ffn_dim)
+            nn.init.normal_(role_fc1.weight, mean=0.0, std=0.05)
+            nn.init.zeros_(role_fc1.bias)
+            role_out = nn.Linear(cfg.ffn_dim, 1)
+            nn.init.zeros_(role_out.weight)
+            nn.init.zeros_(role_out.bias)
+            self.candidate_role_policy_head = nn.Sequential(
+                nn.LayerNorm(cfg.d_model * 4),
+                role_fc1,
+                nn.SiLU(),
+                role_out,
+            )
         self.state_value_head = nn.Sequential(
             nn.Linear(cfg.d_model + cfg.recurrent_hidden_dim, cfg.ffn_dim),
             nn.SiLU(),
@@ -381,6 +472,16 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 nn.SiLU(),
                 cand_build_out,
             )
+            if actor_critic.enable_draw_weighted_durable_value:
+                deck_proj_out = nn.Linear(cfg.d_model, cfg.d_model)
+                nn.init.zeros_(deck_proj_out.weight)
+                nn.init.zeros_(deck_proj_out.bias)
+                self.persistent_build_deck_proj = nn.Sequential(
+                    nn.LayerNorm(cfg.d_model * 3),
+                    nn.Linear(cfg.d_model * 3, cfg.d_model),
+                    nn.SiLU(),
+                    deck_proj_out,
+                )
         rev_dim = (
             CRITIC_REVIVAL_CONTEXT_DIM
             if actor_critic.enable_asymmetric_revival_critic
@@ -478,6 +579,33 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 nn.SiLU(),
                 durable_out,
             )
+            if actor_critic.enable_draw_weighted_durable_value:
+                deck_ctx_dim = (
+                    cfg.d_model * (1 + int(actor_critic.enable_direct_vitals_context))
+                    + memory_half
+                    + rev_dim
+                )
+                self.durable_deck_norm = nn.LayerNorm(cfg.d_model * 3)
+                self.durable_deck_card_fc = nn.Linear(cfg.d_model * 3, cfg.ffn_dim)
+                self.durable_deck_raw_fc = nn.Linear(cfg.token_feature_dim * 2, cfg.ffn_dim)
+                self.durable_deck_ctx_norm = nn.LayerNorm(deck_ctx_dim)
+                self.durable_deck_ctx_fc = nn.Linear(deck_ctx_dim, cfg.ffn_dim, bias=False)
+                self.durable_deck_out = nn.Linear(cfg.ffn_dim * 3, 1)
+                nn.init.zeros_(self.durable_deck_out.weight)
+                nn.init.zeros_(self.durable_deck_out.bias)
+                deck_size_fc1 = nn.Linear(DURABLE_DECK_SIZE_DIM + rev_dim, cfg.ffn_dim)
+                nn.init.normal_(deck_size_fc1.weight, mean=0.0, std=0.25)
+                nn.init.zeros_(deck_size_fc1.bias)
+                deck_size_out = nn.Linear(cfg.ffn_dim, 1)
+                nn.init.zeros_(deck_size_out.weight)
+                nn.init.zeros_(deck_size_out.bias)
+                self.durable_deck_size_head = nn.Sequential(
+                    deck_size_fc1,
+                    nn.SiLU(),
+                    deck_size_out,
+                )
+                self.durable_deck_size_linear = nn.Linear(DURABLE_DECK_SIZE_DIM, 1, bias=False)
+                nn.init.zeros_(self.durable_deck_size_linear.weight)
         if actor_critic.enable_hierarchical_branch_policy:
             branch_context_blocks = 3 + int(actor_critic.enable_direct_vitals_context)
             branch_dim = cfg.d_model * branch_context_blocks + cfg.recurrent_hidden_dim
@@ -510,23 +638,358 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         world: WorldEncoding,
         zone_ids: Tensor,
         owner_ids: Tensor,
+        *,
+        token_weights: Tensor | None = None,
     ) -> Tensor:
         batch_size = int(world.tokens.shape[0])
         build_mask = self._persistent_token_mask(zone_ids, owner_ids, world.world_mask)
         null_token = self.world_null_token.expand(batch_size, -1, -1)
         keys = torch.cat([null_token, world.tokens], dim=1)
-        null_mask = torch.ones((batch_size, 1), dtype=torch.bool, device=world.tokens.device)
-        key_mask = torch.cat([null_mask, build_mask], dim=1)
         queries = self.persistent_build_queries.expand(batch_size, -1, -1)
-        delta, _ = self.persistent_build_attn(
-            queries,
-            keys,
-            keys,
-            key_padding_mask=~key_mask,
-            need_weights=False,
-        )
+        if token_weights is None:
+            null_mask = torch.ones((batch_size, 1), dtype=torch.bool, device=world.tokens.device)
+            key_mask = torch.cat([null_mask, build_mask], dim=1)
+            delta, _ = self.persistent_build_attn(
+                queries,
+                keys,
+                keys,
+                key_padding_mask=~key_mask,
+                need_weights=False,
+            )
+        else:
+            eff_w = torch.where(
+                build_mask,
+                token_weights.to(dtype=world.tokens.dtype),
+                torch.zeros_like(token_weights, dtype=world.tokens.dtype),
+            )
+            null_w = torch.ones((batch_size, 1), dtype=world.tokens.dtype, device=world.tokens.device)
+            full_w = torch.cat([null_w, eff_w], dim=1)
+            key_log_bias = torch.where(
+                full_w > 0.0,
+                torch.log(full_w.clamp_min(1e-12)),
+                torch.full_like(full_w, -1e9),
+            )
+            delta, _ = self.persistent_build_attn(
+                queries,
+                keys,
+                keys,
+                key_padding_mask=key_log_bias,
+                need_weights=False,
+            )
         pooled: Tensor = self.persistent_build_norm(queries + delta).mean(dim=1)
         return pooled
+
+    def _prepare_draw_weighted_persistent_world(
+        self,
+        world: WorldTokenBatch,
+    ) -> _PreparedPersistentWorld:
+        dtype = world.features.dtype
+        device = world.features.device
+        batch_size, world_cap, _ = world.features.shape
+        pers_mask = self._persistent_token_mask(world.zone_ids, world.owner_ids, world.mask)
+        is_mapping_item = world.type_ids.eq(self._mapping_item_type_id)
+        deck_card_mask = (
+            pers_mask
+            & world.zone_ids.eq(DECK_ZONE_ID)
+            & is_mapping_item
+            & ((world.features[:, :, 1] - 0.1875).abs() < 1e-4)
+        )
+        has_deck = deck_card_mask.any(dim=1)
+        raw_qty_slot = world.features[:, :, DECK_QUANTITY_SLOT].clamp(0.0, 0.8)
+        card_qty = torch.where(
+            deck_card_mask,
+            torch.expm1(10.0 * raw_qty_slot).round().clamp_min(1.0),
+            torch.zeros((batch_size, world_cap), dtype=dtype, device=device),
+        )
+        deck_size = card_qty.sum(dim=1)
+        draw_prob = card_qty / deck_size.unsqueeze(1).clamp_min(1.0)
+        card_weight = DECK_REFERENCE_SIZE * draw_prob
+
+        deck_seq_mask = (
+            pers_mask
+            & world.zone_ids.eq(DECK_ZONE_ID)
+            & (~is_mapping_item)
+            & ((world.features[:, :, 2] - 0.125).abs() < 1e-4)
+        )
+        deck_label_mask = (
+            pers_mask
+            & world.zone_ids.eq(DECK_ZONE_ID)
+            & is_mapping_item
+            & ((world.features[:, :, 1] - 0.3125).abs() < 1e-4)
+        )
+
+        rel_ids = world.relation_binding_ids
+        valid_rel = rel_ids > 1
+        mod_mask = pers_mask & world.zone_ids.eq(MODIFIER_ZONE_ID)
+        match_mod = (
+            (mod_mask & valid_rel).unsqueeze(2)
+            & (deck_card_mask & valid_rel).unsqueeze(1)
+            & rel_ids.unsqueeze(2).eq(rel_ids.unsqueeze(1))
+        )
+        mod_parent_count = match_mod.to(dtype=dtype).sum(dim=2)
+        has_mod_parent = mod_parent_count > 0.0
+        mod_weight = (
+            torch.einsum("buv,bv->bu", match_mod.to(dtype=dtype), card_weight)
+            / mod_parent_count.clamp_min(1.0)
+        )
+        mod_parent_entity_id = (
+            torch.where(match_mod, world.entity_ids.unsqueeze(1).expand(-1, world_cap, -1), 0)
+            .max(dim=2)
+            .values
+        )
+
+        player_owned = world.owner_ids.eq(self._player_owner_id) & world.mask.bool()
+        card_rel_match = (
+            (player_owned & valid_rel).unsqueeze(2)
+            & (deck_card_mask & valid_rel).unsqueeze(1)
+            & rel_ids.unsqueeze(2).eq(rel_ids.unsqueeze(1))
+        )
+        has_card_rel = card_rel_match.any(dim=2)
+        label_seq_mask = (
+            player_owned
+            & (~is_mapping_item)
+            & (~world.zone_ids.eq(MODIFIER_ZONE_ID))
+            & ((world.features[:, :, 2] - 0.25).abs() < 1e-4)
+            & has_card_rel
+        )
+        seq_len = torch.where(
+            label_seq_mask,
+            (world.features[:, :, 1] * 64.0).round().long().clamp_min(0),
+            torch.zeros((batch_size, world_cap), dtype=torch.long, device=device),
+        )
+        seq_end = seq_len.cumsum(dim=1)
+        seq_start = seq_end - seq_len
+        label_ord = deck_label_mask.long().cumsum(dim=1) - 1
+        counts_exact = (seq_len.sum(dim=1) == deck_label_mask.long().sum(dim=1)) & has_deck
+        in_seq_span = (
+            counts_exact.view(batch_size, 1, 1)
+            & deck_label_mask.unsqueeze(2)
+            & label_seq_mask.unsqueeze(1)
+            & (label_ord.unsqueeze(2) >= seq_start.unsqueeze(1))
+            & (label_ord.unsqueeze(2) < seq_end.unsqueeze(1))
+        )
+        match_label = (
+            torch.einsum(
+                "bus,bsv->buv",
+                in_seq_span.to(dtype=dtype),
+                card_rel_match.to(dtype=dtype),
+            )
+            > 0.5
+        )
+        label_parent_count = match_label.to(dtype=dtype).sum(dim=2)
+        has_label_parent = label_parent_count > 0.0
+        label_weight_matched = (
+            torch.einsum("buv,bv->bu", match_label.to(dtype=dtype), card_weight)
+            / label_parent_count.clamp_min(1.0)
+        )
+        def_ids = world.definition_binding_ids
+        same_def = (
+            deck_label_mask.unsqueeze(2)
+            & deck_label_mask.unsqueeze(1)
+            & def_ids.unsqueeze(2).eq(def_ids.unsqueeze(1))
+        )
+        same_def_count = same_def.to(dtype=dtype).sum(dim=2).clamp_min(1.0)
+        label_weight = torch.where(has_label_parent, label_weight_matched, 1.0 / same_def_count)
+
+        kept_deck_zone = deck_card_mask | deck_seq_mask | deck_label_mask
+        eff_mask = torch.where(
+            has_deck.unsqueeze(1) & world.zone_ids.eq(DECK_ZONE_ID),
+            kept_deck_zone,
+            pers_mask,
+        )
+        token_weights = torch.where(
+            eff_mask,
+            torch.ones((batch_size, world_cap), dtype=dtype, device=device),
+            torch.zeros((batch_size, world_cap), dtype=dtype, device=device),
+        )
+        active_deck_row = has_deck.unsqueeze(1)
+        token_weights = torch.where(active_deck_row & deck_card_mask, card_weight, token_weights)
+        token_weights = torch.where(active_deck_row & has_mod_parent, mod_weight, token_weights)
+        token_weights = torch.where(active_deck_row & deck_label_mask, label_weight, token_weights)
+
+        features = world.features.clone()
+        seq_rows = active_deck_row & deck_seq_mask
+        features[:, :, 1] = torch.where(
+            seq_rows,
+            (deck_size.unsqueeze(1) / 64.0).clamp(0.0, 1.0),
+            features[:, :, 1],
+        )
+        card_rows = active_deck_row & deck_card_mask
+        label_rows = active_deck_row & deck_label_mask
+        mod_item_mask = mod_mask & is_mapping_item
+        mod_item_rows = active_deck_row & has_mod_parent & mod_item_mask
+        for slot in (2, 3, 5, DECK_FLOOR_ADDED_SLOT, DECK_QUANTITY_SLOT):
+            if slot < features.shape[-1]:
+                features[:, :, slot] = torch.where(card_rows, 0.0, features[:, :, slot])
+        features[:, :, 2] = torch.where(label_rows | mod_item_rows, 0.0, features[:, :, 2])
+
+        canon_order_ids = torch.where(card_rows | label_rows | mod_item_rows, 0, world.order_ids)
+        canon_aux_ids = torch.where(card_rows, world.entity_ids, world.entity_aux_ids)
+        canon_aux_ids = torch.where(
+            active_deck_row & has_mod_parent,
+            mod_parent_entity_id,
+            canon_aux_ids,
+        )
+
+        child_uv = (match_mod & mod_item_mask.unsqueeze(2)) | match_label
+        prepared_world = WorldTokenBatch(
+            features=features,
+            type_ids=world.type_ids,
+            role_ids=world.role_ids,
+            owner_ids=world.owner_ids,
+            entity_ids=world.entity_ids,
+            entity_aux_ids=canon_aux_ids,
+            definition_binding_ids=world.definition_binding_ids,
+            relation_binding_ids=world.relation_binding_ids,
+            zone_ids=world.zone_ids,
+            order_ids=canon_order_ids,
+            mask=eff_mask,
+        )
+        return _PreparedPersistentWorld(
+            world=prepared_world,
+            token_weights=token_weights,
+            deck_card_mask=deck_card_mask,
+            draw_prob=draw_prob,
+            deck_size=deck_size,
+            has_deck=has_deck,
+            child_uv=child_uv,
+        )
+
+    @staticmethod
+    def _weighted_multihead_attention(
+        mha: nn.MultiheadAttention,
+        query: Tensor,
+        key_value: Tensor,
+        key_log_bias: Tensor,
+    ) -> Tensor:
+        batch_size, q_len, d_model = query.shape
+        _, k_len, _ = key_value.shape
+        n_heads = mha.num_heads
+        head_dim = d_model // n_heads
+        w_q, w_k, w_v = mha.in_proj_weight.chunk(3, dim=0)
+        if mha.in_proj_bias is not None:
+            b_q, b_k, b_v = mha.in_proj_bias.chunk(3, dim=0)
+        else:
+            b_q = b_k = b_v = None
+        q = nn.functional.linear(query, w_q, b_q).view(batch_size, q_len, n_heads, head_dim).transpose(1, 2)
+        k = nn.functional.linear(key_value, w_k, b_k).view(batch_size, k_len, n_heads, head_dim).transpose(1, 2)
+        v = nn.functional.linear(key_value, w_v, b_v).view(batch_size, k_len, n_heads, head_dim).transpose(1, 2)
+        attn_mask = key_log_bias.to(dtype=q.dtype)[:, None, None, :]
+        dropout_p = float(mha.dropout) if mha.training else 0.0
+        out = nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+        )
+        merged = out.transpose(1, 2).contiguous().view(batch_size, q_len, d_model)
+        return nn.functional.linear(merged, mha.out_proj.weight, mha.out_proj.bias)
+
+    @classmethod
+    def _weighted_world_encoder_forward(
+        cls,
+        encoder: nn.TransformerEncoder,
+        tokens: Tensor,
+        key_log_bias: Tensor,
+    ) -> Tensor:
+        h = tokens
+        for mod in encoder.layers:
+            if not isinstance(mod, nn.TransformerEncoderLayer):
+                raise TypeError(f"Unsupported world_encoder layer type: {type(mod)!r}")
+            if mod.norm_first:
+                normed = mod.norm1(h)
+                sa = cls._weighted_multihead_attention(mod.self_attn, normed, normed, key_log_bias)
+                h = h + mod.dropout1(sa)
+                ff = mod.linear2(mod.dropout(mod.activation(mod.linear1(mod.norm2(h)))))
+                h = h + mod.dropout2(ff)
+            else:
+                sa = cls._weighted_multihead_attention(mod.self_attn, h, h, key_log_bias)
+                h = mod.norm1(h + mod.dropout1(sa))
+                ff = mod.linear2(mod.dropout(mod.activation(mod.linear1(h))))
+                h = mod.norm2(h + mod.dropout2(ff))
+        if encoder.norm is not None:
+            h = encoder.norm(h)
+        return h
+
+    def _encode_world_with_weights(
+        self,
+        world: WorldTokenBatch,
+        domain_ids: Tensor,
+        token_weights: Tensor,
+        *,
+        _validated: bool = False,
+    ) -> tuple[WorldEncoding, Tensor]:
+        if _validated:
+            batch_size = int(world.features.shape[0])
+        else:
+            batch_size, _ = world.validate(self.config)
+        cfg = self.config
+        domain_ids = domain_ids.long().clamp(min=0, max=cfg.domain_count - 1)
+        world_mask = world.mask.bool() & (token_weights > 0.0)
+        raw_world_tokens = self.token_embedder(
+            world.features,
+            type_ids=world.type_ids,
+            role_ids=world.role_ids,
+            owner_ids=world.owner_ids,
+            entity_ids=world.entity_ids,
+            entity_aux_ids=world.entity_aux_ids,
+            zone_ids=world.zone_ids,
+            order_ids=world.order_ids,
+            segment_id=0,
+        )
+        world_tokens = raw_world_tokens * world_mask.unsqueeze(-1).to(dtype=raw_world_tokens.dtype)
+
+        null_token = self.world_null_token.expand(batch_size, -1, -1)
+        encoded_tokens = torch.cat([null_token, world_tokens], dim=1)
+        null_weight = torch.ones(
+            (batch_size, 1),
+            dtype=raw_world_tokens.dtype,
+            device=raw_world_tokens.device,
+        )
+        full_weights = torch.cat(
+            [null_weight, token_weights.to(dtype=raw_world_tokens.dtype)],
+            dim=1,
+        )
+        neg_mask_val = -1e4 if raw_world_tokens.dtype == torch.float16 else -1e9
+        key_log_bias = torch.where(
+            full_weights > 0.0,
+            torch.log(full_weights.clamp_min(1e-12)),
+            torch.full_like(full_weights, neg_mask_val),
+        )
+        encoded_tokens = self._weighted_world_encoder_forward(
+            self.world_encoder,
+            encoded_tokens,
+            key_log_bias,
+        )
+        relation_tokens = encoded_tokens[:, 1:] * world_mask.unsqueeze(-1).to(
+            dtype=encoded_tokens.dtype
+        )
+
+        domain_context = self.domain_embedding(domain_ids).unsqueeze(1)
+        latent_queries = self.latent_queries.expand(batch_size, -1, -1) + domain_context
+        latent_delta = self._weighted_multihead_attention(
+            self.world_to_latent,
+            latent_queries,
+            encoded_tokens,
+            key_log_bias,
+        )
+        latents = self.world_to_latent_norm(latent_queries + latent_delta)
+        latents = self.latent_encoder(latents)
+        state_embedding = self.state_norm(latents.mean(dim=1))
+        return (
+            WorldEncoding(
+                latents=latents,
+                state_embedding=state_embedding,
+                tokens=relation_tokens,
+                world_mask=world_mask,
+                entity_ids=world.entity_ids,
+                entity_aux_ids=world.entity_aux_ids,
+                definition_binding_ids=world.definition_binding_ids,
+                relation_binding_ids=world.relation_binding_ids,
+            ),
+            world_tokens,
+        )
 
     def _extract_scaled_vitals(
         self,
@@ -641,6 +1104,26 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         vitals_emb: Tensor = self.persistent_vitals_encoder(raw_vitals)
         return vitals_emb, raw_vitals
 
+    @staticmethod
+    def _scale_card_and_modifier_features(features: Tensor) -> Tensor:
+        scaled = features.clone()
+        slot_end = min(int(scaled.shape[-1]), NUMERIC_FACT_SLOT_END)
+        if slot_end > NUMERIC_FACT_SLOT_START:
+            num_block = scaled[:, :, NUMERIC_FACT_SLOT_START:slot_end]
+            scaled[:, :, NUMERIC_FACT_SLOT_START:slot_end] = torch.where(
+                num_block.abs() >= 0.99,
+                num_block,
+                num_block * 8.0,
+            )
+        if scaled.shape[-1] > 198:
+            mod_block = scaled[:, :, 198:]
+            scaled[:, :, 198:] = torch.where(
+                mod_block.abs() >= 0.99,
+                mod_block,
+                mod_block * 8.0,
+            )
+        return scaled
+
     def _durable_readout(
         self,
         *,
@@ -650,6 +1133,11 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         raw_vitals: Tensor | None = None,
         run_memory: Tensor,
         revival_context: Tensor | None = None,
+        card_repr: Tensor | None = None,
+        card_raw_feats: Tensor | None = None,
+        draw_prob: Tensor | None = None,
+        deck_size: Tensor | None = None,
+        has_deck: Tensor | None = None,
     ) -> Tensor:
         parts = [world_state_embedding]
         if build_embedding is not None:
@@ -672,6 +1160,60 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 out = out + self.durable_vitals_linear(
                     raw_vitals[:, -SALIENT_VITALS_DIM:]
                 ).squeeze(-1)
+        if (
+            self.actor_critic_config.enable_draw_weighted_durable_value
+            and card_repr is not None
+            and card_raw_feats is not None
+            and draw_prob is not None
+            and deck_size is not None
+            and has_deck is not None
+        ):
+            deck_ctx_parts = [world_state_embedding]
+            if vitals_embedding is not None:
+                deck_ctx_parts.append(vitals_embedding)
+            deck_ctx_parts.append(run_memory)
+            if rev_scaled is not None:
+                deck_ctx_parts.append(rev_scaled)
+            deck_ctx = (
+                0.5
+                * self.durable_deck_ctx_fc(
+                    self.durable_deck_ctx_norm(torch.cat(deck_ctx_parts, dim=-1))
+                ).unsqueeze(1)
+            )
+            card_hidden = nn.functional.silu(
+                self.durable_deck_card_fc(self.durable_deck_norm(card_repr)) + deck_ctx
+            )
+            raw_hidden = nn.functional.silu(self.durable_deck_raw_fc(card_raw_feats))
+            bilinear_card = torch.cat(
+                [card_hidden, raw_hidden, card_hidden * raw_hidden],
+                dim=-1,
+            )
+            card_utilities = self.durable_deck_out(bilinear_card).squeeze(-1)
+            expected_card_utility = torch.einsum("bw,bw->b", draw_prob, card_utilities)
+            has_deck_f = has_deck.to(dtype=out.dtype)
+            safe_n = deck_size.clamp_min(1.0)
+            deck_size_vec = (
+                torch.stack(
+                    [
+                        ((safe_n - DECK_REFERENCE_SIZE) / 10.0).clamp(-1.2, 5.0),
+                        (safe_n - 20.0).clamp_min(0.0) / 10.0,
+                        (DECK_REFERENCE_SIZE / safe_n).clamp(0.0, 4.0) - 1.0,
+                        torch.log1p(safe_n) - math.log1p(DECK_REFERENCE_SIZE),
+                    ],
+                    dim=-1,
+                )
+                * has_deck_f.unsqueeze(-1)
+            )
+            deck_size_in = (
+                torch.cat([deck_size_vec, rev_scaled], dim=-1)
+                if rev_scaled is not None
+                else deck_size_vec
+            )
+            deck_size_delta = (
+                self.durable_deck_size_head(deck_size_in).squeeze(-1)
+                + self.durable_deck_size_linear(deck_size_vec).squeeze(-1)
+            ) * has_deck_f
+            out = out + expected_card_utility + deck_size_delta
         if rev_scaled is not None:
             out = (
                 out
@@ -725,21 +1267,73 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             device=world.features.device,
             dtype=world.features.dtype,
         )
-        pers_world = self._mask_world_to_persistent(world)
         zero_domains = torch.zeros(
             (batch_size,),
             dtype=torch.long,
             device=world.features.device,
         )
-        pers_enc = self.encode_world(pers_world, zero_domains, _validated=not validate)
+        card_repr: Tensor | None = None
+        card_raw_feats: Tensor | None = None
+        draw_prob: Tensor | None = None
+        deck_size: Tensor | None = None
+        has_deck: Tensor | None = None
+        token_weights: Tensor | None = None
+        if self.actor_critic_config.enable_draw_weighted_durable_value:
+            prep = self._prepare_draw_weighted_persistent_world(world)
+            pers_world = prep.world
+            token_weights = prep.token_weights
+            draw_prob = prep.draw_prob
+            deck_size = prep.deck_size
+            has_deck = prep.has_deck
+            pers_enc, raw_world_tokens = self._encode_world_with_weights(
+                pers_world,
+                zero_domains,
+                token_weights,
+                _validated=not validate,
+            )
+            child_uv_f = prep.child_uv.to(dtype=pers_enc.tokens.dtype)
+            per_card_child_w = child_uv_f / child_uv_f.sum(dim=2, keepdim=True).clamp_min(1.0)
+            child_tok_sum = torch.einsum("buv,bud->bvd", per_card_child_w, pers_enc.tokens)
+            scaled_feats = self._scale_card_and_modifier_features(
+                pers_world.features.to(dtype=pers_enc.tokens.dtype)
+            )
+            child_feat_sum = torch.einsum("buv,buf->bvf", per_card_child_w, scaled_feats)
+            card_mask_f = prep.deck_card_mask.unsqueeze(-1).to(dtype=pers_enc.tokens.dtype)
+            card_repr = (
+                torch.cat([pers_enc.tokens, raw_world_tokens, child_tok_sum], dim=-1)
+                * card_mask_f
+            )
+            card_raw_feats = (
+                torch.cat([scaled_feats, child_feat_sum], dim=-1)
+                * card_mask_f
+            )
+        else:
+            pers_world = self._mask_world_to_persistent(world)
+            pers_enc = self.encode_world(pers_world, zero_domains, _validated=not validate)
         pers_run = self.run_recurrent_norm(
             self.run_recurrent_cell(pers_enc.state_embedding, previous_run)
         )
         build_emb = (
-            self._pool_persistent_build(pers_enc, pers_world.zone_ids, pers_world.owner_ids)
+            self._pool_persistent_build(
+                pers_enc,
+                pers_world.zone_ids,
+                pers_world.owner_ids,
+                token_weights=token_weights,
+            )
             if self.actor_critic_config.enable_persistent_build_context
             else None
         )
+        if (
+            build_emb is not None
+            and card_repr is not None
+            and draw_prob is not None
+            and self.actor_critic_config.enable_draw_weighted_durable_value
+        ):
+            build_emb = build_emb + torch.einsum(
+                "bw,bwd->bd",
+                draw_prob.to(dtype=build_emb.dtype),
+                self.persistent_build_deck_proj(card_repr),
+            )
         vitals_emb: Tensor | None = None
         raw_vitals: Tensor | None = None
         if self.actor_critic_config.enable_direct_vitals_context:
@@ -751,6 +1345,11 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             raw_vitals=raw_vitals,
             run_memory=pers_run,
             revival_context=rev_ctx,
+            card_repr=card_repr,
+            card_raw_feats=card_raw_feats,
+            draw_prob=draw_prob,
+            deck_size=deck_size,
+            has_deck=has_deck,
         )
         return durable_val, pers_run
 
@@ -1078,6 +1677,22 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         raw_logits = self.candidate_policy_head(
             torch.cat([base.candidate_embeddings, state, memory], dim=-1)
         ).squeeze(-1)
+        if self.actor_critic_config.enable_role_conditioned_candidate_policy:
+            bounded_roles = batch.candidates.role_ids.long().clamp(
+                min=0,
+                max=self.config.role_vocab_size - 1,
+            )
+            role_emb = self.token_embedder.role_embedding(bounded_roles)
+            cand_modulated = base.candidate_embeddings * torch.tanh(
+                self.candidate_role_gate(role_emb)
+            )
+            role_delta = self.candidate_role_policy_head(
+                torch.cat(
+                    [cand_modulated, base.candidate_embeddings, role_emb, state],
+                    dim=-1,
+                )
+            ).squeeze(-1)
+            raw_logits = raw_logits + role_delta
         if self.actor_critic_config.enable_hierarchical_branch_policy:
             salient_for_actor = (
                 raw_vitals[:, -SALIENT_VITALS_DIM:]
@@ -1186,6 +1801,66 @@ def initialize_actor_critic_from_iql(
     }
 
 
+def initialize_actor_critic_from_macro_publication(
+    model: HybridDomainActorCriticModel,
+    source_state: dict[str, Tensor],
+) -> dict[str, tuple[str, ...]]:
+    """Hot-start an actor-critic from a parent macro-credit publication.
+
+    Every tensor in ``source_state`` must match an existing parameter in
+    ``model`` with identical shape (zero dropped parent weights), and any newly
+    added destination tensors must belong to ``V2_FRESH_TENSOR_PREFIXES`` under
+    ``has_v2_extensions``.
+    """
+
+    destination = model.state_dict()
+    loaded: dict[str, Tensor] = {}
+    unmatched_source: list[str] = []
+    for key, value in source_state.items():
+        if value.is_floating_point() and not bool(torch.isfinite(value).all().item()):
+            raise ValueError(f"hybrid macro publication tensor is non-finite: {key}")
+        target = destination.get(key)
+        if target is None or tuple(target.shape) != tuple(value.shape):
+            unmatched_source.append(key)
+            continue
+        loaded[key] = value
+    if unmatched_source:
+        raise ValueError(
+            "macro publication source tensors incompatible with destination model: "
+            + ", ".join(sorted(unmatched_source))
+        )
+    result = model.load_state_dict(loaded, strict=False)
+    required_prefixes = (
+        "candidate_policy_head.",
+        "state_value_head.",
+        "macro_stream.",
+        "combat_stream.",
+        "joint_stream.",
+    )
+    absent = [
+        prefix for prefix in required_prefixes if not any(key.startswith(prefix) for key in loaded)
+    ]
+    if absent:
+        raise ValueError("macro publication source misses: " + ", ".join(absent))
+    unexpected_fresh = [
+        name
+        for name in result.missing_keys
+        if not (
+            model.actor_critic_config.has_v2_extensions
+            and name.startswith(V2_FRESH_TENSOR_PREFIXES)
+        )
+    ]
+    if unexpected_fresh:
+        raise ValueError(
+            "macro publication leaves non-extension tensors uninitialized: "
+            + ", ".join(sorted(unexpected_fresh))
+        )
+    return {
+        "inherited": tuple(sorted(loaded)),
+        "fresh": tuple(sorted(result.missing_keys)),
+    }
+
+
 __all__ = [
     "CRITIC_REVIVAL_CONTEXT_DIM",
     "HYBRID_ACTOR_CRITIC_MODEL_VERSION",
@@ -1197,4 +1872,5 @@ __all__ = [
     "HybridDomainActorCriticModel",
     "hierarchical_greedy_action_index",
     "initialize_actor_critic_from_iql",
+    "initialize_actor_critic_from_macro_publication",
 ]

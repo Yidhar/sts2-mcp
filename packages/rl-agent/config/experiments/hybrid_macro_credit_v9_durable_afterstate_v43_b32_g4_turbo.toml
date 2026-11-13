@@ -1,0 +1,104 @@
+# Durable Afterstate Macro Credit v4.3 (b32) — Draw-Weighted Split-Invariant V_durable + Role-Conditioned Candidate Polarity
+# Tuned for 48-thread AMD EPYC 9B45 + NVIDIA RTX PRO 6000 Blackwell (96 GB VRAM, 600W):
+# 1. Draw-Probability Weighted & Multiset-Split-Invariant V_durable (enable_draw_weighted_durable_value = true):
+#    Weights every deck card root & modifier/label child by physical draw share p_i = q_i / N_deck (scaled to 12.0),
+#    canonicalizes instance/order/floor/quantity artifacts across orderless deck multisets (|V(5x) - V(4x+1x)| < 1e-6),
+#    and adds a direct Draw-Expected Card Utility highway + physical N_deck residual so Smith(Strike) loses its
+#    spurious +1 multiset-row bonus and Shop Remove / Card Skip obey exact deck-thinning algebra.
+# 2. Multiplicative Role-Conditioned Candidate Policy Residual (enable_role_conditioned_candidate_policy = true):
+#    Couples candidate embeddings multiplicatively with role_embedding(role_ids) so shop:remove can invert card
+#    ranking polarity (-u(card)) relative to rest_site:smith / card_reward:take (+u(card)).
+# 3. Asymmetric Revival Critic + Identity-Pure Persistent World + Exact IEEE-754 FP32 Recurrence (revival_budget = 32,
+#    seed_index_offset = 110000).
+version = "sts2-synchronous-macro-credit-course-v1"
+
+[course]
+roots_per_cohort = 48
+seed_index_offset = 110000
+parallel_collectors = 48
+macro_branch_epsilon = 0.04
+maximum_root_snapshot_bytes = 536870912
+maximum_cohort_snapshot_bytes = 8589934592
+maximum_root_seconds = 3600.0
+maximum_cohort_seconds = 7200.0
+maximum_output_bytes = 68719476736
+minimum_free_disk_bytes = 2147483648
+
+[branches]
+root_surface = "reward"
+root_occurrence = 1
+continuation_macro_decisions = 0
+terminal_only = true
+max_native_steps = 8192
+max_candidates = 128
+timeout_seconds = 1200.0
+max_trace_bytes = 536870912
+policy_atol = 0.000001
+policy_rtol = 0.00001
+
+[learner]
+target_mode = "durable_afterstate_v2"
+enable_direct_vitals_context = true
+enable_macro_branch_prior = true
+enable_persistent_only_durable_value = true
+enable_asymmetric_revival_critic = true
+enable_draw_weighted_durable_value = true
+enable_role_conditioned_candidate_policy = true
+revival_budget = 32
+zero_macro_pace_penalty = true
+clip_macro_pg_fallback = true
+macro_pg_clip_eps = 0.20
+macro_pg_adv_clip = 0.25
+macro_pg_kl_weight = 0.05
+macro_pg_within_branch_entropy_only = true
+separate_value_grad_clip = true
+learning_rate = 0.00015
+shared_learning_rate_scale = 0.25
+weight_decay = 0.01
+macro_trace_lambda = 0.95
+macro_kl = 0.04
+durable_warmup_updates = 5
+combat_actor_warmup_updates = 10
+macro_entropy_weight = 0.015
+durable_post_value_weight = 0.5
+chunk_steps = 16
+combat_unroll_steps = 16
+eval_batch_size = 48
+chunk_batch_size = 96
+allow_tf32 = false
+macro_policy_weight = 1.0
+macro_value_weight = 0.5
+combat_policy_weight = 0.25
+combat_value_weight = 0.5
+combat_entropy_weight = 0.0005
+rho_clip = 1.1
+c_clip = 1.0
+policy_rho_clip = 1.1
+gradient_clip_norm = 1.0
+likelihood_tolerance = 0.02
+
+[training.transaction_learning]
+enabled = false
+
+[training.failure_credit]
+mode = "disabled"
+
+[training.episodic_learning]
+enabled = false
+
+[training.rollout]
+deterministic_probe_interval_episodes = 0
+deterministic_probe_environment_steps = []
+
+[training.curriculum]
+revival_budget = 32
+epsilon_start = 0.0
+epsilon_end = 0.0
+
+[training.runtime]
+rocm_sdpa_backend = "math"
+seed = 6700000
+evaluation_steps = []
+early_evaluation_steps = []
+final_audit_steps = []
+evaluation_liveness_guard_enabled = false

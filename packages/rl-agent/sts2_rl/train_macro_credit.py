@@ -252,6 +252,10 @@ def _actor_critic_config(config: MacroTrainingConfig) -> HybridActorCriticConfig
             enable_macro_branch_prior=config.learner.enable_macro_branch_prior,
             enable_persistent_only_durable_value=config.learner.enable_persistent_only_durable_value,
             enable_asymmetric_revival_critic=config.learner.enable_asymmetric_revival_critic,
+            enable_draw_weighted_durable_value=config.learner.enable_draw_weighted_durable_value,
+            enable_role_conditioned_candidate_policy=(
+                config.learner.enable_role_conditioned_candidate_policy
+            ),
         )
     return HybridActorCriticConfig(grounded)
 

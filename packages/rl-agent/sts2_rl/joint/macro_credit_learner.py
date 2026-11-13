@@ -75,6 +75,8 @@ class MacroCreditLearnerConfig:
     enable_macro_branch_prior: bool = False
     enable_persistent_only_durable_value: bool = False
     enable_asymmetric_revival_critic: bool = False
+    enable_draw_weighted_durable_value: bool = False
+    enable_role_conditioned_candidate_policy: bool = False
     revival_budget: int = 0
     zero_macro_pace_penalty: bool = False
     clip_macro_pg_fallback: bool = False
@@ -91,12 +93,18 @@ class MacroCreditLearnerConfig:
             "enable_macro_branch_prior",
             "enable_persistent_only_durable_value",
             "enable_asymmetric_revival_critic",
+            "enable_draw_weighted_durable_value",
+            "enable_role_conditioned_candidate_policy",
             "zero_macro_pace_penalty",
             "clip_macro_pg_fallback",
             "macro_pg_within_branch_entropy_only",
         ):
             if not isinstance(getattr(self, bool_name), bool):
                 raise ValueError(f"macro credit {bool_name} must be a boolean")
+        if self.enable_draw_weighted_durable_value and not self.enable_persistent_only_durable_value:
+            raise ValueError(
+                "macro credit enable_draw_weighted_durable_value requires enable_persistent_only_durable_value=True"
+            )
         if self.target_mode not in {"counterfactual_rollout", "combat_shadow_price", "durable_afterstate_v2"}:
             raise ValueError(
                 "macro credit target_mode must be 'counterfactual_rollout', "
@@ -312,6 +320,8 @@ class MacroCreditLearner:
                 "run_recurrent",
                 "branch_policy_head",
                 "branch_vitals_head",
+                "candidate_role_",
+                "durable_deck_",
                 "durable_revival_",
                 "durable_value_head",
                 "durable_vitals_",
@@ -332,6 +342,7 @@ class MacroCreditLearner:
         value_prefixes = (
             "state_value_head",
             "state_revival_",
+            "durable_deck_",
             "durable_value_head",
             "durable_vitals_",
             "durable_revival_",
@@ -355,10 +366,12 @@ class MacroCreditLearner:
             "macro_stream_norm",
             "combat_stream_norm",
             "candidate_policy_head",
+            "candidate_role_",
             "state_value_head",
             "state_revival_",
             "branch_policy_head",
             "branch_vitals_",
+            "durable_deck_",
             "durable_revival_",
             "durable_value_head",
             "durable_vitals_",

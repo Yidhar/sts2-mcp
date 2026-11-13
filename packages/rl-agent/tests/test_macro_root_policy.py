@@ -280,3 +280,84 @@ def test_macro_credit_publication_curriculum_transfer(
     assert policy.provenance["initialization_mode"] == "in_memory_model_initialization"
     assert policy.provenance["source_reward_identity"]["revival_budget"] == 64
     assert policy.provenance["reward_identity"]["revival_budget"] == 48
+
+
+def test_macro_credit_publication_durable_v4_to_v5_hot_start_preserves_step0_policy_and_fails_closed(
+    tmp_path: Path, config: TrainingConfig
+) -> None:
+    grounded = config.model.to_model_config()
+    v4_cfg = HybridActorCriticConfig.durable_v4(grounded)
+    v5_cfg = HybridActorCriticConfig.durable_v5(grounded)
+    source_v4 = HybridDomainActorCriticModel(v4_cfg).eval()
+    payload = {
+        "format": "sts2-hybrid-macro-credit-publication-v1",
+        "model_config": v4_cfg.as_mapping(),
+        "reward_identity": act_frontloaded_death_reward_identity(revival_budget=32),
+        "control_scores": "policy_logits",
+        "policy_version": 200,
+        "online": source_v4.state_dict(),
+    }
+    saved_path = _save(tmp_path, payload)
+    target_course = replace(config, curriculum=replace(config.curriculum, revival_budget=16))
+
+    # Without initialize_from_macro_publication, model_config mismatch is rejected.
+    with pytest.raises(ValueError, match="model_config differs"):
+        FrozenMacroRootPolicy(
+            saved_path,
+            replace(config, curriculum=replace(config.curriculum, revival_budget=32)),
+            "cpu",
+            initialize_from_macro_publication=False,
+            actor_critic_config=v5_cfg,
+        )
+
+    # Disabling a parent v2 capability flag is rejected fail-closed.
+    with pytest.raises(ValueError, match="cannot disable parent flag"):
+        FrozenMacroRootPolicy(
+            saved_path,
+            target_course,
+            "cpu",
+            initialize_from_macro_publication=True,
+            actor_critic_config=HybridActorCriticConfig.durable_v3(grounded),
+        )
+
+    # Monotonic v4 -> v5 hot-start inherits 100% of v4 weights and preserves exact step-0 logits.
+    policy = FrozenMacroRootPolicy(
+        saved_path,
+        target_course,
+        "cpu",
+        initialize_from_macro_publication=True,
+        actor_critic_config=v5_cfg,
+    )
+    assert policy.provenance["ignored_source_tensor_names"] == []
+    assert policy.provenance["loaded_tensor_count"] == len(source_v4.state_dict())
+    assert len(policy.provenance["fresh_tensor_names"]) > 0
+    assert all(
+        name.startswith(("candidate_role_", "durable_deck_", "persistent_build_deck_proj."))
+        for name in policy.provenance["fresh_tensor_names"]
+    )
+    snap = _snapshot(config)
+    encoded = collate_encoded_snapshots(
+        (snap,),
+        expected_config=policy.encoding_config,
+        expected_fingerprint=snap.encoding_fingerprint,
+        device="cpu",
+    )
+    with torch.no_grad():
+        expected = source_v4(encoded, source_v4.initial_state(1, device="cpu"))
+    logits, hidden = policy.forward(snap, None)
+    torch.testing.assert_close(logits, expected.policy_logits[0], rtol=0, atol=0)
+    torch.testing.assert_close(hidden, expected.recurrent_state, rtol=0, atol=0)
+
+    # Missing trunk tensor in source publication fails closed.
+    bad_payload = dict(payload, online=dict(payload["online"]))
+    del bad_payload["online"]["macro_stream.layers.0.linear1.weight"]
+    bad_path = tmp_path / "bad_network.pt"
+    torch.save(bad_payload, bad_path)
+    with pytest.raises(ValueError):
+        FrozenMacroRootPolicy(
+            bad_path,
+            target_course,
+            "cpu",
+            initialize_from_macro_publication=True,
+            actor_critic_config=v5_cfg,
+        )

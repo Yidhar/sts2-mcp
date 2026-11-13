@@ -2523,6 +2523,454 @@ def test_v4_2_dominated_loot_leave_suppression_and_within_branch_pg_entropy() ->
     assert m_b["parameter_delta_norm"] == pytest.approx(m_s["parameter_delta_norm"], abs=1e-5)
 
 
+def test_v4_3_draw_weighted_durable_value_exact_multiset_split_and_afterstate_invariance() -> None:
+    from sts2_rl.macro_competence_probes import probe_multiset_split_invariance
+    from sts2_rl.models.hybrid_actor_critic import initialize_actor_critic_from_macro_publication
+
+    torch.manual_seed(20261113)
+    cfg = _tiny_model_config()
+    encoder = GroundedObservationEncoder(cfg.to_encoding_config())
+    v4_model = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v4(cfg.to_model_config())).eval()
+    v5_model = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v5(cfg.to_model_config())).eval()
+    # Randomize non-zero readout heads on both v4 and v5 so every pathway is actively exercised.
+    with torch.no_grad():
+        for module in (v4_model.durable_value_head, v4_model.durable_vitals_head):
+            for param in module.parameters():
+                param.normal_(0.0, 0.25)
+    initialize_actor_critic_from_macro_publication(v5_model, v4_model.state_dict())
+    with torch.no_grad():
+        for module in (
+            v5_model.durable_deck_raw_fc,
+            v5_model.durable_deck_out,
+            v5_model.durable_deck_size_head,
+            v5_model.durable_deck_size_linear,
+            v5_model.persistent_build_deck_proj,
+        ):
+            for param in module.parameters():
+                param.normal_(0.0, 0.25)
+
+    strike = {
+        "id": "CARD.STRIKE_IRONCLAD",
+        "type": "Attack",
+        "rarity": "Basic",
+        "cost": 1,
+        "is_upgradable": True,
+        "is_removable": True,
+        "dynamic_vars": {"Damage": 6},
+        "keywords": ["strike", "retain"],
+        "traits": ["starter"],
+        "enchantments": [{"id": "SHARP", "amount": 2}],
+        "upgrade_preview": {
+            "id": "CARD.STRIKE_IRONCLAD",
+            "type": "Attack",
+            "rarity": "Basic",
+            "cost": 1,
+            "upgraded": True,
+            "dynamic_vars": {"Damage": 9},
+            "keywords": ["strike", "retain"],
+            "traits": ["starter"],
+            "enchantments": [{"id": "SHARP", "amount": 2}],
+        },
+    }
+    defend = {
+        "id": "CARD.DEFEND_IRONCLAD",
+        "type": "Skill",
+        "rarity": "Basic",
+        "cost": 1,
+        "is_upgradable": True,
+        "is_removable": True,
+        "dynamic_vars": {"Block": 5},
+    }
+
+    deck_grouped = [copy.deepcopy(strike) for _ in range(5)] + [copy.deepcopy(defend) for _ in range(4)]
+    s_inst = copy.deepcopy(strike)
+    s_inst["instance_id"] = "inst_42"
+    s_inst["floor_added_to_deck"] = 5
+    deck_split2 = [copy.deepcopy(strike) for _ in range(4)] + [s_inst] + [copy.deepcopy(defend) for _ in range(4)]
+
+    s_f0 = copy.deepcopy(strike)
+    s_f0["floor_added_to_deck"] = 0
+    s_f2 = copy.deepcopy(strike)
+    s_f2["floor_added_to_deck"] = 2
+    s_f6 = copy.deepcopy(strike)
+    s_f6["instance_id"] = "inst_99"
+    s_f6["floor_added_to_deck"] = 6
+    d_inst = copy.deepcopy(defend)
+    d_inst["instance_id"] = "def_7"
+    d_inst["floor_added_to_deck"] = 3
+    deck_split3 = (
+        [copy.deepcopy(s_f0) for _ in range(2)]
+        + [copy.deepcopy(s_f2) for _ in range(2)]
+        + [s_f6]
+        + [copy.deepcopy(defend) for _ in range(3)]
+        + [d_inst]
+    )
+
+    snaps = [encoder.encode_world_snapshot(_rest_surface(d)[0]) for d in (deck_grouped, deck_split2, deck_split3)]
+    wb, dom = collate_encoded_worlds(
+        snaps,
+        expected_config=snaps[0].config,
+        expected_fingerprint=snaps[0].encoding_fingerprint,
+        device="cpu",
+    )
+    with torch.no_grad():
+        vals_v4, _ = v4_model.forward_durable_value(wb, dom, validate=False)
+        vals_v5, run_v5 = v5_model.forward_durable_value(wb, dom, validate=False)
+
+    # v4 suffers orderless multiset-row splitting drift, while v5 is invariant to < 1e-6!
+    assert abs(float(vals_v4[0].item()) - float(vals_v4[1].item())) > 1e-4
+    assert abs(float(vals_v5[0].item()) - float(vals_v5[1].item())) < 1e-6
+    assert abs(float(vals_v5[0].item()) - float(vals_v5[2].item())) < 1e-6
+    assert float((run_v5[0] - run_v5[1]).abs().max().item()) < 1e-6
+    assert float((run_v5[0] - run_v5[2]).abs().max().item()) < 1e-6
+
+    probe_v5 = probe_multiset_split_invariance(v5_model, encoder)
+    assert probe_v5["durable_enabled"] is True
+    assert float(probe_v5["grouped_vs_split_abs_diff"]) < 1e-6
+
+    # Afterstate W_post from card_reward:take (no instance_id / floor_added_to_deck)
+    # matches real next-floor observation s_{t+1} (with instance_id & floor_added_to_deck) to < 1e-6!
+    inflame = {
+        "id": "CARD.INFLAME",
+        "type": "Power",
+        "rarity": "Uncommon",
+        "cost": 1,
+        "is_upgradable": True,
+        "is_removable": True,
+        "dynamic_vars": {"Strength": 2},
+    }
+    rew_obs = {
+        "phase": "rewards",
+        "decision_domain": "card_reward",
+        "run": {"active": True, "act": 1, "floor": 6, "ascension": 0},
+        "player": {
+            "character_id": "IRONCLAD",
+            "hp": 50,
+            "max_hp": 80,
+            "gold": 120,
+            "open_potion_slots": 2,
+            "deck": copy.deepcopy(deck_grouped),
+            "relics": [{"id": "BURNING_BLOOD", "has_upon_pickup_effect": False}],
+            "potions": [],
+        },
+        "rewards": {"cards": [copy.deepcopy(inflame)], "can_skip": True},
+    }
+    rew_legal = [
+        {
+            "action_id": "take_0",
+            "kind": "select_card_reward",
+            "model_action_kind": "card_reward",
+            "index": 0,
+            "is_enabled": True,
+            "card": copy.deepcopy(inflame),
+        },
+        {
+            "action_id": "skip",
+            "kind": "skip_card_reward",
+            "model_action_kind": "card_reward",
+            "index": 1,
+            "is_enabled": True,
+        },
+    ]
+    rew_dec = forward_decision(rew_obs, rew_legal, control_domain="macro")
+    assert rew_dec is not None
+    post_worlds = synthesize_deterministic_afterstates(
+        encoder=encoder,
+        observation=rew_obs,
+        decision=rew_dec,
+        candidates=rew_dec.candidates,
+    )
+    assert post_worlds is not None
+    inflame_real = copy.deepcopy(inflame)
+    inflame_real["instance_id"] = "reward_inst_999"
+    inflame_real["floor_added_to_deck"] = 6
+    real_next_obs = _rest_surface([*copy.deepcopy(deck_split2), inflame_real])[0]
+    real_next_obs["player"]["hp"] = 50
+    real_next_obs["player"]["gold"] = 120
+    real_next_snap = encoder.encode_world_snapshot(real_next_obs)
+    wb_cmp, dom_cmp = collate_encoded_worlds(
+        (post_worlds[0], real_next_snap),
+        expected_config=post_worlds[0].config,
+        expected_fingerprint=post_worlds[0].encoding_fingerprint,
+        device="cpu",
+    )
+    with torch.no_grad():
+        v_cmp, _ = v5_model.forward_durable_value(wb_cmp, dom_cmp, validate=False)
+    assert abs(float(v_cmp[0].item()) - float(v_cmp[1].item())) < 1e-6
+
+
+def test_v4_3_draw_thinning_algebra_and_role_conditioned_smith_vs_remove_polarity() -> None:
+    from sts2_rl.macro_competence_probes import (
+        _build_rest_probe_surface,
+        _build_shop_remove_probe_surface,
+        default_probe_decks,
+        probe_smith_vs_remove_divergence,
+    )
+    from sts2_rl.train_macro_credit import _actor_critic_config
+
+    torch.manual_seed(77)
+    cfg = _tiny_model_config()
+    encoder = GroundedObservationEncoder(cfg.to_encoding_config())
+    model = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v5(cfg.to_model_config()))
+    opt = torch.optim.AdamW(model.parameters(), lr=1.5e-3)
+
+    # 1. Train durable_v5 on factual build outcomes where high_scale/cost_drop > basic_d > basic_a
+    #    and verify exact deck-thinning, deck-bloat, & stack-neutral Smith ordering!
+    multiset_deck = copy.deepcopy(default_probe_decks()[-1])
+    rest_obs, rest_legal = _build_rest_probe_surface(multiset_deck, hp=60, max_hp=80)
+    shop_obs, shop_legal = _build_shop_remove_probe_surface(multiset_deck, hp=60, max_hp=80)
+    rest_dec = forward_decision(rest_obs, rest_legal, control_domain="macro")
+    shop_dec = forward_decision(shop_obs, shop_legal, control_domain="macro")
+    assert rest_dec is not None and shop_dec is not None
+    rest_enc = encoder.encode(rest_obs, [c.semantic_action for c in rest_dec.candidates])
+    shop_enc = encoder.encode(shop_obs, [c.semantic_action for c in shop_dec.candidates])
+    rest_grouped = tuple(rest_dec.candidates[r.representative_position] for r in rest_enc.actions)
+    shop_grouped = tuple(shop_dec.candidates[r.representative_position] for r in shop_enc.actions)
+
+    # Pure card-utility probe worlds (fixing gold=120 to isolate pure deck composition & size)
+    smith_posts = synthesize_deterministic_afterstates(
+        encoder=encoder, observation=rest_obs, decision=rest_dec, candidates=rest_grouped
+    )
+    assert smith_posts is not None
+    card_worth = {
+        "probe_card_basic_a": (-0.6, -0.35),
+        "probe_card_basic_d": (-0.4, -0.05),
+        "probe_card_cost_drop": (0.8, 2.0),
+        "probe_card_high_scale": (1.0, 2.4),
+        "probe_card_utility_draw": (0.6, 1.6),
+    }
+
+    def deck_expected_worth(cards: list[dict[str, Any]]) -> float:
+        vals = [
+            card_worth[str(c["id"])][1 if c.get("upgraded") else 0]
+            for c in cards
+        ]
+        return sum(vals) / len(vals)
+
+    # Build training worlds: base deck (N=11), single-card Smith (N=11), Remove (N=10), and Add (N=12)
+    train_snaps = [encoder.encode_world_snapshot(rest_obs)]
+    train_targets = [deck_expected_worth(multiset_deck)]
+    for cand, post_snap in zip(rest_grouped, smith_posts, strict=True):
+        if cand.branch == "smith" and isinstance(cand.target, dict):
+            cid = str(cand.target["id"])
+            mod_deck = copy.deepcopy(multiset_deck)
+            base_card_copy: dict[str, Any] | None = None
+            for idx_c, c in enumerate(mod_deck):
+                if c["id"] == cid and not c.get("upgraded"):
+                    base_card_copy = copy.deepcopy(c)
+                    mod_deck[idx_c] = copy.deepcopy(c["upgrade_preview"])
+                    break
+            assert base_card_copy is not None
+            train_snaps.append(post_snap)
+            train_targets.append(deck_expected_worth(mod_deck))
+
+            thin_deck = copy.deepcopy(multiset_deck)
+            for idx_c, c in enumerate(thin_deck):
+                if c["id"] == cid:
+                    thin_deck.pop(idx_c)
+                    break
+            thin_obs, _ = _build_rest_probe_surface(thin_deck, hp=60, max_hp=80)
+            train_snaps.append(encoder.encode_world_snapshot(thin_obs))
+            train_targets.append(deck_expected_worth(thin_deck))
+
+            add_deck = [*copy.deepcopy(multiset_deck), base_card_copy]
+            add_obs, _ = _build_rest_probe_surface(add_deck, hp=60, max_hp=80)
+            train_snaps.append(encoder.encode_world_snapshot(add_obs))
+            train_targets.append(deck_expected_worth(add_deck))
+
+    wb_train, dom_train = collate_encoded_worlds(
+        train_snaps,
+        expected_config=train_snaps[0].config,
+        expected_fingerprint=train_snaps[0].encoding_fingerprint,
+        device="cpu",
+    )
+    y_train = torch.tensor(train_targets, dtype=torch.float32)
+
+    rest_batch = collate_encoded_snapshots(
+        (rest_enc.snapshot,),
+        expected_config=rest_enc.snapshot.config,
+        expected_fingerprint=rest_enc.snapshot.encoding_fingerprint,
+        device="cpu",
+    )
+    shop_batch = collate_encoded_snapshots(
+        (shop_enc.snapshot,),
+        expected_config=shop_enc.snapshot.config,
+        expected_fingerprint=shop_enc.snapshot.encoding_fingerprint,
+        device="cpu",
+    )
+
+    # Opposite target distributions on the exact same cards for Smith vs Remove!
+    smith_target_logits = torch.full((rest_enc.snapshot.candidate_count,), -1e9, dtype=torch.float32)
+    for idx_g, cand in enumerate(rest_grouped):
+        if cand.branch == "rest":
+            smith_target_logits[idx_g] = -1.0
+        elif cand.branch == "smith" and isinstance(cand.target, dict):
+            base_w, upg_w = card_worth[str(cand.target["id"])]
+            smith_target_logits[idx_g] = 4.0 * (upg_w - base_w)
+    smith_target_p = torch.softmax(smith_target_logits, dim=0)
+
+    remove_target_logits = torch.full((shop_enc.snapshot.candidate_count,), -1e9, dtype=torch.float32)
+    for idx_g, cand in enumerate(shop_grouped):
+        if cand.branch == "leave":
+            remove_target_logits[idx_g] = -1.0
+        elif cand.branch == "remove" and isinstance(cand.target, dict):
+            base_w, _ = card_worth[str(cand.target["id"])]
+            remove_target_logits[idx_g] = -4.0 * base_w
+    remove_target_p = torch.softmax(remove_target_logits, dim=0)
+
+    for _ in range(150):
+        opt.zero_grad()
+        pred_v, _ = model.forward_durable_value(wb_train, dom_train, validate=False)
+        v_loss = torch.nn.functional.mse_loss(pred_v, y_train)
+        out_r = model(rest_batch, validate=False)
+        out_s = model(shop_batch, validate=False)
+        lp_r = torch.log_softmax(out_r.policy_logits[0, : rest_enc.snapshot.candidate_count], dim=0)
+        lp_s = torch.log_softmax(out_s.policy_logits[0, : shop_enc.snapshot.candidate_count], dim=0)
+        p_loss = -(smith_target_p * lp_r).sum() - (remove_target_p * lp_s).sum()
+        (20.0 * v_loss + p_loss).backward()
+        opt.step()
+
+    model.eval()
+    with torch.no_grad():
+        pred_after, _ = model.forward_durable_value(wb_train, dom_train, validate=False)
+    v_base = float(pred_after[0].item())
+    smith_by_id: dict[str, float] = {}
+    remove_by_id: dict[str, float] = {}
+    add_by_id: dict[str, float] = {}
+    cursor_idx = 1
+    for cand in rest_grouped:
+        if cand.branch == "smith" and isinstance(cand.target, dict):
+            cid = str(cand.target["id"])
+            smith_by_id[cid] = float(pred_after[cursor_idx].item())
+            remove_by_id[cid] = float(pred_after[cursor_idx + 1].item())
+            add_by_id[cid] = float(pred_after[cursor_idx + 2].item())
+            cursor_idx += 3
+
+    v_smith_basic_a = smith_by_id["probe_card_basic_a"]
+    v_remove_basic_a = remove_by_id["probe_card_basic_a"]
+    assert smith_by_id["probe_card_high_scale"] > v_smith_basic_a + 0.05
+    assert smith_by_id["probe_card_cost_drop"] > v_smith_basic_a + 0.05
+    assert v_remove_basic_a > v_base > remove_by_id["probe_card_high_scale"]
+    assert add_by_id["probe_card_high_scale"] > v_base > add_by_id["probe_card_basic_a"]
+
+    div = probe_smith_vs_remove_divergence(model, encoder, decks=(multiset_deck,))
+    assert div["mean_smith_remove_spearman"] <= -0.8
+    assert div["top1_target_divergence_rate"] == 1.0
+
+    # 2. Verify v9 (b32 and b16) experiment configs and MacroCreditLearner batched parity on durable_v5!
+    exp_dir = Path(__file__).resolve().parents[1] / "config/experiments"
+    for fname, expected_budget in (
+        ("hybrid_macro_credit_v9_durable_afterstate_v43_b32_g4_turbo.toml", 32),
+        ("hybrid_macro_credit_v9_durable_afterstate_v43_b16_g4_turbo.toml", 16),
+    ):
+        c9 = load_macro_training_config(exp_dir / fname)
+        assert c9.learner.revival_budget == expected_budget
+        assert c9.training.curriculum.revival_budget == expected_budget
+        assert c9.learner.enable_draw_weighted_durable_value is True
+        assert c9.learner.enable_role_conditioned_candidate_policy is True
+        ac9 = _actor_critic_config(c9)
+        assert ac9 == HybridActorCriticConfig.durable_v5(c9.training.model.to_model_config())
+
+    # Learner batched vs single parity with durable_v5
+    combat_obs = {
+        "phase": "combat",
+        "decision_domain": "combat",
+        "run": {"active": True, "act": 1, "floor": 7},
+        "player": {"id": "ironclad", "side": "player", "hp": 60, "max_hp": 80, "energy": 3, "hand": [{"id": "strike", "cost": 1}]},
+        "combat": {"in_progress": True, "enemies": [{"id": "cultist", "side": "enemy", "hp": 40, "max_hp": 48}]},
+    }
+    combat_actions = [
+        {"action_handle": "c0", "kind": "play_card", "model_action_kind": "play_card", "is_enabled": True, "card": {"id": "strike", "cost": 1}},
+        {"action_handle": "c1", "kind": "end_turn", "model_action_kind": "end_turn", "is_enabled": True},
+    ]
+    combat_snap = encoder.encode(combat_obs, combat_actions).snapshot
+    v5_init = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v5(cfg.to_model_config())).eval()
+    v5_trajs: list[MacroCreditTrajectory] = []
+    with torch.no_grad():
+        for idx in range(2):
+            o0 = v5_init(rest_batch, None, validate=False)
+            m0 = torch.tensor(rest_enc.snapshot.action_mask.tolist(), dtype=torch.bool)
+            lp0 = torch.log_softmax(o0.policy_logits[0, : m0.numel()].masked_fill(~m0, -torch.inf), dim=0)
+            b1 = collate_encoded_snapshots(
+                (combat_snap,),
+                expected_config=combat_snap.config,
+                expected_fingerprint=combat_snap.encoding_fingerprint,
+                device="cpu",
+            )
+            o1 = v5_init(b1, o0.recurrent_state, validate=False)
+            m1 = torch.tensor(combat_snap.action_mask.tolist(), dtype=torch.bool)
+            lp1 = torch.log_softmax(o1.policy_logits[0, : m1.numel()].masked_fill(~m1, -torch.inf), dim=0)
+            chosen0 = idx % int(m0.sum().item())
+            prior_lp = macro_mixture_log_probs(lp0, rest_enc.snapshot, 0.04)
+            node0 = MacroAfterstateNode(
+                step_index=0,
+                surface="rest_site",
+                candidate_branches=tuple(c.branch for c in rest_grouped),
+                post_worlds=tuple(smith_posts),
+            )
+            s0 = HybridVTraceStep(
+                rest_enc.snapshot,
+                chosen0,
+                float(prior_lp[chosen0].item()),
+                0.0,
+                1.0,
+                False,
+                "rest_site",
+                rest_grouped[chosen0].branch,
+                "macro",
+                0,
+            )
+            f0 = MacroRewardFacts(0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 6, 6, 1)
+            s1 = HybridVTraceStep(
+                combat_snap, 0, float(lp1[0].item()), 1.95, 0.0, True, "combat", "play_card", "combat", 0
+            )
+            f1 = MacroRewardFacts(2.0, 0.0, 0.0, -0.05, 0.0, 0, 0.0, 7, 7, 1)
+            v5_trajs.append(
+                MacroCreditTrajectory(
+                    f"v43-{idx}",
+                    6_700_100 + 2 * idx,
+                    0,
+                    (),
+                    (s0, s1),
+                    None,
+                    None,
+                    "factual_terminal",
+                    (f0, f1),
+                    macro_branch_epsilon=0.04,
+                    afterstate_nodes=(node0,),
+                )
+            )
+    v5_cohort = MacroCreditCohort("v43-cohort", 0, (), natural_only=tuple(v5_trajs))
+    v5_lcfg = dict(
+        target_mode="durable_afterstate_v2",
+        enable_direct_vitals_context=True,
+        enable_macro_branch_prior=True,
+        enable_persistent_only_durable_value=True,
+        enable_asymmetric_revival_critic=True,
+        enable_draw_weighted_durable_value=True,
+        enable_role_conditioned_candidate_policy=True,
+        revival_budget=32,
+        zero_macro_pace_penalty=True,
+        clip_macro_pg_fallback=True,
+        macro_pg_within_branch_entropy_only=True,
+        separate_value_grad_clip=True,
+        durable_warmup_updates=0,
+        combat_actor_warmup_updates=0,
+    )
+    m5_b = MacroCreditLearner(
+        model=copy.deepcopy(v5_init),
+        config=MacroCreditLearnerConfig(**v5_lcfg, eval_batch_size=8, chunk_batch_size=8),  # type: ignore[arg-type]
+    ).learn(v5_cohort)
+    m5_s = MacroCreditLearner(
+        model=copy.deepcopy(v5_init),
+        config=MacroCreditLearnerConfig(**v5_lcfg, eval_batch_size=1, chunk_batch_size=1),  # type: ignore[arg-type]
+    ).learn(v5_cohort)
+    assert m5_b["durable_value_loss"] == pytest.approx(m5_s["durable_value_loss"], abs=1e-5)
+    assert m5_b["macro_policy_loss"] == pytest.approx(m5_s["macro_policy_loss"], abs=1e-5)
+    assert m5_b["parameter_delta_norm"] == pytest.approx(m5_s["parameter_delta_norm"], abs=1e-5)
+    assert m5_b["parameter_delta_norm"] > 0.0
+
+
 
 
 

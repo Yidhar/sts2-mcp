@@ -321,6 +321,7 @@ def _probe_prune_and_sync(
         output_dir,
         keep_recent_cohorts=keep_recent_cohorts,
     )
+    split_inv = probe_report.get("multiset_split_invariance") or {}
     history_entry = {
         "committed_update": committed_after,
         "completed_at_utc": _utc_now_iso(),
@@ -332,6 +333,7 @@ def _probe_prune_and_sync(
         ],
         "smith_vs_remove_jsd": probe_report["smith_vs_remove_divergence"]["mean_smith_remove_jsd"],
         "smith_vs_remove_spearman": probe_report["smith_vs_remove_divergence"]["mean_smith_remove_spearman"],
+        "multiset_split_max_abs_diff": split_inv.get("max_durable_value_abs_diff"),
         "episode_macro_discipline": probe_report["episode_macro_discipline"],
     }
     _append_jsonl(output_dir / "campaign_history.jsonl", history_entry)
@@ -353,6 +355,8 @@ def _probe_prune_and_sync(
                 "snapshot_saved": sync_manifest["snapshot_saved"],
                 "campfire_low_minus_high_rest_prob": history_entry["campfire_low_minus_high_rest_prob"],
                 "smith_vs_remove_jsd": history_entry["smith_vs_remove_jsd"],
+                "smith_vs_remove_spearman": history_entry["smith_vs_remove_spearman"],
+                "multiset_split_max_abs_diff": history_entry["multiset_split_max_abs_diff"],
             },
             sort_keys=True,
         ),

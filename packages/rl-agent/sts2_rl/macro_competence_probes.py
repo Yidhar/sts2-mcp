@@ -135,7 +135,48 @@ def default_probe_decks() -> tuple[list[dict[str, Any]], ...]:
             },
         },
     ]
-    return (deck_alpha, deck_beta)
+
+    # Multiset-grouped deck mirroring real HeadlessSim starter stacks (4x basic_a, 4x basic_d).
+    deck_gamma = [
+        {
+            "id": "probe_card_basic_a",
+            "type": "Attack",
+            "rarity": "Basic",
+            "cost": 1,
+            "is_upgradable": True,
+            "is_removable": True,
+            "dynamic_vars": {"Damage": 6},
+            "upgrade_preview": {
+                "id": "probe_card_basic_a",
+                "type": "Attack",
+                "rarity": "Basic",
+                "cost": 1,
+                "upgraded": True,
+                "dynamic_vars": {"Damage": 9},
+            },
+        }
+        for _ in range(4)
+    ] + [
+        {
+            "id": "probe_card_basic_d",
+            "type": "Skill",
+            "rarity": "Basic",
+            "cost": 1,
+            "is_upgradable": True,
+            "is_removable": True,
+            "dynamic_vars": {"Block": 5},
+            "upgrade_preview": {
+                "id": "probe_card_basic_d",
+                "type": "Skill",
+                "rarity": "Basic",
+                "cost": 1,
+                "upgraded": True,
+                "dynamic_vars": {"Block": 8},
+            },
+        }
+        for _ in range(4)
+    ] + copy.deepcopy(deck_alpha[-2:]) + [copy.deepcopy(deck_beta[-1])]
+    return (deck_alpha, deck_beta, deck_gamma)
 
 
 def _build_rest_probe_surface(
@@ -551,6 +592,95 @@ def summarize_episode_macro_discipline(episodes: Sequence[Mapping[str, Any]]) ->
     }
 
 
+@torch.no_grad()
+def probe_multiset_split_invariance(
+    model: HybridDomainActorCriticModel,
+    encoder: GroundedObservationEncoder,
+) -> dict[str, Any]:
+    """Measure V_durable invariance under orderless multiset row splitting."""
+    model.eval()
+    if not model.actor_critic_config.enable_durable_value_head:
+        return {
+            "durable_enabled": False,
+            "grouped_vs_split_abs_diff": None,
+            "smith_high_delta_minus_basic_adv": None,
+        }
+    device = next(model.parameters()).device
+    multiset_deck = copy.deepcopy(default_probe_decks()[-1])
+    basic_card = copy.deepcopy(multiset_deck[0])
+    grouped_deck = [copy.deepcopy(basic_card), *copy.deepcopy(multiset_deck)]
+    split_copy = copy.deepcopy(basic_card)
+    split_copy["instance_id"] = "probe_split_inst_42"
+    split_copy["floor_added_to_deck"] = 5
+    split_deck = [split_copy, *copy.deepcopy(multiset_deck)]
+
+    obs_grouped, _ = _build_rest_probe_surface(grouped_deck, hp=60, max_hp=80)
+    obs_split, _ = _build_rest_probe_surface(split_deck, hp=60, max_hp=80)
+    snap_grouped = encoder.encode_world_snapshot(obs_grouped)
+    snap_split = encoder.encode_world_snapshot(obs_split)
+    wb, dom = collate_encoded_worlds(
+        (snap_grouped, snap_split),
+        expected_config=snap_grouped.config,
+        expected_fingerprint=snap_grouped.encoding_fingerprint,
+        device=device,
+    )
+    vals, _ = model.forward_durable_value(wb, dom, validate=False)
+    split_diff = abs(float(vals[0].item()) - float(vals[1].item()))
+
+    obs_rest, legal_rest = _build_rest_probe_surface(multiset_deck, hp=60, max_hp=80)
+    dec_rest = forward_decision(obs_rest, legal_rest, control_domain="macro")
+    smith_adv: float | None = None
+    if dec_rest is not None:
+        enc_rest = encoder.encode(obs_rest, [cand.semantic_action for cand in dec_rest.candidates])
+        batch_rest = collate_encoded_snapshots(
+            (enc_rest.snapshot,),
+            expected_config=enc_rest.snapshot.config,
+            expected_fingerprint=enc_rest.snapshot.encoding_fingerprint,
+            device=device,
+        )
+        out_rest = model(batch_rest, validate=False)
+        grouped_cands = tuple(
+            dec_rest.candidates[ref.representative_position] for ref in enc_rest.actions
+        )
+        post_worlds = synthesize_deterministic_afterstates(
+            encoder=encoder,
+            observation=obs_rest,
+            decision=dec_rest,
+            candidates=grouped_cands,
+        )
+        if post_worlds is not None:
+            post_wb, post_dom = collate_encoded_worlds(
+                post_worlds,
+                expected_config=post_worlds[0].config,
+                expected_fingerprint=post_worlds[0].encoding_fingerprint,
+                device=device,
+            )
+            expanded_h = out_rest.recurrent_state.expand(len(post_worlds), -1).contiguous()
+            q_after, _ = model.forward_durable_value(post_wb, post_dom, expanded_h, validate=False)
+            basic_vals = [
+                float(q_after[idx].item())
+                for idx, cand in enumerate(grouped_cands)
+                if cand.branch == "smith"
+                and isinstance(cand.target, Mapping)
+                and str(cand.target.get("id") or "").startswith("probe_card_basic_")
+            ]
+            high_vals = [
+                float(q_after[idx].item())
+                for idx, cand in enumerate(grouped_cands)
+                if cand.branch == "smith"
+                and isinstance(cand.target, Mapping)
+                and str(cand.target.get("id") or "") in {"probe_card_cost_drop", "probe_card_high_scale"}
+            ]
+            if basic_vals and high_vals:
+                smith_adv = max(high_vals) - max(basic_vals)
+
+    return {
+        "durable_enabled": True,
+        "grouped_vs_split_abs_diff": split_diff,
+        "smith_high_delta_minus_basic_adv": smith_adv,
+    }
+
+
 def run_all_competence_probes(
     model: HybridDomainActorCriticModel,
     encoder: GroundedObservationEncoder,
@@ -561,6 +691,7 @@ def run_all_competence_probes(
         "version": MACRO_COMPETENCE_PROBE_VERSION,
         "campfire_hp_sensitivity": probe_campfire_hp_sensitivity(model, encoder),
         "smith_vs_remove_divergence": probe_smith_vs_remove_divergence(model, encoder),
+        "multiset_split_invariance": probe_multiset_split_invariance(model, encoder),
         "episode_macro_discipline": summarize_episode_macro_discipline(recent_episodes),
     }
     for key, value in report.items():
@@ -639,6 +770,7 @@ __all__ = [
     "MACRO_COMPETENCE_PROBE_VERSION",
     "default_probe_decks",
     "probe_campfire_hp_sensitivity",
+    "probe_multiset_split_invariance",
     "probe_smith_vs_remove_divergence",
     "run_all_competence_probes",
     "summarize_episode_macro_discipline",
