@@ -282,7 +282,12 @@ class InMemoryTeacher:
             )
             with torch.inference_mode():
                 initial = self.model.initial_state(1, device=self.device).detach() if hidden is None else hidden
-                output = self.model(encoded, initial, validate=False)
+                output = self.model(
+                    encoded,
+                    initial,
+                    compute_durable_value=False,
+                    validate=False,
+                )
                 return output.policy_logits[0].detach(), output.recurrent_state.detach()
 
 

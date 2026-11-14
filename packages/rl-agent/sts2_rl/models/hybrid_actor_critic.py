@@ -318,7 +318,12 @@ class HybridActorCriticOutput:
     action_mask: Tensor  # [B, A]
     durable_value: Tensor | None = None  # [B], candidate-independent when enabled
 
-    def validate(self, config: HybridActorCriticConfig) -> tuple[int, int]:
+    def validate(
+        self,
+        config: HybridActorCriticConfig,
+        *,
+        require_durable_value: bool = True,
+    ) -> tuple[int, int]:
         if self.policy_logits.ndim != 2:
             raise ValueError("hybrid actor logits must have rank 2")
         batch_size, action_count = self.policy_logits.shape
@@ -347,7 +352,7 @@ class HybridActorCriticOutput:
             value = getattr(self, name)
             if not torch.is_floating_point(value) or not bool(torch.isfinite(value).all().item()):
                 raise ValueError(f"hybrid actor {name} must be finite floating point")
-        if config.enable_durable_value_head:
+        if require_durable_value and config.enable_durable_value_head:
             if self.durable_value is None:
                 raise ValueError("hybrid actor durable_value is required when enabled")
             if tuple(self.durable_value.shape) != (batch_size,):
@@ -679,10 +684,81 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         pooled: Tensor = self.persistent_build_norm(queries + delta).mean(dim=1)
         return pooled
 
+    @staticmethod
+    def _compact_world_by_mask(
+        world: WorldTokenBatch,
+        keep_mask: Tensor,
+    ) -> tuple[WorldTokenBatch, Tensor]:
+        batch_size, world_cap, feat_dim = world.features.shape
+        if world_cap <= 1:
+            idx0 = torch.zeros(
+                (batch_size, world_cap),
+                dtype=torch.long,
+                device=world.features.device,
+            )
+            return world, idx0
+        max_keep = max(1, int(keep_mask.long().sum(dim=1).max().item()))
+        if max_keep >= world_cap:
+            idx_id = (
+                torch.arange(world_cap, device=world.features.device)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+            )
+            return (
+                WorldTokenBatch(
+                    features=world.features,
+                    type_ids=world.type_ids,
+                    role_ids=world.role_ids,
+                    owner_ids=world.owner_ids,
+                    entity_ids=world.entity_ids,
+                    entity_aux_ids=world.entity_aux_ids,
+                    definition_binding_ids=world.definition_binding_ids,
+                    relation_binding_ids=world.relation_binding_ids,
+                    zone_ids=world.zone_ids,
+                    order_ids=world.order_ids,
+                    mask=keep_mask,
+                ),
+                idx_id,
+            )
+        gather_idx = torch.argsort(
+            (~keep_mask).to(dtype=torch.int8),
+            dim=1,
+            stable=True,
+        )[:, :max_keep]
+        feat_idx = gather_idx.unsqueeze(-1).expand(-1, -1, feat_dim)
+        return (
+            WorldTokenBatch(
+                features=world.features.gather(1, feat_idx),
+                type_ids=world.type_ids.gather(1, gather_idx),
+                role_ids=world.role_ids.gather(1, gather_idx),
+                owner_ids=world.owner_ids.gather(1, gather_idx),
+                entity_ids=world.entity_ids.gather(1, gather_idx),
+                entity_aux_ids=world.entity_aux_ids.gather(1, gather_idx),
+                definition_binding_ids=world.definition_binding_ids.gather(1, gather_idx),
+                relation_binding_ids=world.relation_binding_ids.gather(1, gather_idx),
+                zone_ids=world.zone_ids.gather(1, gather_idx),
+                order_ids=world.order_ids.gather(1, gather_idx),
+                mask=keep_mask.gather(1, gather_idx),
+            ),
+            gather_idx,
+        )
+
+    @torch.no_grad()
     def _prepare_draw_weighted_persistent_world(
         self,
         world: WorldTokenBatch,
     ) -> _PreparedPersistentWorld:
+        pers_mask_full = self._persistent_token_mask(world.zone_ids, world.owner_ids, world.mask)
+        player_owned_full = world.owner_ids.eq(self._player_owner_id) & world.mask.bool()
+        is_map_full = world.type_ids.eq(self._mapping_item_type_id)
+        cand_label_seq_full = (
+            player_owned_full
+            & (~is_map_full)
+            & (~world.zone_ids.eq(MODIFIER_ZONE_ID))
+            & ((world.features[:, :, 2] - 0.25).abs() < 1e-4)
+        )
+        world, _ = self._compact_world_by_mask(world, pers_mask_full | cand_label_seq_full)
+
         dtype = world.features.dtype
         device = world.features.device
         batch_size, world_cap, _ = world.features.shape
@@ -845,8 +921,17 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             order_ids=canon_order_ids,
             mask=eff_mask,
         )
+        comp_world, eff_idx = self._compact_world_by_mask(prepared_world, eff_mask)
+        w_eff = int(eff_idx.shape[1])
+        if w_eff < world_cap:
+            token_weights = token_weights.gather(1, eff_idx)
+            deck_card_mask = deck_card_mask.gather(1, eff_idx)
+            draw_prob = draw_prob.gather(1, eff_idx)
+            idx_u = eff_idx.unsqueeze(2).expand(-1, -1, world_cap)
+            idx_v = eff_idx.unsqueeze(1).expand(-1, w_eff, -1)
+            child_uv = child_uv.gather(1, idx_u).gather(2, idx_v)
         return _PreparedPersistentWorld(
-            world=prepared_world,
+            world=comp_world,
             token_weights=token_weights,
             deck_card_mask=deck_card_mask,
             draw_prob=draw_prob,
@@ -1658,6 +1743,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         recurrent_state: Tensor | None = None,
         *,
         critic_revival_context: Tensor | None = None,
+        compute_durable_value: bool = True,
         validate: bool = True,
     ) -> HybridActorCriticOutput:
         base, build_emb, vitals_emb, raw_vitals = self._forward_representation_with_build(
@@ -1726,7 +1812,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 + self.state_revival_head(rev_scaled).squeeze(-1)
             )
         durable_value: Tensor | None = None
-        if self.actor_critic_config.enable_durable_value_head:
+        if compute_durable_value and self.actor_critic_config.enable_durable_value_head:
             if self.actor_critic_config.enable_persistent_only_durable_value:
                 durable_value, _ = self._compute_persistent_durable_value(
                     batch.world,
@@ -1755,7 +1841,10 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             durable_value=durable_value,
         )
         if validate:
-            output.validate(self.actor_critic_config)
+            output.validate(
+                self.actor_critic_config,
+                require_durable_value=compute_durable_value,
+            )
         return output
 
 

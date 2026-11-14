@@ -278,7 +278,12 @@ class FrozenMacroRootPolicy:
         if hidden is None:
             hidden = self.initial_state()
         with torch.inference_mode():
-            output = self.model(encoded, hidden, validate=False)
+            output = self.model(
+                encoded,
+                hidden,
+                compute_durable_value=False,
+                validate=False,
+            )
             logits = output.policy_logits[0].detach()
             next_hidden = output.recurrent_state.detach()
         return logits, next_hidden

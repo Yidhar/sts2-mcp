@@ -23,7 +23,7 @@ from torch.nn import functional as F
 
 from sts2_rl.encoding import EncodedDecisionSnapshot, EncodedWorldSnapshot
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots, collate_encoded_worlds
-from sts2_rl.models.grounded_candidate import _safe_valid_mask
+from sts2_rl.models.grounded_candidate import WorldTokenBatch, _safe_valid_mask
 from sts2_rl.models.hybrid_actor_critic import HybridActorCriticOutput, HybridDomainActorCriticModel
 
 from .macro_credit_data import (
@@ -964,7 +964,7 @@ class MacroCreditLearner:
             sorted_worlds = [flat_worlds[idx] for idx in perm]
             stacked_hiddens = torch.cat(flat_hiddens, dim=0)[perm]
             stacked_revs = torch.cat(flat_revs, dim=0)[perm] if rev_all is not None else None
-            world_cap = max(256, self.config.eval_batch_size * 12)
+            world_cap = max(128, min(256, self.config.eval_batch_size * 8))
             gpu_q_chunks: list[Tensor] = []
             for w_start in range(0, n_worlds, world_cap):
                 self._check_resource()
@@ -1572,7 +1572,6 @@ class MacroCreditLearner:
         )
 
         flat_is_macro_gpu = torch.tensor(flat_is_macro_cpu, device=self.device, dtype=torch.bool)
-        flat_has_dur_gpu = torch.tensor(flat_has_dur_cpu, device=self.device, dtype=torch.bool)
         flat_is_choice_gpu = torch.tensor(flat_is_choice_cpu, device=self.device, dtype=torch.bool)
         flat_has_as_gpu = torch.tensor(flat_has_as_cpu, device=self.device, dtype=torch.bool)
         flat_action_idx_gpu = torch.tensor(flat_action_idx_cpu, device=self.device, dtype=torch.long)
@@ -1688,11 +1687,10 @@ class MacroCreditLearner:
                         batch,
                         active_hidden,
                         critic_revival_context=active_rev,
+                        compute_durable_value=False,
                         validate=False,
                     ),
                 )
-                if output.durable_value is None:
-                    raise ValueError("durable_afterstate_v2 requires durable_value on every step")
                 for k, c in enumerate(active_c):
                     hidden_list[c] = output.recurrent_state[k]
 
@@ -1704,7 +1702,6 @@ class MacroCreditLearner:
                     & torch.isfinite(output.policy_logits).all()
                     & torch.isfinite(output.value).all()
                     & torch.isfinite(output.recurrent_state).all()
-                    & torch.isfinite(output.durable_value).all()
                     & torch.isfinite(safe_logs).all()
                 )
                 probs = all_logs.exp().masked_fill(~masks, 0.0)
@@ -1713,7 +1710,6 @@ class MacroCreditLearner:
                 chosen_logs = safe_logs.gather(1, act_idx_k.unsqueeze(1)).squeeze(1)
 
                 is_macro_k = flat_is_macro_gpu[gids_gpu]
-                has_dur_k = flat_has_dur_gpu[gids_gpu]
                 is_choice_k = flat_is_choice_gpu[gids_gpu]
                 has_as_k = flat_has_as_gpu[gids_gpu]
 
@@ -1729,10 +1725,37 @@ class MacroCreditLearner:
                 )
 
                 if any_dur:
-                    dur_huber = F.smooth_l1_loss(
-                        output.durable_value, flat_dur_target[gids_gpu], reduction="none"
+                    dur_k = [k for k, g in enumerate(gids_cpu) if flat_has_dur_cpu[g]]
+                    dur_k_gpu = torch.tensor(dur_k, device=self.device, dtype=torch.long)
+                    dur_gids_gpu = gids_gpu[dur_k_gpu]
+                    dur_world_batch = WorldTokenBatch(
+                        features=batch.world.features[dur_k_gpu],
+                        type_ids=batch.world.type_ids[dur_k_gpu],
+                        role_ids=batch.world.role_ids[dur_k_gpu],
+                        owner_ids=batch.world.owner_ids[dur_k_gpu],
+                        entity_ids=batch.world.entity_ids[dur_k_gpu],
+                        entity_aux_ids=batch.world.entity_aux_ids[dur_k_gpu],
+                        definition_binding_ids=batch.world.definition_binding_ids[dur_k_gpu],
+                        relation_binding_ids=batch.world.relation_binding_ids[dur_k_gpu],
+                        zone_ids=batch.world.zone_ids[dur_k_gpu],
+                        order_ids=batch.world.order_ids[dur_k_gpu],
+                        mask=batch.world.mask[dur_k_gpu],
                     )
-                    durable_loss = torch.where(has_dur_k, dur_huber, 0.0).sum() / denom_dur_val
+                    dur_rev = None if active_rev is None else active_rev[dur_k_gpu]
+                    dur_vals, _ = ac_model.forward_durable_value(
+                        dur_world_batch,
+                        batch.domain_ids[dur_k_gpu],
+                        active_hidden[dur_k_gpu],
+                        critic_revival_context=dur_rev,
+                        validate=False,
+                    )
+                    finite_ok = finite_ok & torch.isfinite(dur_vals).all()
+                    durable_loss = (
+                        F.smooth_l1_loss(
+                            dur_vals, flat_dur_target[dur_gids_gpu], reduction="sum"
+                        )
+                        / denom_dur_val
+                    )
                     slice_totals_gpu["durable_value_loss"] = (
                         slice_totals_gpu["durable_value_loss"] + durable_loss.detach().double()
                     )

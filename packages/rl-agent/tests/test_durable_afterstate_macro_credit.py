@@ -2971,9 +2971,73 @@ def test_v4_3_draw_thinning_algebra_and_role_conditioned_smith_vs_remove_polarit
     assert m5_b["parameter_delta_norm"] > 0.0
 
 
+def test_v4_3_persistent_token_compaction_and_skip_durable_forward() -> None:
+    """Verify persistent token compaction shrinks transient world bloat and compute_durable_value=False is exact."""
+    from sts2_rl.models.grounded_candidate import WorldTokenBatch
 
+    torch.manual_seed(20261114)
+    cfg = _tiny_model_config()
+    encoder = GroundedObservationEncoder(cfg.to_encoding_config())
+    model = HybridDomainActorCriticModel(
+        HybridActorCriticConfig.durable_v5(cfg.to_model_config())
+    ).eval()
+    with torch.no_grad():
+        for mod in (
+            model.durable_deck_out,
+            model.durable_deck_size_linear,
+            model.candidate_role_policy_head,
+        ):
+            for p in mod.parameters():
+                p.add_(0.05 * torch.randn_like(p))
 
+    obs_rest, actions_rest = _rest_surface(_sample_deck())
+    dec_rest = forward_decision(obs_rest, actions_rest, control_domain="macro")
+    assert dec_rest is not None
+    enc_rest = encoder.encode(obs_rest, [cand.semantic_action for cand in dec_rest.candidates])
+    batch = collate_encoded_snapshots(
+        (enc_rest.snapshot,),
+        expected_config=enc_rest.snapshot.config,
+        expected_fingerprint=enc_rest.snapshot.encoding_fingerprint,
+        device="cpu",
+    )
 
+    out_full = model(batch, compute_durable_value=True, validate=True)
+    out_fast = model(batch, compute_durable_value=False, validate=True)
+    assert out_full.durable_value is not None
+    assert out_fast.durable_value is None
+    assert torch.equal(out_full.policy_logits, out_fast.policy_logits)
+    assert torch.equal(out_full.value, out_fast.value)
+    assert torch.equal(out_full.recurrent_state, out_fast.recurrent_state)
 
+    wb = batch.world
+    bsz, w0, fdim = wb.features.shape
+    bloat = 180
+    pad_world = WorldTokenBatch(
+        features=torch.cat([wb.features, torch.randn(bsz, bloat, fdim)], dim=1),
+        type_ids=torch.cat([wb.type_ids, torch.ones(bsz, bloat, dtype=torch.long)], dim=1),
+        role_ids=torch.cat([wb.role_ids, torch.zeros(bsz, bloat, dtype=torch.long)], dim=1),
+        owner_ids=torch.cat([wb.owner_ids, torch.full((bsz, bloat), 2, dtype=torch.long)], dim=1),
+        entity_ids=torch.cat([wb.entity_ids, torch.ones(bsz, bloat, dtype=torch.long)], dim=1),
+        entity_aux_ids=torch.cat([wb.entity_aux_ids, torch.zeros(bsz, bloat, dtype=torch.long)], dim=1),
+        definition_binding_ids=torch.cat([wb.definition_binding_ids, torch.zeros(bsz, bloat, dtype=torch.long)], dim=1),
+        relation_binding_ids=torch.cat([wb.relation_binding_ids, torch.zeros(bsz, bloat, dtype=torch.long)], dim=1),
+        zone_ids=torch.cat([wb.zone_ids, torch.full((bsz, bloat), 20, dtype=torch.long)], dim=1),
+        order_ids=torch.cat([wb.order_ids, torch.zeros(bsz, bloat, dtype=torch.long)], dim=1),
+        mask=torch.cat([wb.mask, torch.ones(bsz, bloat, dtype=torch.bool)], dim=1),
+    )
+    prep_pad = model._prepare_draw_weighted_persistent_world(pad_world)
+    assert prep_pad.world.features.shape[1] <= w0
 
+    model_a = copy.deepcopy(model)
+    model_b = copy.deepcopy(model)
+    dom0 = torch.zeros((bsz,), dtype=torch.long)
+    val_a, _ = model_a.forward_durable_value(wb, dom0, validate=False)
+    val_b, _ = model_b.forward_durable_value(pad_world, dom0, validate=False)
+    assert float((val_a - val_b).abs().max().item()) < 1e-6
+    val_a.sum().backward()  # type: ignore[no-untyped-call]
+    val_b.sum().backward()  # type: ignore[no-untyped-call]
+    for (na, pa), (_, pb) in zip(model_a.named_parameters(), model_b.named_parameters(), strict=True):
+        if pa.grad is not None or pb.grad is not None:
+            assert pa.grad is not None and pb.grad is not None, na
+            assert float((pa.grad - pb.grad).abs().max().item()) < 1e-5, na
 

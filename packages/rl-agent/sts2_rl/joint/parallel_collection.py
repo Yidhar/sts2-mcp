@@ -257,7 +257,15 @@ class BatchedPolicyInferenceServer:
                     )
                 else:
                     hidden_gpu = hid_t.to(device=self.device, dtype=model_dtype)
-                output = self.model(encoded, hidden_gpu, validate=False)
+                if isinstance(self.model, HybridDomainActorCriticModel):
+                    output = self.model(
+                        encoded,
+                        hidden_gpu,
+                        compute_durable_value=False,
+                        validate=False,
+                    )
+                else:
+                    output = self.model(encoded, hidden_gpu, validate=False)
                 logits_cpu = output.policy_logits.detach().to(
                     device="cpu", dtype=torch.float32
                 ).numpy()
