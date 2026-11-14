@@ -361,3 +361,64 @@ def test_macro_credit_publication_durable_v4_to_v5_hot_start_preserves_step0_pol
             initialize_from_macro_publication=True,
             actor_critic_config=v5_cfg,
         )
+
+
+def test_macro_credit_publication_durable_v5_to_v6_hot_start_preserves_step0_policy(
+    tmp_path: Path, config: TrainingConfig
+) -> None:
+    grounded = config.model.to_model_config()
+    v5_cfg = HybridActorCriticConfig.durable_v5(grounded)
+    v6_cfg = HybridActorCriticConfig.durable_v6(grounded)
+    source_v5 = HybridDomainActorCriticModel(v5_cfg).eval()
+    payload = {
+        "format": "sts2-hybrid-macro-credit-publication-v1",
+        "model_config": v5_cfg.as_mapping(),
+        "reward_identity": act_frontloaded_death_reward_identity(revival_budget=32),
+        "control_scores": "policy_logits",
+        "policy_version": 5,
+        "online": source_v5.state_dict(),
+    }
+    saved_path = _save(tmp_path, payload)
+    target_course = replace(config, curriculum=replace(config.curriculum, revival_budget=32))
+
+    policy = FrozenMacroRootPolicy(
+        saved_path,
+        target_course,
+        "cpu",
+        initialize_from_macro_publication=True,
+        actor_critic_config=v6_cfg,
+    )
+    assert all(
+        name.startswith(("durable_deck_size_", "durable_vitals_"))
+        for name in policy.provenance["ignored_source_tensor_names"]
+    )
+    assert len(policy.provenance["ignored_source_tensor_names"]) > 0
+    assert all(
+        name.startswith("durable_progress_vitals_head.")
+        for name in policy.provenance["fresh_tensor_names"]
+    )
+    snap = _snapshot(config)
+    encoded = collate_encoded_snapshots(
+        (snap,),
+        expected_config=policy.encoding_config,
+        expected_fingerprint=snap.encoding_fingerprint,
+        device="cpu",
+    )
+    with torch.no_grad():
+        expected = source_v5(encoded, source_v5.initial_state(1, device="cpu"))
+    logits, hidden = policy.forward(snap, None)
+    torch.testing.assert_close(logits, expected.policy_logits[0], rtol=0, atol=0)
+    torch.testing.assert_close(hidden, expected.recurrent_state, rtol=0, atol=0)
+
+    # Disabling enable_deconfounded_durable_value from a v6 parent fails closed.
+    v6_payload = dict(payload, model_config=v6_cfg.as_mapping(), online=policy.model.state_dict())
+    v6_path = tmp_path / "v6_pub.pt"
+    torch.save(v6_payload, v6_path)
+    with pytest.raises(ValueError, match="cannot disable parent flag"):
+        FrozenMacroRootPolicy(
+            v6_path,
+            target_course,
+            "cpu",
+            initialize_from_macro_publication=True,
+            actor_critic_config=v5_cfg,
+        )

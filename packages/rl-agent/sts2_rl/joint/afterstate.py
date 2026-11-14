@@ -631,6 +631,182 @@ def _synthesize_reward_candidate(
     return None
 
 
+def _resolve_selection_upgrade_preview(
+    observation: Mapping[str, Any],
+    candidate: SemanticCandidate,
+) -> Mapping[str, Any] | None:
+    direct = _resolve_smith_upgrade_preview(observation, candidate)
+    if direct is not None:
+        return direct
+    action_card = candidate.semantic_action.get("card")
+    target_source = action_card if isinstance(action_card, Mapping) else candidate.target
+    if not isinstance(target_source, Mapping):
+        return None
+    raw_sel: dict[str, Any] = {}
+    for top_key in ("card_selection", "selection", "decision"):
+        top_val = observation.get(top_key)
+        if isinstance(top_val, Mapping):
+            nested_sel = top_val.get("selection")
+            if isinstance(nested_sel, Mapping):
+                raw_sel.update(dict(nested_sel))
+            else:
+                raw_sel.update(dict(top_val))
+    candidate_pool: list[Mapping[str, Any]] = []
+    for field in ("cards", "selectable_cards"):
+        seq = raw_sel.get(field)
+        if isinstance(seq, Sequence) and not isinstance(seq, str | bytes):
+            candidate_pool.extend(item for item in seq if isinstance(item, Mapping))
+    opts = raw_sel.get("options")
+    if isinstance(opts, Sequence) and not isinstance(opts, str | bytes):
+        for opt in opts:
+            if isinstance(opt, Mapping) and isinstance(opt.get("card"), Mapping):
+                merged = dict(opt["card"])
+                if isinstance(opt.get("upgrade_preview"), Mapping) and "upgrade_preview" not in merged:
+                    merged["upgrade_preview"] = opt["upgrade_preview"]
+                candidate_pool.append(merged)
+    if candidate_pool:
+        canonical_pool = [
+            {**_canonical_card({**dict(item), "pile": "Deck"}), "quantity": 1}
+            for item in candidate_pool
+        ]
+        matched_index = _match_deck_entry_index(canonical_pool, target_source)
+        if matched_index is not None:
+            preview = candidate_pool[matched_index].get("upgrade_preview")
+            if isinstance(preview, Mapping) and preview:
+                return preview
+    return None
+
+
+def _synthesize_selection_candidate(
+    base_canonical: Mapping[str, Any],
+    observation: Mapping[str, Any],
+    candidate: SemanticCandidate,
+) -> dict[str, Any] | None:
+    if candidate.branch != "selection_add":
+        return None
+    decision_block = base_canonical.get("decision")
+    sel = decision_block.get("selection") if isinstance(decision_block, Mapping) else None
+    if not isinstance(sel, Mapping):
+        return None
+    raw_sel: dict[str, Any] = {}
+    for top_key in ("card_selection", "selection", "decision"):
+        top_val = observation.get(top_key)
+        if isinstance(top_val, Mapping):
+            nested_sel = top_val.get("selection")
+            if isinstance(nested_sel, Mapping):
+                raw_sel.update(dict(nested_sel))
+            else:
+                raw_sel.update(dict(top_val))
+
+    if (
+        sel.get("confirmation_mode") == "manual"
+        or raw_sel.get("requires_manual_confirmation") is True
+        or raw_sel.get("requires_confirm") is True
+        or raw_sel.get("confirm_enabled") is True
+        or sel.get("confirm_ready") is True
+    ):
+        return None
+    is_auto_confirm = (
+        sel.get("confirmation_mode") == "automatic"
+        or raw_sel.get("requires_manual_confirmation") is False
+        or raw_sel.get("requires_confirm") is False
+    )
+    if not is_auto_confirm:
+        return None
+    if _exact_int(sel.get("selected_count")) not in (None, 0) or sel.get("selected_cards"):
+        return None
+    if (
+        sel.get("can_skip") is True
+        or sel.get("cancelable") is True
+        or raw_sel.get("can_skip") is True
+        or raw_sel.get("cancelable") is True
+        or raw_sel.get("can_cancel") is True
+    ):
+        return None
+    rem = _exact_int(sel.get("remaining_select") if sel.get("remaining_select") is not None else raw_sel.get("remaining_picks"))
+    min_s = _exact_int(sel.get("min_select") if sel.get("min_select") is not None else raw_sel.get("min_select"))
+    max_s = _exact_int(sel.get("max_select") if sel.get("max_select") is not None else raw_sel.get("max_select"))
+    if max_s not in (None, 1) or min_s not in (None, 1):
+        return None
+    if rem is not None:
+        if rem != 1:
+            return None
+    elif not (min_s == 1 and max_s == 1):
+        return None
+
+    source_zone = str(
+        sel.get("source_zone")
+        or raw_sel.get("source_zone")
+        or raw_sel.get("source_pile")
+        or "Deck"
+    ).strip().lower()
+    if source_zone != "deck":
+        return None
+
+    op = str(sel.get("operation_type") or raw_sel.get("operation_type") or "").strip().lower()
+    mode = str(
+        sel.get("mode")
+        or raw_sel.get("mode")
+        or raw_sel.get("screen_type")
+        or raw_sel.get("screen_subtype")
+        or ""
+    ).strip().lower()
+    prompt = str(sel.get("prompt_id") or raw_sel.get("prompt_id") or "").strip().lower()
+    is_upgrade = (
+        op == "upgrade"
+        or mode in {"deckupgrade", "upgrade"}
+        or prompt == "card_selection.to_upgrade"
+    )
+    is_remove = (
+        op == "remove"
+        or mode in {"deckremove", "remove", "purge"}
+        or prompt == "card_selection.to_remove"
+    )
+    if is_upgrade == is_remove:
+        return None
+
+    post = copy.deepcopy(dict(base_canonical))
+    player = post.get("player")
+    if not isinstance(player, Mapping):
+        return None
+    player_dict = dict(player)
+    post["player"] = player_dict
+    post.pop("decision", None)
+    post.pop("event", None)
+    post["phase"] = "map"
+    post["decision_domain"] = "map"
+
+    action_card = candidate.semantic_action.get("card")
+    target_card = action_card if isinstance(action_card, Mapping) else candidate.target
+    deck_cards = player_dict.get("deck_cards")
+    deck_count = _exact_int(player_dict.get("deck"))
+    if not isinstance(target_card, Mapping) or not isinstance(deck_cards, list) or deck_count is None:
+        return None
+
+    match_index = _match_deck_entry_index(deck_cards, target_card)
+    if match_index is None:
+        return None
+    decremented = _decrement_deck_entry(deck_cards, match_index)
+    if decremented is None:
+        return None
+
+    if is_upgrade:
+        raw_preview = _resolve_selection_upgrade_preview(observation, candidate)
+        if raw_preview is None:
+            return None
+        upgraded_deck = _append_deck_card(decremented, raw_preview)
+        if upgraded_deck is None:
+            return None
+        player_dict["deck_cards"] = upgraded_deck
+        return post
+
+    if deck_count < 1:
+        return None
+    player_dict["deck_cards"] = decremented
+    player_dict["deck"] = deck_count - 1
+    return post
+
+
 def synthesize_deterministic_afterstates(
     *,
     encoder: GroundedObservationEncoder,
@@ -647,7 +823,7 @@ def synthesize_deterministic_afterstates(
     active_candidates = tuple(decision.candidates if candidates is None else candidates)
     if len(active_candidates) < 2:
         return None
-    if decision.surface not in {"rest", "shop", "reward"}:
+    if decision.surface not in {"rest", "shop", "reward", "selection"}:
         return None
 
     try:
@@ -669,6 +845,8 @@ def synthesize_deterministic_afterstates(
             # Includes claim_card, claim_special_card, or mixed card/claim surfaces
             # whose post-state draws unseen random cards.
             return None
+    elif decision.surface == "selection" and branches != {"selection_add"}:
+        return None
 
     encoded_post_worlds: list[EncodedWorldSnapshot] = []
     for candidate in active_candidates:
@@ -690,6 +868,12 @@ def synthesize_deterministic_afterstates(
                 candidate,
                 is_card_reward_surface=is_card_reward_surface,
             )
+        elif decision.surface == "selection":
+            post_canonical = _synthesize_selection_candidate(
+                base_canonical,
+                observation,
+                candidate,
+            )
         else:
             return None
 
@@ -704,7 +888,76 @@ def synthesize_deterministic_afterstates(
     return tuple(encoded_post_worlds)
 
 
+def synthesize_partial_deterministic_afterstates(
+    *,
+    encoder: GroundedObservationEncoder,
+    observation: Mapping[str, Any],
+    decision: ForwardDecision,
+    candidates: Sequence[SemanticCandidate] | None = None,
+) -> tuple[tuple[int, ...], tuple[EncodedWorldSnapshot, ...]] | None:
+    """Synthesize verified deterministic afterstate subset when >= 2 candidates qualify.
+
+    For full deterministic surfaces (card rewards, deterministic loot, campfires,
+    shops without pickup-effect relics, single-pick deck upgrade/remove selections),
+    returns ``(tuple(range(len(active_candidates))), post_worlds)``.
+    For shops or campfires where specific candidates have immediate stochastic/pickup
+    side effects (e.g. ``has_upon_pickup_effect=True`` relics), isolates the verified
+    deterministic subset ``D`` (provided ``|D| >= 2``) while leaving ``i not in D``
+    untouched by subset-preserving MPO.
+    """
+
+    active_candidates = tuple(decision.candidates if candidates is None else candidates)
+    if len(active_candidates) < 2:
+        return None
+    full = synthesize_deterministic_afterstates(
+        encoder=encoder,
+        observation=observation,
+        decision=decision,
+        candidates=active_candidates,
+    )
+    if full is not None:
+        return tuple(range(len(active_candidates))), full
+
+    if decision.surface not in {"shop", "rest"}:
+        return None
+    try:
+        base_canonical = _canonical_model_observation(observation)
+    except Exception:
+        return None
+    if "combat" in base_canonical:
+        return None
+
+    det_indices: list[int] = []
+    det_worlds: list[EncodedWorldSnapshot] = []
+    for idx, candidate in enumerate(active_candidates):
+        if decision.surface == "shop":
+            post_canonical = _synthesize_shop_candidate(
+                base_canonical,
+                observation,
+                candidate,
+            )
+        else:
+            post_canonical = _synthesize_rest_candidate(
+                base_canonical,
+                observation,
+                candidate,
+            )
+        if post_canonical is None:
+            continue
+        try:
+            encoded = encoder.encode_canonical_world_snapshot(post_canonical)
+        except Exception:
+            continue
+        det_indices.append(idx)
+        det_worlds.append(encoded)
+
+    if len(det_indices) < 2:
+        return None
+    return tuple(det_indices), tuple(det_worlds)
+
+
 __all__ = [
     "AFTERSTATE_SYNTHESIZER_VERSION",
     "synthesize_deterministic_afterstates",
+    "synthesize_partial_deterministic_afterstates",
 ]

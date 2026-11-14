@@ -161,6 +161,7 @@ class FrozenMacroRootPolicy:
                 "enable_asymmetric_revival_critic",
                 "enable_draw_weighted_durable_value",
                 "enable_role_conditioned_candidate_policy",
+                "enable_deconfounded_durable_value",
             ):
                 if getattr(parsed_macro_source_cfg, flag_name) and not getattr(model_config, flag_name):
                     raise ValueError(

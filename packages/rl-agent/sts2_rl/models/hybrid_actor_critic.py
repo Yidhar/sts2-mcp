@@ -51,7 +51,11 @@ PLAYER_CURRENT_HP_OFFSET: Final = 34 - NUMERIC_FACT_SLOT_START
 PLAYER_GOLD_OFFSET: Final = 54 - NUMERIC_FACT_SLOT_START
 PLAYER_HP_OFFSET: Final = 62 - NUMERIC_FACT_SLOT_START
 PLAYER_MAX_HP_OFFSET: Final = 111 - NUMERIC_FACT_SLOT_START
+PLAYER_OPEN_POTION_SLOTS_OFFSET: Final = 119 - NUMERIC_FACT_SLOT_START
+RUN_ACT_OFFSET: Final = 6 - NUMERIC_FACT_SLOT_START
+RUN_FLOOR_OFFSET: Final = 51 - NUMERIC_FACT_SLOT_START
 SALIENT_VITALS_DIM: Final = 4
+DURABLE_PROGRESS_VITALS_DIM: Final = 10
 CRITIC_REVIVAL_CONTEXT_DIM: Final = 6
 PERSISTENT_BUILD_ZONE_IDS: Final[tuple[int, ...]] = (2, 13, 15, 16, 20, 22)
 IDENTITY_BLIND_CARD_COUNT_ZONE_IDS: Final[frozenset[int]] = frozenset({2, 20})
@@ -60,12 +64,19 @@ V2_FRESH_TENSOR_PREFIXES: Final[tuple[str, ...]] = (
     "branch_vitals_",
     "candidate_role_",
     "durable_deck_",
+    "durable_progress_vitals_",
     "durable_revival_",
     "durable_value_head.",
     "durable_vitals_",
     "persistent_build_",
     "persistent_vitals_",
     "state_revival_",
+)
+RETIRED_DECONFOUNDED_SOURCE_PREFIXES: Final[tuple[str, ...]] = (
+    "durable_deck_size_head.",
+    "durable_deck_size_linear.",
+    "durable_vitals_head.",
+    "durable_vitals_linear.",
 )
 
 
@@ -83,6 +94,7 @@ class HybridActorCriticConfig:
     enable_asymmetric_revival_critic: bool = False
     enable_draw_weighted_durable_value: bool = False
     enable_role_conditioned_candidate_policy: bool = False
+    enable_deconfounded_durable_value: bool = False
 
     def __post_init__(self) -> None:
         HybridCandidateQConfig(
@@ -100,12 +112,17 @@ class HybridActorCriticConfig:
             "enable_asymmetric_revival_critic",
             "enable_draw_weighted_durable_value",
             "enable_role_conditioned_candidate_policy",
+            "enable_deconfounded_durable_value",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"hybrid actor-critic {name} must be boolean")
         if self.enable_draw_weighted_durable_value and not self.enable_persistent_only_durable_value:
             raise ValueError(
                 "enable_draw_weighted_durable_value requires enable_persistent_only_durable_value=True"
+            )
+        if self.enable_deconfounded_durable_value and not self.enable_draw_weighted_durable_value:
+            raise ValueError(
+                "enable_deconfounded_durable_value requires enable_draw_weighted_durable_value=True"
             )
 
     @property
@@ -120,6 +137,7 @@ class HybridActorCriticConfig:
             or self.enable_asymmetric_revival_critic
             or self.enable_draw_weighted_durable_value
             or self.enable_role_conditioned_candidate_policy
+            or self.enable_deconfounded_durable_value
         )
 
     @classmethod
@@ -203,6 +221,30 @@ class HybridActorCriticConfig:
         )
 
     @classmethod
+    def durable_v6(
+        cls,
+        grounded: GroundedCandidateConfig | None = None,
+        *,
+        domain_layers: int = 1,
+        joint_layers: int = 2,
+    ) -> HybridActorCriticConfig:
+        return cls(
+            grounded=grounded or GroundedCandidateConfig(),
+            domain_layers=domain_layers,
+            joint_layers=joint_layers,
+            enable_hierarchical_branch_policy=True,
+            enable_durable_value_head=True,
+            enable_persistent_build_context=True,
+            enable_direct_vitals_context=True,
+            enable_macro_branch_prior=True,
+            enable_persistent_only_durable_value=True,
+            enable_asymmetric_revival_critic=True,
+            enable_draw_weighted_durable_value=True,
+            enable_role_conditioned_candidate_policy=True,
+            enable_deconfounded_durable_value=True,
+        )
+
+    @classmethod
     def from_mapping(
         cls,
         mapping: dict[str, Any],
@@ -247,6 +289,9 @@ class HybridActorCriticConfig:
                 ),
                 enable_role_conditioned_candidate_policy=bool(
                     mapping.get("enable_role_conditioned_candidate_policy", False)
+                ),
+                enable_deconfounded_durable_value=bool(
+                    mapping.get("enable_deconfounded_durable_value", False)
                 ),
             )
         raise ValueError(f"unsupported hybrid actor-critic model_config version: {version!r}")
@@ -296,6 +341,10 @@ class HybridActorCriticConfig:
                     enable_role_conditioned_candidate_policy=(
                         self.enable_role_conditioned_candidate_policy
                     ),
+                )
+            if self.enable_deconfounded_durable_value:
+                base.update(
+                    enable_deconfounded_durable_value=self.enable_deconfounded_durable_value,
                 )
         return base
 
@@ -536,20 +585,41 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             nn.init.zeros_(self.persistent_vitals_to_state.weight)
             nn.init.zeros_(self.persistent_vitals_to_state.bias)
             if actor_critic.enable_durable_value_head:
-                if actor_critic.enable_persistent_only_durable_value:
-                    self.durable_vitals_linear = nn.Linear(SALIENT_VITALS_DIM, 1, bias=False)
-                    nn.init.zeros_(self.durable_vitals_linear.weight)
-                dur_vitals_fc1 = nn.Linear(vitals_in_dim + rev_dim, cfg.ffn_dim)
-                nn.init.normal_(dur_vitals_fc1.weight, mean=0.0, std=0.35)
-                nn.init.zeros_(dur_vitals_fc1.bias)
-                dur_vitals_out = nn.Linear(cfg.ffn_dim, 1)
-                nn.init.zeros_(dur_vitals_out.weight)
-                nn.init.zeros_(dur_vitals_out.bias)
-                self.durable_vitals_head = nn.Sequential(
-                    dur_vitals_fc1,
-                    nn.SiLU(),
-                    dur_vitals_out,
-                )
+                if actor_critic.enable_deconfounded_durable_value:
+                    prog_in_dim = DURABLE_PROGRESS_VITALS_DIM + rev_dim
+                    prog_mid_dim = max(16, cfg.ffn_dim // 2)
+                    prog_fc1 = nn.Linear(prog_in_dim, cfg.ffn_dim)
+                    nn.init.normal_(prog_fc1.weight, mean=0.0, std=0.15)
+                    nn.init.zeros_(prog_fc1.bias)
+                    prog_fc2 = nn.Linear(cfg.ffn_dim, prog_mid_dim)
+                    nn.init.normal_(prog_fc2.weight, mean=0.0, std=0.10)
+                    nn.init.zeros_(prog_fc2.bias)
+                    prog_out = nn.Linear(prog_mid_dim, 1)
+                    nn.init.zeros_(prog_out.weight)
+                    nn.init.zeros_(prog_out.bias)
+                    self.durable_progress_vitals_head = nn.Sequential(
+                        nn.LayerNorm(prog_in_dim),
+                        prog_fc1,
+                        nn.SiLU(),
+                        prog_fc2,
+                        nn.SiLU(),
+                        prog_out,
+                    )
+                else:
+                    if actor_critic.enable_persistent_only_durable_value:
+                        self.durable_vitals_linear = nn.Linear(SALIENT_VITALS_DIM, 1, bias=False)
+                        nn.init.zeros_(self.durable_vitals_linear.weight)
+                    dur_vitals_fc1 = nn.Linear(vitals_in_dim + rev_dim, cfg.ffn_dim)
+                    nn.init.normal_(dur_vitals_fc1.weight, mean=0.0, std=0.35)
+                    nn.init.zeros_(dur_vitals_fc1.bias)
+                    dur_vitals_out = nn.Linear(cfg.ffn_dim, 1)
+                    nn.init.zeros_(dur_vitals_out.weight)
+                    nn.init.zeros_(dur_vitals_out.bias)
+                    self.durable_vitals_head = nn.Sequential(
+                        dur_vitals_fc1,
+                        nn.SiLU(),
+                        dur_vitals_out,
+                    )
             if actor_critic.enable_hierarchical_branch_policy:
                 branch_vitals_out = nn.Linear(cfg.ffn_dim, 1)
                 nn.init.zeros_(branch_vitals_out.weight)
@@ -598,19 +668,20 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 self.durable_deck_out = nn.Linear(cfg.ffn_dim * 3, 1)
                 nn.init.zeros_(self.durable_deck_out.weight)
                 nn.init.zeros_(self.durable_deck_out.bias)
-                deck_size_fc1 = nn.Linear(DURABLE_DECK_SIZE_DIM + rev_dim, cfg.ffn_dim)
-                nn.init.normal_(deck_size_fc1.weight, mean=0.0, std=0.25)
-                nn.init.zeros_(deck_size_fc1.bias)
-                deck_size_out = nn.Linear(cfg.ffn_dim, 1)
-                nn.init.zeros_(deck_size_out.weight)
-                nn.init.zeros_(deck_size_out.bias)
-                self.durable_deck_size_head = nn.Sequential(
-                    deck_size_fc1,
-                    nn.SiLU(),
-                    deck_size_out,
-                )
-                self.durable_deck_size_linear = nn.Linear(DURABLE_DECK_SIZE_DIM, 1, bias=False)
-                nn.init.zeros_(self.durable_deck_size_linear.weight)
+                if not actor_critic.enable_deconfounded_durable_value:
+                    deck_size_fc1 = nn.Linear(DURABLE_DECK_SIZE_DIM + rev_dim, cfg.ffn_dim)
+                    nn.init.normal_(deck_size_fc1.weight, mean=0.0, std=0.25)
+                    nn.init.zeros_(deck_size_fc1.bias)
+                    deck_size_out = nn.Linear(cfg.ffn_dim, 1)
+                    nn.init.zeros_(deck_size_out.weight)
+                    nn.init.zeros_(deck_size_out.bias)
+                    self.durable_deck_size_head = nn.Sequential(
+                        deck_size_fc1,
+                        nn.SiLU(),
+                        deck_size_out,
+                    )
+                    self.durable_deck_size_linear = nn.Linear(DURABLE_DECK_SIZE_DIM, 1, bias=False)
+                    nn.init.zeros_(self.durable_deck_size_linear.weight)
         if actor_critic.enable_hierarchical_branch_policy:
             branch_context_blocks = 3 + int(actor_critic.enable_direct_vitals_context)
             branch_dim = cfg.d_model * branch_context_blocks + cfg.recurrent_hidden_dim
@@ -885,9 +956,13 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
 
         features = world.features.clone()
         seq_rows = active_deck_row & deck_seq_mask
+        if self.actor_critic_config.enable_deconfounded_durable_value:
+            seq_len_val: Tensor | float = DECK_REFERENCE_SIZE / 64.0
+        else:
+            seq_len_val = (deck_size.unsqueeze(1) / 64.0).clamp(0.0, 1.0)
         features[:, :, 1] = torch.where(
             seq_rows,
-            (deck_size.unsqueeze(1) / 64.0).clamp(0.0, 1.0),
+            seq_len_val,
             features[:, :, 1],
         )
         card_rows = active_deck_row & deck_card_mask
@@ -1189,6 +1264,59 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         vitals_emb: Tensor = self.persistent_vitals_encoder(raw_vitals)
         return vitals_emb, raw_vitals
 
+    def _extract_progress_vitals(
+        self,
+        world: WorldTokenBatch,
+    ) -> Tensor:
+        pers_valid = self._persistent_token_mask(world.zone_ids, world.owner_ids, world.mask)
+        slot_end = min(int(world.features.shape[-1]), NUMERIC_FACT_SLOT_END)
+        feats = world.features[:, :, NUMERIC_FACT_SLOT_START:slot_end]
+        dtype = feats.dtype
+        player_valid = (world.zone_ids.eq(PLAYER_ZONE_ID) & pers_valid).unsqueeze(-1)
+        run_valid = (world.zone_ids.eq(RUN_ZONE_ID) & pers_valid).unsqueeze(-1)
+        player_max = torch.where(player_valid, feats, 0.0).amax(dim=1)
+        run_max = torch.where(run_valid, feats, 0.0).amax(dim=1)
+
+        hp_log = torch.maximum(
+            player_max[:, PLAYER_HP_OFFSET],
+            player_max[:, PLAYER_CURRENT_HP_OFFSET],
+        )
+        hp_val = torch.expm1((10.0 * hp_log).clamp(0.0, 8.0))
+        max_hp_val = torch.expm1((10.0 * player_max[:, PLAYER_MAX_HP_OFFSET]).clamp(0.0, 8.0)).clamp_min(1.0)
+        hp_ratio = (hp_val / max_hp_val).clamp(0.0, 2.0)
+        missing_hp_ratio = (1.0 - hp_ratio).clamp(0.0, 1.0)
+        low_hp_crisis = (0.5 - hp_ratio).clamp_min(0.0) * 2.0
+        gold_per_100 = (
+            torch.expm1((10.0 * player_max[:, PLAYER_GOLD_OFFSET]).clamp(0.0, 9.0)) / 100.0
+        ).clamp(0.0, 10.0)
+        open_potions = (
+            torch.expm1((10.0 * player_max[:, PLAYER_OPEN_POTION_SLOTS_OFFSET]).clamp(0.0, 4.0)) / 3.0
+        ).clamp(0.0, 2.0)
+
+        floor_val = torch.expm1((10.0 * run_max[:, RUN_FLOOR_OFFSET]).clamp(0.0, 5.0))
+        floor_norm = (floor_val / 50.0).clamp(0.0, 1.5)
+        act_val = torch.expm1((10.0 * run_max[:, RUN_ACT_OFFSET]).clamp(0.0, 3.0))
+        act_norm = (act_val / 3.0).clamp(0.0, 1.5)
+        is_act1 = (1.0 - (act_val - 1.0).abs()).clamp(0.0, 1.0)
+        is_act2 = (1.0 - (act_val - 2.0).abs()).clamp(0.0, 1.0)
+        is_act3 = (1.0 - (act_val - 3.0).abs()).clamp(0.0, 1.0)
+
+        return torch.stack(
+            [
+                hp_ratio,
+                missing_hp_ratio,
+                low_hp_crisis,
+                gold_per_100,
+                open_potions,
+                floor_norm,
+                act_norm,
+                is_act1,
+                is_act2,
+                is_act3,
+            ],
+            dim=-1,
+        ).to(dtype=dtype)
+
     @staticmethod
     def _scale_card_and_modifier_features(features: Tensor) -> Tensor:
         scaled = features.clone()
@@ -1216,6 +1344,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         build_embedding: Tensor | None,
         vitals_embedding: Tensor | None = None,
         raw_vitals: Tensor | None = None,
+        progress_vitals: Tensor | None = None,
         run_memory: Tensor,
         revival_context: Tensor | None = None,
         card_repr: Tensor | None = None,
@@ -1234,7 +1363,15 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         if rev_scaled is not None:
             parts.append(rev_scaled)
         out: Tensor = self.durable_value_head(torch.cat(parts, dim=-1)).squeeze(-1)
-        if raw_vitals is not None:
+        if self.actor_critic_config.enable_deconfounded_durable_value:
+            if progress_vitals is not None:
+                prog_in = (
+                    torch.cat([progress_vitals, rev_scaled], dim=-1)
+                    if rev_scaled is not None
+                    else progress_vitals
+                )
+                out = out + self.durable_progress_vitals_head(prog_in).squeeze(-1)
+        elif raw_vitals is not None:
             vitals_in = (
                 torch.cat([raw_vitals, rev_scaled], dim=-1)
                 if rev_scaled is not None
@@ -1275,30 +1412,33 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             )
             card_utilities = self.durable_deck_out(bilinear_card).squeeze(-1)
             expected_card_utility = torch.einsum("bw,bw->b", draw_prob, card_utilities)
-            has_deck_f = has_deck.to(dtype=out.dtype)
-            safe_n = deck_size.clamp_min(1.0)
-            deck_size_vec = (
-                torch.stack(
-                    [
-                        ((safe_n - DECK_REFERENCE_SIZE) / 10.0).clamp(-1.2, 5.0),
-                        (safe_n - 20.0).clamp_min(0.0) / 10.0,
-                        (DECK_REFERENCE_SIZE / safe_n).clamp(0.0, 4.0) - 1.0,
-                        torch.log1p(safe_n) - math.log1p(DECK_REFERENCE_SIZE),
-                    ],
-                    dim=-1,
+            if self.actor_critic_config.enable_deconfounded_durable_value:
+                out = out + expected_card_utility
+            else:
+                has_deck_f = has_deck.to(dtype=out.dtype)
+                safe_n = deck_size.clamp_min(1.0)
+                deck_size_vec = (
+                    torch.stack(
+                        [
+                            ((safe_n - DECK_REFERENCE_SIZE) / 10.0).clamp(-1.2, 5.0),
+                            (safe_n - 20.0).clamp_min(0.0) / 10.0,
+                            (DECK_REFERENCE_SIZE / safe_n).clamp(0.0, 4.0) - 1.0,
+                            torch.log1p(safe_n) - math.log1p(DECK_REFERENCE_SIZE),
+                        ],
+                        dim=-1,
+                    )
+                    * has_deck_f.unsqueeze(-1)
                 )
-                * has_deck_f.unsqueeze(-1)
-            )
-            deck_size_in = (
-                torch.cat([deck_size_vec, rev_scaled], dim=-1)
-                if rev_scaled is not None
-                else deck_size_vec
-            )
-            deck_size_delta = (
-                self.durable_deck_size_head(deck_size_in).squeeze(-1)
-                + self.durable_deck_size_linear(deck_size_vec).squeeze(-1)
-            ) * has_deck_f
-            out = out + expected_card_utility + deck_size_delta
+                deck_size_in = (
+                    torch.cat([deck_size_vec, rev_scaled], dim=-1)
+                    if rev_scaled is not None
+                    else deck_size_vec
+                )
+                deck_size_delta = (
+                    self.durable_deck_size_head(deck_size_in).squeeze(-1)
+                    + self.durable_deck_size_linear(deck_size_vec).squeeze(-1)
+                ) * has_deck_f
+                out = out + expected_card_utility + deck_size_delta
         if rev_scaled is not None:
             out = (
                 out
@@ -1421,13 +1561,17 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             )
         vitals_emb: Tensor | None = None
         raw_vitals: Tensor | None = None
+        progress_vitals: Tensor | None = None
         if self.actor_critic_config.enable_direct_vitals_context:
             vitals_emb, raw_vitals = self._encode_direct_vitals(pers_world)
+            if self.actor_critic_config.enable_deconfounded_durable_value:
+                progress_vitals = self._extract_progress_vitals(pers_world)
         durable_val = self._durable_readout(
             world_state_embedding=pers_enc.state_embedding,
             build_embedding=build_emb,
             vitals_embedding=vitals_emb,
             raw_vitals=raw_vitals,
+            progress_vitals=progress_vitals,
             run_memory=pers_run,
             revival_context=rev_ctx,
             card_repr=card_repr,
@@ -1904,12 +2048,17 @@ def initialize_actor_critic_from_macro_publication(
 
     destination = model.state_dict()
     loaded: dict[str, Tensor] = {}
+    retired_source: list[str] = []
     unmatched_source: list[str] = []
+    allow_retired = bool(model.actor_critic_config.enable_deconfounded_durable_value)
     for key, value in source_state.items():
         if value.is_floating_point() and not bool(torch.isfinite(value).all().item()):
             raise ValueError(f"hybrid macro publication tensor is non-finite: {key}")
         target = destination.get(key)
         if target is None or tuple(target.shape) != tuple(value.shape):
+            if allow_retired and target is None and key.startswith(RETIRED_DECONFOUNDED_SOURCE_PREFIXES):
+                retired_source.append(key)
+                continue
             unmatched_source.append(key)
             continue
         loaded[key] = value
@@ -1944,10 +2093,13 @@ def initialize_actor_critic_from_macro_publication(
             "macro publication leaves non-extension tensors uninitialized: "
             + ", ".join(sorted(unexpected_fresh))
         )
-    return {
+    summary: dict[str, tuple[str, ...]] = {
         "inherited": tuple(sorted(loaded)),
         "fresh": tuple(sorted(result.missing_keys)),
     }
+    if retired_source:
+        summary["retired"] = tuple(sorted(retired_source))
+    return summary
 
 
 __all__ = [

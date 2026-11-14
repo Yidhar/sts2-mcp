@@ -3041,3 +3041,459 @@ def test_v4_3_persistent_token_compaction_and_skip_durable_forward() -> None:
             assert pa.grad is not None and pb.grad is not None, na
             assert float((pa.grad - pb.grad).abs().max().item()) < 1e-5, na
 
+
+def test_v4_4_durable_v6_exact_degree_zero_intensive_invariance_and_hotstart() -> None:
+    """Verify durable_v6 is strictly invariant to deck-scale N_deck at fixed draw shares, extracts exact root progress vitals, and hot-starts cleanly from durable_v5."""
+    from sts2_rl.models.hybrid_actor_critic import initialize_actor_critic_from_macro_publication
+
+    torch.manual_seed(20261115)
+    cfg = _tiny_model_config()
+    grounded_cfg = cfg.to_model_config()
+    encoder = GroundedObservationEncoder(cfg.to_encoding_config())
+
+    v5_cfg = HybridActorCriticConfig.durable_v5(grounded_cfg)
+    v6_cfg = HybridActorCriticConfig.durable_v6(grounded_cfg)
+    assert v6_cfg.as_mapping()["enable_deconfounded_durable_value"] is True
+    assert HybridActorCriticConfig.from_mapping(v6_cfg.as_mapping(), fallback_grounded=grounded_cfg) == v6_cfg
+
+    v5_model = HybridDomainActorCriticModel(v5_cfg).eval()
+    v6_model = HybridDomainActorCriticModel(v6_cfg).eval()
+    report = initialize_actor_critic_from_macro_publication(v6_model, v5_model.state_dict())
+    assert any(k.startswith("durable_deck_size_") for k in report["retired"])
+    assert any(k.startswith("durable_vitals_") for k in report["retired"])
+    assert any(k.startswith("durable_progress_vitals_head.") for k in report["fresh"])
+
+    # Randomize all zero-initialized durable_v6 heads so no zero-init masks any N_deck leak!
+    with torch.no_grad():
+        for mod in (
+            v6_model.durable_deck_out,
+            v6_model.durable_progress_vitals_head,
+            v6_model.durable_revival_head,
+            v6_model.durable_revival_linear,
+            v6_model.durable_value_head,
+        ):
+            assert mod is not None
+            for p in mod.parameters():
+                p.add_(0.25 * torch.randn_like(p))
+
+    def _deck_k(mult: int) -> list[dict[str, Any]]:
+        cards: list[dict[str, Any]] = []
+        for idx in range(4 * mult):
+            cards.append({"id": f"strike_{idx % 2}", "type": "Attack", "rarity": "Basic", "cost": 1, "dynamic_vars": {"Damage": 6}})
+        for idx in range(4 * mult):
+            cards.append({"id": f"defend_{idx % 2}", "type": "Skill", "rarity": "Basic", "cost": 1, "dynamic_vars": {"Block": 5}})
+        return cards
+
+    obs_10, _ = _rest_surface(_deck_k(1))
+    obs_20, _ = _rest_surface(_deck_k(2))
+    obs_10_coord = copy.deepcopy(obs_10)
+    obs_10_coord["run"] = {"active": True, "act": 1, "floor": 6, "ascension": 0, "coord": {"x": 3, "y": 5}, "next_boss": "THE_GUARDIAN"}
+    obs_act3 = copy.deepcopy(obs_10)
+    obs_act3["run"] = {"active": True, "act": 3, "floor": 42, "ascension": 0}
+    obs_low_hp = copy.deepcopy(obs_10)
+    obs_low_hp["player"]["hp"] = 12
+
+    worlds = tuple(
+        encoder.encode_world_snapshot(o)
+        for o in (obs_10, obs_20, obs_10_coord, obs_act3, obs_low_hp)
+    )
+    wb, dom = collate_encoded_worlds(
+        worlds,
+        expected_config=worlds[0].config,
+        expected_fingerprint=worlds[0].encoding_fingerprint,
+        device="cpu",
+    )
+    rev_ctx = torch.tensor([[0.1, 0.01, 0.05, 0.1, 0.0, 0.0]] * len(worlds), dtype=torch.float32)
+    with torch.no_grad():
+        vals, _ = v6_model.forward_durable_value(wb, dom, critic_revival_context=rev_ctx, validate=True)
+        prog_vitals = v6_model._extract_progress_vitals(wb)
+
+    # 1. Exact degree-0 intensive scaling invariance: 8-card vs 16-card identical draw distribution!
+    assert abs(float(vals[0].item() - vals[1].item())) < 1e-6
+    # 2. Child run tokens (coord, next_boss) do NOT dilute root progress vitals!
+    assert torch.allclose(prog_vitals[0], prog_vitals[2], atol=1e-6)
+    assert not torch.allclose(prog_vitals[0], prog_vitals[3], atol=1e-4)
+    # 3. Genuine progress (act/floor) and HP changes shift V_durable directly!
+    assert abs(float(vals[0].item() - vals[3].item())) > 1e-3
+    assert abs(float(vals[0].item() - vals[4].item())) > 1e-3
+
+
+def test_v4_4_partial_shop_afterstates_and_selection_upgrade_remove_afterstates() -> None:
+    """Verify partial shop afterstates skip only stochastic relics and selection surfaces synthesize DeckUpgrade/DeckRemove."""
+    from sts2_rl.joint.afterstate import synthesize_partial_deterministic_afterstates
+
+    cfg = _tiny_model_config()
+    encoder = GroundedObservationEncoder(cfg.to_encoding_config())
+
+    # 1. Rich shop containing one pickup-effect relic + passive relic + card_removal + leave:
+    shop_obs: dict[str, Any] = {
+        "phase": "shop",
+        "decision_domain": "shop",
+        "run": {"active": True, "act": 1, "floor": 5},
+        "player": {
+            "character_id": "IRONCLAD",
+            "hp": 60,
+            "max_hp": 80,
+            "gold": 400,
+            "open_potion_slots": 2,
+            "deck": _sample_deck(),
+            "relics": [],
+            "potions": [],
+        },
+        "shop": {
+            "visible": True,
+            "is_open": True,
+            "gold": 400,
+            "items": [
+                {"index": 0, "slot_index": 0, "category": "relic", "type": "relic", "cost": 150, "relic": {"id": "OLD_COIN", "has_upon_pickup_effect": True}},
+                {"index": 1, "slot_index": 1, "category": "relic", "type": "relic", "cost": 150, "relic": {"id": "ANCHOR", "has_upon_pickup_effect": False}},
+                {"index": 2, "slot_index": 2, "category": "card_removal", "type": "card_removal", "cost": 75},
+            ],
+        },
+    }
+    shop_legal = [
+        {"action_id": "buy0", "kind": "shop_purchase", "model_action_kind": "shop", "is_enabled": True, "item": shop_obs["shop"]["items"][0]},
+        {"action_id": "buy1", "kind": "shop_purchase", "model_action_kind": "shop", "is_enabled": True, "item": shop_obs["shop"]["items"][1]},
+        {"action_id": "rem2", "kind": "shop_purchase", "model_action_kind": "shop", "is_enabled": True, "item": shop_obs["shop"]["items"][2]},
+        {"action_id": "leave", "kind": "shop_leave", "model_action_kind": "shop", "is_enabled": True},
+    ]
+    shop_dec = forward_decision(shop_obs, shop_legal, control_domain="macro")
+    assert shop_dec is not None
+    # Full synthesizer stays strictly fail-closed on pickup-effect relic:
+    assert synthesize_deterministic_afterstates(encoder=encoder, observation=shop_obs, decision=shop_dec) is None
+    # Partial synthesizer rescues all deterministic candidates (passive relic + all removes + leave):
+    partial = synthesize_partial_deterministic_afterstates(encoder=encoder, observation=shop_obs, decision=shop_dec)
+    assert partial is not None
+    det_indices, det_worlds = partial
+    assert len(det_indices) == len(det_worlds) == len(shop_dec.candidates) - 1
+    excluded = set(range(len(shop_dec.candidates))) - set(det_indices)
+    assert len(excluded) == 1
+    excluded_idx = next(iter(excluded))
+    assert shop_dec.candidates[excluded_idx].branch == "buy_relic"
+
+    # 2. Single-card DeckUpgrade and DeckRemove selection surfaces:
+    deck_cards = _sample_deck()
+    upg_obs: dict[str, Any] = {
+        "phase": "card_selection",
+        "decision_domain": "card_selection",
+        "run": {"active": True, "act": 1, "floor": 8},
+        "player": {"character_id": "IRONCLAD", "hp": 55, "max_hp": 80, "gold": 120, "deck": deck_cards, "relics": [], "potions": []},
+        "card_selection": {
+            "screen_subtype": "DeckUpgrade",
+            "prompt": "Choose a card to upgrade",
+            "min_select": 1,
+            "max_select": 1,
+            "selected_count": 0,
+            "requires_confirm": False,
+            "cancelable": False,
+            "confirm_enabled": False,
+            "cards": [
+                {**copy.deepcopy(deck_cards[0]), "pile": "Deck", "selection_slot": 0},
+                {**copy.deepcopy(deck_cards[-1]), "pile": "Deck", "selection_slot": 1},
+            ],
+        },
+    }
+    upg_legal = [
+        {"action_id": "sel0", "kind": "select_card", "model_action_kind": "card_selection", "is_enabled": True, "card": upg_obs["card_selection"]["cards"][0]},
+        {"action_id": "sel1", "kind": "select_card", "model_action_kind": "card_selection", "is_enabled": True, "card": upg_obs["card_selection"]["cards"][1]},
+    ]
+    upg_dec = forward_decision(upg_obs, upg_legal, control_domain="macro")
+    assert upg_dec is not None and upg_dec.surface == "selection"
+    upg_worlds = synthesize_deterministic_afterstates(encoder=encoder, observation=upg_obs, decision=upg_dec)
+    assert upg_worlds is not None and len(upg_worlds) == 2
+
+    rem_obs = copy.deepcopy(upg_obs)
+    rem_obs["card_selection"]["screen_subtype"] = "DeckRemove"
+    for c_item in rem_obs["card_selection"]["cards"]:
+        c_item.pop("upgrade_preview", None)
+    rem_legal = [
+        {"action_id": "rem0", "kind": "select_card", "model_action_kind": "card_selection", "is_enabled": True, "card": rem_obs["card_selection"]["cards"][0]},
+        {"action_id": "rem1", "kind": "select_card", "model_action_kind": "card_selection", "is_enabled": True, "card": rem_obs["card_selection"]["cards"][1]},
+    ]
+    rem_dec = forward_decision(rem_obs, rem_legal, control_domain="macro")
+    assert rem_dec is not None and rem_dec.surface == "selection"
+    rem_worlds = synthesize_deterministic_afterstates(encoder=encoder, observation=rem_obs, decision=rem_dec)
+    assert rem_worlds is not None and len(rem_worlds) == 2
+
+    # Multi-card selection (max_select=2) and manual-confirmation screens fail closed:
+    multi_obs = copy.deepcopy(rem_obs)
+    multi_obs["card_selection"]["max_select"] = 2
+    assert synthesize_deterministic_afterstates(encoder=encoder, observation=multi_obs, decision=rem_dec) is None
+
+    manual_obs = copy.deepcopy(upg_obs)
+    manual_obs["card_selection"].pop("requires_confirm", None)
+    manual_obs["card_selection"]["requires_manual_confirmation"] = True
+    assert synthesize_deterministic_afterstates(encoder=encoder, observation=manual_obs, decision=upg_dec) is None
+
+    canonical_auto_obs = copy.deepcopy(upg_obs)
+    canonical_auto_obs["card_selection"].pop("requires_confirm", None)
+    canonical_auto_obs["card_selection"].pop("screen_subtype", None)
+    canonical_auto_obs["card_selection"]["requires_manual_confirmation"] = False
+    canonical_auto_obs["card_selection"]["mode"] = "DeckUpgrade"
+    canonical_auto_obs["card_selection"]["prompt_id"] = "card_selection.TO_UPGRADE"
+    canonical_auto_obs["card_selection"]["operation_type"] = "upgrade"
+    auto_worlds = synthesize_deterministic_afterstates(encoder=encoder, observation=canonical_auto_obs, decision=upg_dec)
+    assert auto_worlds is not None and len(auto_worlds) == 2
+
+
+def test_v4_4_hierarchical_afterstate_mpo_min_temperature_and_minority_branch_polarity() -> None:
+    """Verify min_temperature damps tiny noise and hierarchical MPO gives unattenuated within-branch targets."""
+    from sts2_rl.joint.macro_targets import project_hierarchical_macro_policy, project_macro_policy
+
+    teacher_lp = torch.log_softmax(torch.tensor([0.0, 0.0], dtype=torch.float32), dim=0)
+    tiny_noise_q = torch.tensor([0.5000, 0.5004], dtype=torch.float32)
+    proj_unreg = project_macro_policy(action_value_targets=tiny_noise_q, teacher_log_probs=teacher_lp, max_kl=0.04)
+    proj_reg = project_macro_policy(
+        action_value_targets=tiny_noise_q,
+        teacher_log_probs=teacher_lp,
+        max_kl=0.04,
+        min_temperature=0.008,
+    )
+    assert proj_unreg.kl > 0.035  # scale-free noise saturates KL without min_temperature
+    assert proj_reg.kl < 0.002  # min_temperature damps sub-millipoint noise by >95%!
+
+    # Partial shop: candidate 0 = stochastic relic (p=0.10), candidate 1 = leave (p=0.89),
+    # candidates 2,3 = shop:remove Strike vs Bash (p=0.005 each -> minority branch P=0.01!).
+    prior_probs = torch.tensor([0.10, 0.89, 0.005, 0.005], dtype=torch.float32)
+    prior_logs = prior_probs.log()
+    prior_logs = prior_logs - torch.logsumexp(prior_logs, dim=0)
+    branch_ids = torch.tensor([0, 1, 2, 2], dtype=torch.long)
+    # Deterministic subset D = (1, 2, 3): Leave=0.40, Remove(Strike)=0.46, Remove(Bash)=0.32
+    det_q = torch.tensor([0.40, 0.46, 0.32], dtype=torch.float32)
+    h_proj = project_hierarchical_macro_policy(
+        det_action_values=det_q,
+        teacher_log_probs=prior_logs,
+        policy_branch_ids=branch_ids,
+        deterministic_indices=(1, 2, 3),
+        branch_max_kl=0.03,
+        within_max_kl=0.04,
+        min_temperature=0.008,
+    )
+    assert h_proj.actor_enabled is True
+    # Stochastic candidate 0 outside D conserves exact teacher probability:
+    assert abs(float(h_proj.target_probabilities[0].item() - h_proj.teacher_probabilities[0].item())) < 1e-6
+    # Remove branch mass grows because post-improvement Q_branch(remove) > Q(leave):
+    assert float(h_proj.target_probabilities[2:].sum().item()) > float(h_proj.teacher_probabilities[2:].sum().item())
+    # Unattenuated within-branch target puts >60% conditional mass on Remove(Strike) over Remove(Bash):
+    assert len(h_proj.within_branch_targets) == 1
+    rem_indices, rem_w = h_proj.within_branch_targets[0]
+    assert rem_indices == (2, 3)
+    assert float(rem_w[0].item()) > 0.60
+
+
+def test_v4_4_configs_and_learner_batched_parity_with_partial_nodes_and_pg_fallback() -> None:
+    """Verify v10 configs and exact batched vs single learner parity across full, partial-MPO, and partial-PG-fallback nodes."""
+    from sts2_rl.joint.afterstate import synthesize_partial_deterministic_afterstates
+    from sts2_rl.train_macro_credit import _actor_critic_config
+
+    torch.manual_seed(20261116)
+    exp_dir = Path(__file__).resolve().parents[1] / "config/experiments"
+    for fname, expected_budget, expected_offset in (
+        ("hybrid_macro_credit_v10_durable_afterstate_v44_b32_g4_turbo.toml", 32, 120000),
+        ("hybrid_macro_credit_v10_durable_afterstate_v44_b16_g4_turbo.toml", 16, 130000),
+    ):
+        c10 = load_macro_training_config(exp_dir / fname)
+        assert c10.learner.revival_budget == expected_budget
+        assert c10.training.curriculum.revival_budget == expected_budget
+        assert c10.course.seed_index_offset == expected_offset
+        assert c10.learner.enable_deconfounded_durable_value is True
+        assert c10.learner.enable_partial_afterstates is True
+        assert c10.learner.enable_hierarchical_afterstate_mpo is True
+        assert _actor_critic_config(c10) == HybridActorCriticConfig.durable_v6(c10.training.model.to_model_config())
+
+    cfg = _tiny_model_config()
+    encoder = GroundedObservationEncoder(cfg.to_encoding_config())
+    v6_init = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v6(cfg.to_model_config())).eval()
+    with torch.no_grad():
+        for mod in (v6_init.durable_deck_out, v6_init.durable_progress_vitals_head, v6_init.candidate_role_policy_head):
+            assert mod is not None
+            for p in mod.parameters():
+                p.add_(0.15 * torch.randn_like(p))
+
+    rest_obs, rest_legal = _rest_surface()
+    rest_dec = forward_decision(rest_obs, rest_legal, control_domain="macro")
+    assert rest_dec is not None
+    rest_enc = encoder.encode(rest_obs, [c.semantic_action for c in rest_dec.candidates])
+    rest_grouped = tuple(rest_dec.candidates[ref.representative_position] for ref in rest_enc.actions)
+    rest_posts = synthesize_deterministic_afterstates(
+        encoder=encoder, observation=rest_obs, decision=rest_dec, candidates=rest_grouped
+    )
+    assert rest_posts is not None
+
+    shop_obs: dict[str, Any] = {
+        "phase": "shop",
+        "decision_domain": "shop",
+        "run": {"active": True, "act": 1, "floor": 5},
+        "player": {
+            "character_id": "IRONCLAD",
+            "hp": 60,
+            "max_hp": 80,
+            "gold": 400,
+            "open_potion_slots": 2,
+            "deck": _sample_deck(),
+            "relics": [],
+            "potions": [],
+        },
+        "shop": {
+            "visible": True,
+            "is_open": True,
+            "gold": 400,
+            "items": [
+                {"index": 0, "slot_index": 0, "category": "relic", "type": "relic", "cost": 150, "relic": {"id": "OLD_COIN", "has_upon_pickup_effect": True}},
+                {"index": 1, "slot_index": 1, "category": "card_removal", "type": "card_removal", "cost": 75},
+            ],
+        },
+    }
+    shop_legal = [
+        {"action_id": "buy0", "kind": "shop_purchase", "model_action_kind": "shop", "is_enabled": True, "item": shop_obs["shop"]["items"][0]},
+        {"action_id": "rem1", "kind": "shop_purchase", "model_action_kind": "shop", "is_enabled": True, "item": shop_obs["shop"]["items"][1]},
+        {"action_id": "leave", "kind": "shop_leave", "model_action_kind": "shop", "is_enabled": True},
+    ]
+    shop_dec = forward_decision(shop_obs, shop_legal, control_domain="macro")
+    assert shop_dec is not None
+    shop_enc = encoder.encode(shop_obs, [c.semantic_action for c in shop_dec.candidates])
+    shop_grouped = tuple(shop_dec.candidates[ref.representative_position] for ref in shop_enc.actions)
+    partial_shop = synthesize_partial_deterministic_afterstates(
+        encoder=encoder, observation=shop_obs, decision=shop_dec, candidates=shop_grouped
+    )
+    assert partial_shop is not None
+    shop_det_idx, shop_posts = partial_shop
+    stoch_action_idx = next(i for i in range(len(shop_grouped)) if i not in shop_det_idx)
+    det_action_idx = shop_det_idx[0]
+
+    combat_obs = {
+        "phase": "combat",
+        "decision_domain": "combat",
+        "run": {"active": True, "act": 1, "floor": 7},
+        "player": {"id": "ironclad", "side": "player", "hp": 60, "max_hp": 80, "energy": 3, "hand": [{"id": "strike", "cost": 1}]},
+        "combat": {"in_progress": True, "enemies": [{"id": "cultist", "side": "enemy", "hp": 40, "max_hp": 48}]},
+    }
+    combat_actions = [
+        {"action_handle": "c0", "kind": "play_card", "model_action_kind": "play_card", "is_enabled": True, "card": {"id": "strike", "cost": 1}},
+        {"action_handle": "c1", "kind": "end_turn", "model_action_kind": "end_turn", "is_enabled": True},
+    ]
+    combat_snap = encoder.encode(combat_obs, combat_actions).snapshot
+    rev0 = torch.zeros((1, 6), dtype=torch.float32)
+
+    trajs: list[MacroCreditTrajectory] = []
+    specs = [
+        (rest_enc.snapshot, "rest_site", rest_grouped, 0, MacroAfterstateNode(0, "rest_site", tuple(c.branch for c in rest_grouped), rest_posts)),
+        (
+            shop_enc.snapshot,
+            "shop",
+            shop_grouped,
+            det_action_idx,
+            MacroAfterstateNode(
+                0,
+                "shop",
+                tuple(shop_grouped[i].branch for i in shop_det_idx),
+                shop_posts,
+                candidate_indices=shop_det_idx,
+                is_partial=True,
+            ),
+        ),
+        (
+            shop_enc.snapshot,
+            "shop",
+            shop_grouped,
+            stoch_action_idx,
+            MacroAfterstateNode(
+                0,
+                "shop",
+                tuple(shop_grouped[i].branch for i in shop_det_idx),
+                shop_posts,
+                candidate_indices=shop_det_idx,
+                is_partial=True,
+            ),
+        ),
+    ]
+    with torch.no_grad():
+        for ep_i, (snap0, surf0, cands0, act0, node0) in enumerate(specs):
+            b0 = collate_encoded_snapshots(
+                (snap0,), expected_config=snap0.config, expected_fingerprint=snap0.encoding_fingerprint, device="cpu"
+            )
+            o0 = v6_init(b0, None, critic_revival_context=rev0, validate=False)
+            m0 = torch.tensor(snap0.action_mask.tolist(), dtype=torch.bool)
+            lp0 = torch.log_softmax(o0.policy_logits[0, : m0.numel()].masked_fill(~m0, -torch.inf), dim=0)
+            prior0 = macro_mixture_log_probs(lp0, snap0, 0.04)
+
+            b1 = collate_encoded_snapshots(
+                (combat_snap,),
+                expected_config=combat_snap.config,
+                expected_fingerprint=combat_snap.encoding_fingerprint,
+                device="cpu",
+            )
+            o1 = v6_init(b1, o0.recurrent_state, critic_revival_context=rev0, validate=False)
+            m1 = torch.tensor(combat_snap.action_mask.tolist(), dtype=torch.bool)
+            lp1 = torch.log_softmax(o1.policy_logits[0, : m1.numel()].masked_fill(~m1, -torch.inf), dim=0)
+
+            s0 = HybridVTraceStep(snap0, act0, float(prior0[act0].item()), 0.0, 1.0, False, surf0, cands0[act0].branch, "macro", 0)
+            f0 = MacroRewardFacts(0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 5, 5, 1)
+            s1 = HybridVTraceStep(combat_snap, 0, float(lp1[0].item()), 1.2 + 0.3 * ep_i, 0.0, True, "combat", "play_card", "combat", 0)
+            f1 = MacroRewardFacts(1.2 + 0.3 * ep_i, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 7, 7, 1)
+            trajs.append(
+                MacroCreditTrajectory(
+                    f"v44-{ep_i}",
+                    6_700_300 + 2 * ep_i,
+                    0,
+                    (),
+                    (s0, s1),
+                    None,
+                    None,
+                    "factual_terminal",
+                    (f0, f1),
+                    macro_branch_epsilon=0.04,
+                    afterstate_nodes=(node0,),
+                )
+            )
+
+    cohort = MacroCreditCohort("v44-cohort", 0, (), natural_only=tuple(trajs))
+    v6_lcfg = dict(
+        target_mode="durable_afterstate_v2",
+        enable_direct_vitals_context=True,
+        enable_macro_branch_prior=True,
+        enable_persistent_only_durable_value=True,
+        enable_asymmetric_revival_critic=True,
+        enable_draw_weighted_durable_value=True,
+        enable_role_conditioned_candidate_policy=True,
+        enable_deconfounded_durable_value=True,
+        enable_partial_afterstates=True,
+        enable_hierarchical_afterstate_mpo=True,
+        macro_mpo_min_temperature=0.008,
+        macro_within_branch_kl=0.04,
+        macro_within_branch_mpo_weight=0.50,
+        revival_budget=32,
+        zero_macro_pace_penalty=True,
+        clip_macro_pg_fallback=True,
+        macro_pg_within_branch_entropy_only=True,
+        separate_value_grad_clip=True,
+        durable_warmup_updates=0,
+        combat_actor_warmup_updates=0,
+    )
+    m6_b = MacroCreditLearner(
+        model=copy.deepcopy(v6_init),
+        config=MacroCreditLearnerConfig(**v6_lcfg, eval_batch_size=8, chunk_batch_size=8),  # type: ignore[arg-type]
+    ).learn(cohort)
+    m6_s = MacroCreditLearner(
+        model=copy.deepcopy(v6_init),
+        config=MacroCreditLearnerConfig(**v6_lcfg, eval_batch_size=1, chunk_batch_size=1),  # type: ignore[arg-type]
+    ).learn(cohort)
+
+    assert m6_b["afterstate_steps"] == 2
+    assert m6_b["partial_afterstate_steps"] == 1
+    assert m6_b["partial_afterstate_pg_fallback_steps"] == 1
+    assert m6_b["macro_pg_fallback_steps"] == 1
+    assert m6_b["macro_mpo_within_policy_loss"] > 0.0
+    for key in (
+        "durable_value_loss",
+        "durable_post_value_loss",
+        "macro_policy_loss",
+        "macro_mpo_policy_loss",
+        "macro_mpo_within_policy_loss",
+        "macro_pg_policy_loss",
+        "gradient_norm",
+        "parameter_delta_norm",
+    ):
+        assert m6_b[key] == pytest.approx(m6_s[key], abs=1e-5), key
+
+

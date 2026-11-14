@@ -155,24 +155,60 @@ def macro_mixture_log_probs(
 
 @dataclass(frozen=True, slots=True)
 class MacroAfterstateNode:
-    """Verified deterministic post-state worlds for all legal candidates at one macro step."""
+    """Verified deterministic post-state worlds for legal candidates at one macro step."""
 
     step_index: int
     surface: str
     candidate_branches: tuple[str, ...]
     post_worlds: tuple[EncodedWorldSnapshot, ...]
+    candidate_indices: tuple[int, ...] | None = None
+    is_partial: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.step_index, bool) or not isinstance(self.step_index, int) or self.step_index < 0:
             raise ValueError("afterstate step_index must be a non-negative integer")
         if not isinstance(self.surface, str) or not self.surface:
             raise ValueError("afterstate surface must be non-empty")
+        if not isinstance(self.is_partial, bool):
+            raise ValueError("afterstate is_partial must be boolean")
         if len(self.post_worlds) < 2 or len(self.candidate_branches) != len(self.post_worlds):
             raise ValueError("afterstate node requires complete multi-candidate post_worlds and branches")
         if any(not isinstance(branch, str) or not branch for branch in self.candidate_branches):
             raise ValueError("afterstate candidate_branches must be non-empty strings")
         if not all(isinstance(world, EncodedWorldSnapshot) for world in self.post_worlds):
             raise ValueError("afterstate post_worlds must be EncodedWorldSnapshot instances")
+        if self.candidate_indices is None:
+            if self.is_partial:
+                raise ValueError("partial afterstate node requires explicit candidate_indices")
+            object.__setattr__(self, "candidate_indices", tuple(range(len(self.post_worlds))))
+        indices = self.candidate_indices
+        assert indices is not None
+        if len(indices) != len(self.post_worlds):
+            raise ValueError("afterstate candidate_indices must match post_worlds length")
+        prev_idx = -1
+        for idx in indices:
+            if isinstance(idx, bool) or not isinstance(idx, int) or idx <= prev_idx:
+                raise ValueError("afterstate candidate_indices must be strictly increasing non-negative ints")
+            prev_idx = idx
+        if not self.is_partial and indices != tuple(range(len(self.post_worlds))):
+            raise ValueError("non-partial afterstate node must cover contiguous 0..K-1 candidate indices")
+
+    @property
+    def resolved_candidate_indices(self) -> tuple[int, ...]:
+        assert self.candidate_indices is not None
+        return self.candidate_indices
+
+    def post_world_for_action(self, action_index: int) -> EncodedWorldSnapshot | None:
+        indices = self.resolved_candidate_indices
+        if len(indices) == len(self.post_worlds) and indices[-1] == len(self.post_worlds) - 1:
+            if 0 <= action_index < len(self.post_worlds):
+                return self.post_worlds[action_index]
+            return None
+        try:
+            pos = indices.index(action_index)
+        except ValueError:
+            return None
+        return self.post_worlds[pos]
 
     def storage_nbytes(self) -> int:
         seen: set[int] = set()
@@ -273,9 +309,18 @@ class MacroCreditTrajectory:
             target_step = self.steps[node.step_index]
             if target_step.control_domain != "macro" or target_step.surface != node.surface:
                 raise ValueError("afterstate node must align with a macro step of the same surface")
-            if (
+            if not bool(target_step.snapshot.action_mask.all()):
+                raise ValueError("afterstate node requires an unmasked legal candidate snapshot")
+            det_indices = node.resolved_candidate_indices
+            if node.is_partial:
+                if det_indices[-1] >= target_step.snapshot.candidate_count:
+                    raise ValueError("partial afterstate node candidate_indices exceed step candidate_count")
+                if target_step.action_index in det_indices:
+                    det_pos = det_indices.index(target_step.action_index)
+                    if target_step.branch != node.candidate_branches[det_pos]:
+                        raise ValueError("partial afterstate node disagrees with selected action branch")
+            elif (
                 target_step.snapshot.candidate_count != len(node.post_worlds)
-                or not bool(target_step.snapshot.action_mask.all())
                 or target_step.branch != node.candidate_branches[target_step.action_index]
             ):
                 raise ValueError("afterstate node must cover the complete legal candidate set of its step")

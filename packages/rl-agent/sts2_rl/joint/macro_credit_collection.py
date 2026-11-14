@@ -39,7 +39,10 @@ from sts2_rl.semantics.clock import decision_discount
 from sts2_rl.semantics.forward import ForwardDecision, SemanticCandidate
 from sts2_rl.training.config import TrainingConfig
 
-from .afterstate import synthesize_deterministic_afterstates
+from .afterstate import (
+    synthesize_deterministic_afterstates,
+    synthesize_partial_deterministic_afterstates,
+)
 from .macro_credit_data import (
     MacroAfterstateNode,
     MacroCounterfactualRoot,
@@ -75,6 +78,7 @@ class StochasticBranchAuthority(BranchAuthority):
     policy_mode = "frozen_stochastic"
     macro_branch_epsilon: float = 0.0
     collect_afterstates: bool = False
+    allow_partial_afterstates: bool = False
 
     def __init__(
         self,
@@ -87,6 +91,7 @@ class StochasticBranchAuthority(BranchAuthority):
         config: TrainingConfig,
         macro_branch_epsilon: float = 0.0,
         collect_afterstates: bool = False,
+        allow_partial_afterstates: bool = False,
     ) -> None:
         super().__init__(policy, seed, limits, forced_candidate)
         training_seed(seed)
@@ -98,14 +103,19 @@ class StochasticBranchAuthority(BranchAuthority):
             raise ValueError("macro_branch_epsilon must be finite and in [0.0, 1.0)")
         if not isinstance(collect_afterstates, bool):
             raise ValueError("collect_afterstates must be boolean")
+        if not isinstance(allow_partial_afterstates, bool):
+            raise ValueError("allow_partial_afterstates must be boolean")
         self.teacher_version = teacher_version
         self.macro_branch_epsilon = float(macro_branch_epsilon)
         self.collect_afterstates = collect_afterstates
+        self.allow_partial_afterstates = allow_partial_afterstates
         self._sampling_rng = np.random.default_rng(np.random.SeedSequence([seed, 0x4D414352]))
         self._encoder = GroundedObservationEncoder(config.model.to_encoding_config())
         self.current_snapshot: EncodedDecisionSnapshot | None = None
         self.current_afterstates: tuple[EncodedWorldSnapshot, ...] | None = None
         self.current_afterstate_branches: tuple[str, ...] | None = None
+        self.current_afterstate_indices: tuple[int, ...] | None = None
+        self.current_afterstate_is_partial: bool = False
         self.bootstrap_snapshot: EncodedDecisionSnapshot | None = None
         self.root_teacher_log_probs: tuple[float, ...] | None = None
         self._behavior_log_probability = 0.0
@@ -120,6 +130,8 @@ class StochasticBranchAuthority(BranchAuthority):
     ) -> None:
         self.current_afterstates = None
         self.current_afterstate_branches = None
+        self.current_afterstate_indices = None
+        self.current_afterstate_is_partial = False
         if self.collect_afterstates and self.branch_limits.terminal_only and self.forced_candidate is None:
             self._current_is_root = False
             return
@@ -170,15 +182,32 @@ class StochasticBranchAuthority(BranchAuthority):
         control_domain: Literal["macro", "combat"],
     ) -> None:
         if self.collect_afterstates and control_domain == "macro" and len(candidates) >= 2:
-            post_worlds = synthesize_deterministic_afterstates(
-                encoder=self._encoder,
-                observation=observation,
-                decision=decision,
-                candidates=candidates,
-            )
-            if post_worlds is not None:
-                self.current_afterstates = post_worlds
-                self.current_afterstate_branches = tuple(candidate.branch for candidate in candidates)
+            if self.allow_partial_afterstates:
+                partial = synthesize_partial_deterministic_afterstates(
+                    encoder=self._encoder,
+                    observation=observation,
+                    decision=decision,
+                    candidates=candidates,
+                )
+                if partial is not None:
+                    det_indices, post_worlds = partial
+                    is_part = len(det_indices) < len(candidates)
+                    self.current_afterstates = post_worlds
+                    self.current_afterstate_branches = tuple(candidates[idx].branch for idx in det_indices)
+                    self.current_afterstate_indices = det_indices if is_part else None
+                    self.current_afterstate_is_partial = is_part
+            else:
+                post_worlds_full = synthesize_deterministic_afterstates(
+                    encoder=self._encoder,
+                    observation=observation,
+                    decision=decision,
+                    candidates=candidates,
+                )
+                if post_worlds_full is not None:
+                    self.current_afterstates = post_worlds_full
+                    self.current_afterstate_branches = tuple(candidate.branch for candidate in candidates)
+                    self.current_afterstate_indices = None
+                    self.current_afterstate_is_partial = False
         super()._record_semantic_choice(
             observation=observation,
             decision=decision,
@@ -369,10 +398,14 @@ class TrainingEvidenceTrace(_GuardedEvidenceTrace):
                     surface=event["surface"],
                     candidate_branches=self.authority.current_afterstate_branches,
                     post_worlds=self.authority.current_afterstates,
+                    candidate_indices=self.authority.current_afterstate_indices,
+                    is_partial=self.authority.current_afterstate_is_partial,
                 )
                 self.snapshot_bytes += node.storage_nbytes()
                 self.authority.current_afterstates = None
                 self.authority.current_afterstate_branches = None
+                self.authority.current_afterstate_indices = None
+                self.authority.current_afterstate_is_partial = False
                 if self.snapshot_bytes > self.maximum_snapshot_bytes:
                     raise ProbeBudgetExhausted("maximum_snapshot_bytes")
                 self.afterstate_nodes.append(node)
@@ -489,6 +522,8 @@ class TrainingEvidenceTrace(_GuardedEvidenceTrace):
                 surface=node.surface,
                 candidate_branches=node.candidate_branches,
                 post_worlds=node.post_worlds,
+                candidate_indices=node.candidate_indices,
+                is_partial=node.is_partial,
             )
             for node in self.afterstate_nodes
             if node.step_index >= start
@@ -731,6 +766,7 @@ def collect_durable_afterstate_episode(
     limits: BranchLimits,
     output_dir: Path,
     macro_branch_epsilon: float = 0.0,
+    allow_partial_afterstates: bool = False,
     maximum_snapshot_bytes: int = 256 * 1024 * 1024,
     maximum_group_seconds: float = 1800.0,
     artifact_root: Path | None = None,
@@ -789,6 +825,7 @@ def collect_durable_afterstate_episode(
             config=config,
             macro_branch_epsilon=macro_branch_epsilon,
             collect_afterstates=True,
+            allow_partial_afterstates=allow_partial_afterstates,
         )
         with ExitStack() as stack:
             output = stack.enter_context((output_dir / "episode.jsonl").open("x", encoding="utf-8", newline="\n"))
@@ -856,6 +893,7 @@ def collect_durable_afterstate_cohort(
     cohort_dir: Path,
     cohort_id: str,
     macro_branch_epsilon: float = 0.0,
+    allow_partial_afterstates: bool = False,
     parallel_collectors: int = 1,
     replacement_seed_fn: Callable[[int], int] | None = None,
     max_recoverable_incidents: int = 4,
@@ -891,6 +929,7 @@ def collect_durable_afterstate_cohort(
                 cohort_dir=cohort_dir,
                 cohort_id=cohort_id,
                 macro_branch_epsilon=macro_branch_epsilon,
+                allow_partial_afterstates=allow_partial_afterstates,
                 replacement_seed_fn=replacement_seed_fn,
                 max_recoverable_incidents=max_recoverable_incidents,
                 maximum_episode_snapshot_bytes=maximum_episode_snapshot_bytes,
@@ -932,6 +971,7 @@ def collect_durable_afterstate_cohort(
                     limits=limits,
                     output_dir=cohort_dir / f"episode-{current_offset:03d}",
                     macro_branch_epsilon=macro_branch_epsilon,
+                    allow_partial_afterstates=allow_partial_afterstates,
                     maximum_snapshot_bytes=min(maximum_episode_snapshot_bytes, maximum_cohort_snapshot_bytes),
                     maximum_group_seconds=min(maximum_episode_seconds, remaining_seconds),
                     artifact_root=artifact_root,
