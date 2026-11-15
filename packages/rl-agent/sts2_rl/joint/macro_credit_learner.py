@@ -580,6 +580,15 @@ class MacroCreditLearner:
             and mod.actor_critic_config.enable_asymmetric_revival_critic
         )
 
+    def _uses_stateless_durable_value(self, target_model: nn.Module | None = None) -> bool:
+        mod = self.model if target_model is None else target_model
+        return bool(
+            isinstance(mod, HybridDomainActorCriticModel)
+            and mod.actor_critic_config.enable_durable_value_head
+            and mod.actor_critic_config.enable_persistent_only_durable_value
+            and mod.actor_critic_config.enable_monotone_deconfounded_durable_value
+        )
+
     def _critic_revival_vector(self, revivals_used: int, cum_revival_penalty: float) -> list[float]:
         budget = self.config.revival_budget
         u = max(0, int(revivals_used))
@@ -628,6 +637,7 @@ class MacroCreditLearner:
         *,
         critic_revival_context: Tensor | None = None,
         model_override: HybridDomainActorCriticModel | None = None,
+        compute_durable_value: bool = True,
     ) -> tuple[Tensor, Tensor, Tensor | None, Tensor]:
         self._check_resource()
         durable_value: Tensor | None = None
@@ -639,13 +649,16 @@ class MacroCreditLearner:
                 (snapshot,), expected_config=snapshot.config,
                 expected_fingerprint=snapshot.encoding_fingerprint, device=self.device,
             )
-            if self._use_revival_ctx(active_mod):
+            if isinstance(active_mod, HybridDomainActorCriticModel):
                 output = cast(
                     HybridActorCriticOutput,
-                    cast(HybridDomainActorCriticModel, active_mod)(
+                    active_mod(
                         batch,
                         hidden,
-                        critic_revival_context=critic_revival_context,
+                        critic_revival_context=(
+                            critic_revival_context if self._use_revival_ctx(active_mod) else None
+                        ),
+                        compute_durable_value=compute_durable_value,
                         validate=False,
                     ),
                 )
@@ -737,12 +750,14 @@ class MacroCreditLearner:
         model_override: HybridDomainActorCriticModel | None = None,
         check_likelihood: bool = True,
         record_all_choice_logs: bool = False,
+        compute_durable_value: bool = True,
     ) -> _Evaluation:
         _configure_cuda_tf32(self.device, self.config.allow_tf32)
         active_mod = self.model if model_override is None else model_override
         hidden: Tensor | None = None
         calls = 0
         is_durable_v2 = self.config.target_mode == "durable_afterstate_v2"
+        need_durable = is_durable_v2 and compute_durable_value
         include_unvisited_partial = bool(self.config.enable_partial_afterstate_conditional_mpo)
         afterstate_indices = (
             {
@@ -760,7 +775,12 @@ class MacroCreditLearner:
         if use_rev:
             step_rev_cpu, _, boot_rev_cpu = self._trajectory_critic_revival_contexts(trajectory)
         for snapshot in trajectory.prefix:
-            _, _, _, hidden = self._forward_full(snapshot, hidden, model_override=model_override)
+            _, _, _, hidden = self._forward_full(
+                snapshot,
+                hidden,
+                model_override=model_override,
+                compute_durable_value=False,
+            )
             hidden = hidden.detach()
             calls += 1
         boundaries: dict[int, Tensor | None] = {}
@@ -784,6 +804,7 @@ class MacroCreditLearner:
                 hidden,
                 critic_revival_context=rev_step_gpu,
                 model_override=model_override,
+                compute_durable_value=need_durable,
             )
             hidden = hidden.detach()
             policy, _, _ = self._policy(step, logits)
@@ -805,9 +826,10 @@ class MacroCreditLearner:
             if index == root_index:
                 root_logs = policy.detach().cpu().clone()
             if is_durable_v2:
-                if durable_val is None:
-                    raise ValueError("durable_afterstate_v2 requires durable_value on every step")
-                durable_values.append(durable_val.detach().cpu().clone())
+                if need_durable:
+                    if durable_val is None:
+                        raise ValueError("durable_afterstate_v2 requires durable_value on every step")
+                    durable_values.append(durable_val.detach().cpu().clone())
                 if index in afterstate_indices:
                     step_log_probs[index] = policy.detach().cpu().clone()
                     post_step_hidden[index] = hidden.detach().cpu().clone()
@@ -831,9 +853,10 @@ class MacroCreditLearner:
                 hidden,
                 critic_revival_context=boot_rev_gpu,
                 model_override=model_override,
+                compute_durable_value=need_durable,
             )
             bootstrap = bootstrap_val.detach().cpu().clone()
-            if is_durable_v2:
+            if need_durable:
                 if durable_boot is None:
                     raise ValueError("durable_afterstate_v2 requires durable_value on bootstrap snapshot")
                 durable_bootstrap = durable_boot.detach().cpu().clone()
@@ -846,7 +869,7 @@ class MacroCreditLearner:
             root_logs,
             calls,
             maximum_error,
-            durable_values=torch.stack(durable_values) if is_durable_v2 else None,
+            durable_values=torch.stack(durable_values) if need_durable else None,
             durable_bootstrap_value=durable_bootstrap,
             step_log_probs=step_log_probs if is_durable_v2 else None,
             post_step_hidden=post_step_hidden if is_durable_v2 else None,
@@ -909,6 +932,7 @@ class MacroCreditLearner:
         model_override: HybridDomainActorCriticModel | None = None,
         check_likelihood: bool = True,
         record_all_choice_logs: bool = False,
+        compute_durable_value: bool = True,
     ) -> list[_Evaluation]:
         _configure_cuda_tf32(self.device, self.config.allow_tf32)
         ac_model = cast(
@@ -917,7 +941,11 @@ class MacroCreditLearner:
         )
         use_rev = self._use_revival_ctx(ac_model)
         results: list[_Evaluation] = []
-        batch_cap = self.config.eval_batch_size
+        batch_cap = (
+            min(self.config.eval_batch_size, 16)
+            if int(ac_model.config.d_model) >= 256
+            else self.config.eval_batch_size
+        )
         for group_start in range(0, len(references), batch_cap):
             group = references[group_start : group_start + batch_cap]
             m = len(group)
@@ -935,6 +963,7 @@ class MacroCreditLearner:
                         snap,
                         hidden[i : i + 1] if has_hidden[i] else None,
                         model_override=ac_model,
+                        compute_durable_value=False,
                     )
                     hidden[i] = next_h[0].detach()
                     has_hidden[i] = True
@@ -999,10 +1028,11 @@ class MacroCreditLearner:
                         batch,
                         hidden[active],
                         critic_revival_context=rev_t_gpu,
+                        compute_durable_value=compute_durable_value,
                         validate=False,
                     ),
                 )
-                if output.durable_value is None:
+                if compute_durable_value and output.durable_value is None:
                     raise ValueError("durable_afterstate_v2 requires durable_value on every step")
                 masks = batch.candidates.action_mask
                 batch_logs = torch.log_softmax(output.policy_logits.masked_fill(~masks, -torch.inf), dim=-1)
@@ -1012,15 +1042,19 @@ class MacroCreditLearner:
                     & torch.isfinite(output.policy_logits).all()
                     & torch.isfinite(output.value).all()
                     & torch.isfinite(output.recurrent_state).all()
-                    & torch.isfinite(output.durable_value).all()
                     & torch.isfinite(safe_batch_logs).all()
                 )
+                if compute_durable_value:
+                    assert output.durable_value is not None
+                    finite_ok = finite_ok & torch.isfinite(output.durable_value).all()
                 hidden[active] = output.recurrent_state.detach()
                 for i in active:
                     has_hidden[i] = True
                 step_logs_gpu.append(batch_logs.detach())
                 step_vals_gpu.append(output.value.detach())
-                step_durs_gpu.append(output.durable_value.detach())
+                if compute_durable_value:
+                    assert output.durable_value is not None
+                    step_durs_gpu.append(output.durable_value.detach())
                 if any(t in afterstate_sets[i] for i in active):
                     post_hids_gpu[t] = output.recurrent_state.detach().clone()
 
@@ -1029,7 +1063,7 @@ class MacroCreditLearner:
 
             if t_max > 0:
                 flat_vals_cpu = torch.cat(step_vals_gpu, dim=0).cpu()
-                flat_durs_cpu = torch.cat(step_durs_gpu, dim=0).cpu()
+                flat_durs_cpu = torch.cat(step_durs_gpu, dim=0).cpu() if compute_durable_value else None
                 flat_logs_cpu = torch.cat([lg.reshape(-1) for lg in step_logs_gpu], dim=0).cpu()
                 boundary_hids_cpu = {
                     t: (None if h is None else h.cpu()) for t, h in boundary_hids_gpu.items()
@@ -1044,7 +1078,11 @@ class MacroCreditLearner:
                     c_width = int(step_logs_gpu[t].shape[1])
                     logs_t_cpu = flat_logs_cpu[l_offset : l_offset + k_len * c_width].reshape(k_len, c_width)
                     vals_t_cpu = flat_vals_cpu[v_offset : v_offset + k_len]
-                    durs_t_cpu = flat_durs_cpu[v_offset : v_offset + k_len]
+                    durs_t_cpu = (
+                        flat_durs_cpu[v_offset : v_offset + k_len]
+                        if flat_durs_cpu is not None
+                        else None
+                    )
                     v_offset += k_len
                     l_offset += k_len * c_width
                     if t % self.config.chunk_steps == 0:
@@ -1071,7 +1109,8 @@ class MacroCreditLearner:
                                     f"(err={err:.6g}, tol={self.config.likelihood_tolerance:.6g}, "
                                     f"step={t}/{len(traj.steps)}, domain={step.control_domain})"
                                 )
-                        durable_values_list[i].append(durs_t_cpu[k].clone())
+                        if durs_t_cpu is not None:
+                            durable_values_list[i].append(durs_t_cpu[k].clone())
                         values_list[i].append(vals_t_cpu[k].clone())
                         logs_list[i].append(selected.clone())
                         if t in afterstate_sets[i]:
@@ -1112,24 +1151,32 @@ class MacroCreditLearner:
                         boot_batch,
                         hidden[boot_indices],
                         critic_revival_context=boot_rev_gpu,
+                        compute_durable_value=compute_durable_value,
                         validate=False,
                     ),
                 )
-                if boot_out.durable_value is None:
+                if compute_durable_value and boot_out.durable_value is None:
                     raise ValueError("durable_afterstate_v2 requires durable_value on bootstrap snapshot")
                 boot_ok = (
                     torch.isfinite(boot_out.policy_logits).all()
                     & torch.isfinite(boot_out.value).all()
                     & torch.isfinite(boot_out.recurrent_state).all()
-                    & torch.isfinite(boot_out.durable_value).all()
                 )
+                if compute_durable_value:
+                    assert boot_out.durable_value is not None
+                    boot_ok = boot_ok & torch.isfinite(boot_out.durable_value).all()
                 if not bool(boot_ok.item()):
                     raise FloatingPointError("macro actor-critic bootstrap forward is non-finite")
                 b_val_cpu = boot_out.value.detach().cpu()
-                b_dur_cpu = boot_out.durable_value.detach().cpu()
+                b_dur_cpu = (
+                    boot_out.durable_value.detach().cpu()
+                    if compute_durable_value and boot_out.durable_value is not None
+                    else None
+                )
                 for k, i in enumerate(boot_indices):
                     boot_vals[i] = b_val_cpu[k].clone()
-                    dur_boot_vals[i] = b_dur_cpu[k].clone()
+                    if b_dur_cpu is not None:
+                        dur_boot_vals[i] = b_dur_cpu[k].clone()
                     calls[i] += 1
             for i in range(m):
                 results.append(
@@ -1141,8 +1188,8 @@ class MacroCreditLearner:
                         None,
                         calls[i],
                         max_errors[i],
-                        durable_values=torch.stack(durable_values_list[i]),
-                        durable_bootstrap_value=dur_boot_vals.get(i),
+                        durable_values=torch.stack(durable_values_list[i]) if compute_durable_value else None,
+                        durable_bootstrap_value=dur_boot_vals.get(i) if compute_durable_value else None,
                         step_log_probs=step_log_probs_list[i],
                         post_step_hidden=post_step_hidden_list[i],
                     )
@@ -1252,7 +1299,11 @@ class MacroCreditLearner:
             sorted_worlds = [flat_worlds[idx] for idx in perm]
             stacked_hiddens = torch.cat(flat_hiddens, dim=0)[perm]
             stacked_revs = torch.cat(flat_revs, dim=0)[perm] if rev_all is not None else None
-            world_cap = max(128, min(256, self.config.eval_batch_size * 8))
+            world_cap = (
+                64
+                if int(ac_model.config.d_model) >= 256
+                else max(128, min(256, self.config.eval_batch_size * 8))
+            )
             gpu_q_chunks: list[Tensor] = []
             for w_start in range(0, n_worlds, world_cap):
                 self._check_resource()
@@ -1941,6 +1992,426 @@ class MacroCreditLearner:
         self._check_resource()
         return totals
 
+    def _select_recurrent_chunk_slice_end(
+        self,
+        ac_model: HybridDomainActorCriticModel,
+        keyed_chunks: Sequence[tuple[int, int, int, _PreparedReference, int, int]],
+        slice_start: int,
+    ) -> int:
+        total_chunks = len(keyed_chunks)
+        cfg = self.config
+        d_model = max(128, int(ac_model.config.d_model))
+        width_scale = min(1.0, (128.0 / float(d_model)) ** 1.25)
+        world_step_budget = 12_288 if d_model >= 256 else max(16_384, int(49_152 * width_scale))
+        local_step_budget = 24_576 if d_model >= 256 else max(24_576, int(98_304 * width_scale))
+        max_attn_floats = 1_200_000_000
+        n_heads = max(1, int(ac_model.config.n_heads))
+        world_layers = max(1, int(ac_model.config.world_layers))
+        limit = min(total_chunks, slice_start + cfg.chunk_batch_size)
+
+        cur_cl = 1
+        cur_w = 1
+        cur_len = 1
+        slice_end = slice_start + 1
+        for cand_idx in range(slice_start, limit):
+            row_cl, row_w, _, _, r_start, r_stop = keyed_chunks[cand_idx]
+            next_cl = max(cur_cl, max(1, int(row_cl)))
+            next_w = max(cur_w, max(1, int(row_w)))
+            next_len = max(cur_len, max(1, int(r_stop - r_start)))
+            attn_floats_per_chunk = next_len * world_layers * n_heads * ((next_w + 1) ** 2)
+            allowed_b = max(
+                1,
+                min(
+                    cfg.chunk_batch_size,
+                    local_step_budget // next_cl,
+                    world_step_budget // next_w,
+                    max_attn_floats // max(1, attn_floats_per_chunk),
+                ),
+            )
+            if (cand_idx - slice_start + 1) > allowed_b:
+                break
+            cur_cl = next_cl
+            cur_w = next_w
+            cur_len = next_len
+            slice_end = cand_idx + 1
+        return slice_end
+
+    def _backward_stateless_pre_durable(
+        self,
+        *,
+        dur_entries: Sequence[tuple[EncodedWorldSnapshot, int]],
+        flat_dur_target: Tensor,
+        flat_stage_target: Tensor,
+        flat_step_rev_gpu: Tensor | None,
+        denom_dur_val: int,
+        durable_value_weight: float,
+        stage_baseline_weight: float,
+    ) -> tuple[float, float]:
+        if not dur_entries:
+            return 0.0, 0.0
+        ac_model = cast(HybridDomainActorCriticModel, self.model)
+        has_stage_base = bool(ac_model.actor_critic_config.enable_monotone_deconfounded_durable_value)
+        sorted_entries = sorted(dur_entries, key=lambda row: row[0].world.token_count)
+        max_sub = 32 if int(ac_model.config.d_model) >= 256 else 64
+        dur_total = torch.zeros((), device=self.device, dtype=torch.float64)
+        stage_total = torch.zeros((), device=self.device, dtype=torch.float64)
+
+        idx = 0
+        n_total = len(sorted_entries)
+        while idx < n_total:
+            self._check_resource()
+            tentative_end = min(n_total, idx + max_sub)
+            max_w = max(1, sorted_entries[tentative_end - 1][0].world.token_count)
+            step_cap = max(1, min(max_sub, 24_576 // max_w))
+            end = min(n_total, idx + step_cap)
+            sub_entries = sorted_entries[idx:end]
+            idx = end
+
+            sub_worlds = tuple(row[0] for row in sub_entries)
+            wb, dom = collate_encoded_worlds(
+                sub_worlds,
+                expected_config=sub_worlds[0].config,
+                expected_fingerprint=sub_worlds[0].encoding_fingerprint,
+                device=self.device,
+                validate=False,
+            )
+            sub_gids = torch.tensor([row[1] for row in sub_entries], device=self.device, dtype=torch.long)
+            sub_rev = None if flat_step_rev_gpu is None else flat_step_rev_gpu[sub_gids]
+            sub_terms: list[Tensor] = []
+
+            if durable_value_weight:
+                dur_vals, _ = ac_model.forward_durable_value(
+                    wb,
+                    dom,
+                    None,
+                    critic_revival_context=sub_rev,
+                    validate=False,
+                )
+            else:
+                with torch.no_grad():
+                    dur_vals, _ = ac_model.forward_durable_value(
+                        wb,
+                        dom,
+                        None,
+                        critic_revival_context=sub_rev,
+                        validate=False,
+                    )
+            if not bool(torch.isfinite(dur_vals).all().item()):
+                raise FloatingPointError("stateless durable_value forward is non-finite")
+            dur_loss = F.smooth_l1_loss(dur_vals, flat_dur_target[sub_gids], reduction="sum") / denom_dur_val
+            dur_total = dur_total + dur_loss.detach().double()
+            if durable_value_weight:
+                sub_terms.append(0.5 * durable_value_weight * dur_loss)
+
+            if has_stage_base:
+                if stage_baseline_weight:
+                    stage_vals = ac_model.forward_durable_stage_baseline(
+                        wb,
+                        critic_revival_context=sub_rev,
+                    )
+                else:
+                    with torch.no_grad():
+                        stage_vals = ac_model.forward_durable_stage_baseline(
+                            wb,
+                            critic_revival_context=sub_rev,
+                        )
+                if not bool(torch.isfinite(stage_vals).all().item()):
+                    raise FloatingPointError("stateless durable_stage_baseline forward is non-finite")
+                stage_loss = (
+                    F.smooth_l1_loss(stage_vals, flat_stage_target[sub_gids], reduction="sum") / denom_dur_val
+                )
+                stage_total = stage_total + stage_loss.detach().double()
+                if stage_baseline_weight:
+                    sub_terms.append(0.5 * stage_baseline_weight * stage_loss)
+
+            if sub_terms:
+                sub_mega = torch.stack(sub_terms).sum()
+                sub_terms.clear()
+                if not bool(torch.isfinite(sub_mega).item()):
+                    raise FloatingPointError("stateless durable loss is non-finite")
+                sub_mega.backward()  # type: ignore[no-untyped-call]
+                del sub_mega
+        return float(dur_total.item()), float(stage_total.item())
+
+    def _backward_stateless_chosen_post_durable(
+        self,
+        *,
+        post_entries: Sequence[tuple[EncodedWorldSnapshot, Tensor, Tensor | None]],
+        denom_afterstate: int,
+    ) -> tuple[float, float]:
+        if not post_entries:
+            return 0.0, 0.0
+        ac_model = cast(HybridDomainActorCriticModel, self.model)
+        cfg = self.config
+        has_stage_base = bool(ac_model.actor_critic_config.enable_monotone_deconfounded_durable_value)
+        sorted_entries = sorted(post_entries, key=lambda row: row[0].world.token_count)
+        max_sub = 32 if int(ac_model.config.d_model) >= 256 else 64
+        post_total = torch.zeros((), device=self.device, dtype=torch.float64)
+        stage_total = torch.zeros((), device=self.device, dtype=torch.float64)
+
+        idx = 0
+        n_total = len(sorted_entries)
+        while idx < n_total:
+            self._check_resource()
+            tentative_end = min(n_total, idx + max_sub)
+            max_w = max(1, sorted_entries[tentative_end - 1][0].world.token_count)
+            step_cap = max(1, min(max_sub, 24_576 // max_w))
+            end = min(n_total, idx + step_cap)
+            sub_entries = sorted_entries[idx:end]
+            idx = end
+
+            sub_worlds = tuple(row[0] for row in sub_entries)
+            wb, dom = collate_encoded_worlds(
+                sub_worlds,
+                expected_config=sub_worlds[0].config,
+                expected_fingerprint=sub_worlds[0].encoding_fingerprint,
+                device=self.device,
+                validate=False,
+            )
+            stacked_targets = torch.stack([row[1] for row in sub_entries], dim=0)
+            stacked_revs = (
+                torch.stack([cast(Tensor, row[2]) for row in sub_entries], dim=0)
+                if sub_entries[0][2] is not None
+                else None
+            )
+            sub_terms: list[Tensor] = []
+
+            if cfg.durable_post_value_weight:
+                post_vals, _ = ac_model.forward_durable_value(
+                    wb,
+                    dom,
+                    None,
+                    critic_revival_context=stacked_revs,
+                    validate=False,
+                )
+            else:
+                with torch.no_grad():
+                    post_vals, _ = ac_model.forward_durable_value(
+                        wb,
+                        dom,
+                        None,
+                        critic_revival_context=stacked_revs,
+                        validate=False,
+                    )
+            if not bool(torch.isfinite(post_vals).all().item()):
+                raise FloatingPointError("stateless post durable_value forward is non-finite")
+            post_loss = F.smooth_l1_loss(post_vals, stacked_targets, reduction="sum") / denom_afterstate
+            post_total = post_total + post_loss.detach().double()
+            if cfg.durable_post_value_weight:
+                sub_terms.append(0.5 * cfg.durable_post_value_weight * post_loss)
+
+            if has_stage_base:
+                if cfg.durable_stage_baseline_weight:
+                    post_stage_vals = ac_model.forward_durable_stage_baseline(
+                        wb,
+                        critic_revival_context=stacked_revs,
+                    )
+                else:
+                    with torch.no_grad():
+                        post_stage_vals = ac_model.forward_durable_stage_baseline(
+                            wb,
+                            critic_revival_context=stacked_revs,
+                        )
+                if not bool(torch.isfinite(post_stage_vals).all().item()):
+                    raise FloatingPointError("stateless post durable_stage_baseline forward is non-finite")
+                post_stage_loss = (
+                    F.smooth_l1_loss(post_stage_vals, stacked_targets, reduction="sum") / denom_afterstate
+                )
+                stage_total = stage_total + post_stage_loss.detach().double()
+                if cfg.durable_stage_baseline_weight:
+                    sub_terms.append(0.5 * cfg.durable_stage_baseline_weight * post_stage_loss)
+
+            if sub_terms:
+                sub_mega = torch.stack(sub_terms).sum()
+                sub_terms.clear()
+                if not bool(torch.isfinite(sub_mega).item()):
+                    raise FloatingPointError("stateless post durable loss is non-finite")
+                sub_mega.backward()  # type: ignore[no-untyped-call]
+                del sub_mega
+        return float(post_total.item()), float(stage_total.item())
+
+    def _backward_stateless_distill_afterstates(
+        self,
+        *,
+        node_entries: Sequence[
+            tuple[
+                int,
+                _AfterstateStepTarget,
+                int | None,
+                EncodedWorldSnapshot | None,
+                Tensor | None,
+            ]
+        ],
+        denom_afterstate: int,
+    ) -> tuple[float, float, float, float]:
+        if not node_entries:
+            return 0.0, 0.0, 0.0, 0.0
+        ac_model = cast(HybridDomainActorCriticModel, self.model)
+        cfg = self.config
+        has_stage_base = bool(ac_model.actor_critic_config.enable_monotone_deconfounded_durable_value)
+        sorted_nodes = sorted(node_entries, key=lambda row: row[0])
+        max_worlds_per_group = 32 if int(ac_model.config.d_model) >= 256 else 64
+
+        val_total = torch.zeros((), device=self.device, dtype=torch.float64)
+        margin_total = torch.zeros((), device=self.device, dtype=torch.float64)
+        post_total = torch.zeros((), device=self.device, dtype=torch.float64)
+        stage_total = torch.zeros((), device=self.device, dtype=torch.float64)
+
+        n_nodes = len(sorted_nodes)
+        n_idx = 0
+        while n_idx < n_nodes:
+            self._check_resource()
+            group_end = n_idx
+            group_worlds = 0
+            group_max_w = 1
+            while group_end < n_nodes:
+                cand_max_w, cand_as_t, _, _, _ = sorted_nodes[group_end]
+                w_cnt = len(cand_as_t.node.post_worlds)
+                next_worlds = group_worlds + w_cnt
+                next_max_w = max(group_max_w, max(1, int(cand_max_w)))
+                if group_end > n_idx and (
+                    next_worlds > max_worlds_per_group or (next_worlds * next_max_w) > 24_576
+                ):
+                    break
+                group_worlds = next_worlds
+                group_max_w = next_max_w
+                group_end += 1
+
+            sub_nodes = sorted_nodes[n_idx:group_end]
+            n_idx = group_end
+
+            all_cand_worlds: list[EncodedWorldSnapshot] = []
+            all_cand_revs: list[Tensor] = []
+            node_specs: list[
+                tuple[int, int, Tensor, int | None, Tensor, EncodedWorldSnapshot | None, Tensor | None]
+            ] = []
+            for _, as_t, chosen_pos, chosen_w_obj, p_rev_item in sub_nodes:
+                s_w = len(all_cand_worlds)
+                w_cnt = len(as_t.node.post_worlds)
+                all_cand_worlds.extend(as_t.node.post_worlds)
+                if p_rev_item is not None:
+                    all_cand_revs.extend([p_rev_item] * w_cnt)
+                node_specs.append(
+                    (
+                        s_w,
+                        s_w + w_cnt,
+                        as_t.action_values.to(device=self.device, dtype=self.dtype),
+                        chosen_pos,
+                        as_t.post_target.to(device=self.device, dtype=self.dtype),
+                        chosen_w_obj,
+                        p_rev_item,
+                    )
+                )
+
+            q_s_parts: list[Tensor] = []
+            n_all_w = len(all_cand_worlds)
+            for ws in range(0, n_all_w, max_worlds_per_group):
+                self._check_resource()
+                we = min(ws + max_worlds_per_group, n_all_w)
+                sub_w = tuple(all_cand_worlds[ws:we])
+                wb_sub, dom_sub = collate_encoded_worlds(
+                    sub_w,
+                    expected_config=sub_w[0].config,
+                    expected_fingerprint=sub_w[0].encoding_fingerprint,
+                    device=self.device,
+                    validate=False,
+                )
+                sub_rev = torch.stack(all_cand_revs[ws:we], dim=0) if all_cand_revs else None
+                q_sub, _ = ac_model.forward_durable_value(
+                    wb_sub,
+                    dom_sub,
+                    None,
+                    critic_revival_context=sub_rev,
+                    validate=False,
+                )
+                q_s_parts.append(q_sub)
+            q_s_all = torch.cat(q_s_parts, dim=0)
+            if not bool(torch.isfinite(q_s_all).all().item()):
+                raise FloatingPointError("stateless distill afterstate forward is non-finite")
+
+            node_val_losses: list[Tensor] = []
+            node_margin_losses: list[Tensor] = []
+            chosen_post_losses: list[Tensor] = []
+            chosen_stage_worlds: list[EncodedWorldSnapshot] = []
+            chosen_stage_revs: list[Tensor] = []
+            chosen_stage_targets: list[Tensor] = []
+            for s_w, e_w, q_t_gpu, chosen_pos, post_t_gpu, chosen_w_obj, p_rev_item in node_specs:
+                q_s_node = q_s_all[s_w:e_w]
+                node_val_losses.append(F.smooth_l1_loss(q_s_node, q_t_gpu))
+                if q_s_node.numel() > 1:
+                    node_margin_losses.append(
+                        F.smooth_l1_loss(q_s_node - q_s_node.mean(), q_t_gpu - q_t_gpu.mean())
+                    )
+                if chosen_pos is not None and chosen_w_obj is not None:
+                    post_blend = 0.5 * q_t_gpu[chosen_pos] + 0.5 * post_t_gpu
+                    chosen_post_losses.append(F.smooth_l1_loss(q_s_node[chosen_pos], post_blend))
+                    if has_stage_base:
+                        chosen_stage_worlds.append(chosen_w_obj)
+                        if p_rev_item is not None:
+                            chosen_stage_revs.append(p_rev_item)
+                        chosen_stage_targets.append(post_t_gpu)
+
+            sub_terms: list[Tensor] = []
+            if node_val_losses:
+                as_val_loss = torch.stack(node_val_losses).sum() / denom_afterstate
+                val_total = val_total + as_val_loss.detach().double()
+                if cfg.distill_value_weight:
+                    sub_terms.append(0.5 * cfg.distill_value_weight * as_val_loss)
+            if node_margin_losses:
+                as_margin_loss = torch.stack(node_margin_losses).sum() / denom_afterstate
+                margin_total = margin_total + as_margin_loss.detach().double()
+                if cfg.distill_afterstate_margin_weight:
+                    sub_terms.append(0.5 * cfg.distill_afterstate_margin_weight * as_margin_loss)
+            if chosen_post_losses:
+                post_loss = torch.stack(chosen_post_losses).sum() / denom_afterstate
+                post_total = post_total + post_loss.detach().double()
+                if cfg.durable_post_value_weight:
+                    sub_terms.append(0.5 * cfg.durable_post_value_weight * post_loss)
+            if has_stage_base and chosen_stage_worlds:
+                cw_tuple = tuple(chosen_stage_worlds)
+                cwb, _ = collate_encoded_worlds(
+                    cw_tuple,
+                    expected_config=cw_tuple[0].config,
+                    expected_fingerprint=cw_tuple[0].encoding_fingerprint,
+                    device=self.device,
+                    validate=False,
+                )
+                crev = torch.stack(chosen_stage_revs, dim=0) if chosen_stage_revs else None
+                ctarg = torch.stack(chosen_stage_targets, dim=0)
+                if cfg.durable_stage_baseline_weight:
+                    p_stage_vals = ac_model.forward_durable_stage_baseline(
+                        cwb,
+                        critic_revival_context=crev,
+                    )
+                else:
+                    with torch.no_grad():
+                        p_stage_vals = ac_model.forward_durable_stage_baseline(
+                            cwb,
+                            critic_revival_context=crev,
+                        )
+                if not bool(torch.isfinite(p_stage_vals).all().item()):
+                    raise FloatingPointError("stateless distill afterstate stage_baseline is non-finite")
+                p_stage_loss = F.smooth_l1_loss(p_stage_vals, ctarg, reduction="sum") / denom_afterstate
+                stage_total = stage_total + p_stage_loss.detach().double()
+                if cfg.durable_stage_baseline_weight:
+                    sub_terms.append(0.5 * cfg.durable_stage_baseline_weight * p_stage_loss)
+
+            if sub_terms:
+                sub_mega = torch.stack(sub_terms).sum()
+                sub_terms.clear()
+                if not bool(torch.isfinite(sub_mega).item()):
+                    raise FloatingPointError("stateless distill afterstate loss is non-finite")
+                sub_mega.backward()  # type: ignore[no-untyped-call]
+                del sub_mega
+            del q_s_all, q_s_parts
+
+        return (
+            float(val_total.item()),
+            float(margin_total.item()),
+            float(post_total.item()),
+            float(stage_total.item()),
+        )
+
     def _backward_chunks_durable_batch(
         self,
         prepared_items: Sequence[_PreparedReference],
@@ -2172,10 +2643,11 @@ class MacroCreditLearner:
                     if snap.world.token_count > max_w:
                         max_w = snap.world.token_count
                 keyed_chunks.append((max_cl, max_w, ref_idx, item, start, stop))
-        keyed_chunks.sort(key=lambda row: (row[0], row[1]))
+        keyed_chunks.sort(key=lambda row: (row[1] // 64, row[0], row[1]))
 
         maximum_chunk = max((stop - start for _, _, _, _, start, stop in keyed_chunks), default=0)
         zero_row = ac_model.initial_state(1, device=self.device)[0].detach()
+        stateless_durable = self._uses_stateless_durable_value(ac_model)
 
         denom_dur_val = max(1, denominators["durable_value_steps"])
         denom_macro_steps = max(1, denominators["macro_steps"])
@@ -2205,24 +2677,9 @@ class MacroCreditLearner:
 
         slice_start = 0
         total_chunks = len(keyed_chunks)
-        width_scale = min(1.0, (128.0 / max(128, int(ac_model.config.d_model))) ** 1.25)
-        max_local_token_budget = max(8_192, int(98_304 * width_scale))
-        max_world_token_budget = max(8_192, int(65_536 * width_scale))
-        min_slice_floor = min(cfg.chunk_batch_size, 4 if ac_model.config.d_model > 128 else 8)
         while slice_start < total_chunks:
             self._check_resource()
-            tentative_end = min(total_chunks, slice_start + cfg.chunk_batch_size)
-            worst_cl = max(1, keyed_chunks[tentative_end - 1][0])
-            worst_w = max(1, max(row[1] for row in keyed_chunks[slice_start:tentative_end]))
-            dynamic_cap = max(
-                min_slice_floor,
-                min(
-                    cfg.chunk_batch_size,
-                    max_local_token_budget // worst_cl,
-                    max_world_token_budget // worst_w,
-                ),
-            )
-            slice_end = min(total_chunks, slice_start + dynamic_cap)
+            slice_end = self._select_recurrent_chunk_slice_end(ac_model, keyed_chunks, slice_start)
             chunk_slice = [
                 (ref_idx, item, start, stop)
                 for _, _, ref_idx, item, start, stop in keyed_chunks[slice_start:slice_end]
@@ -2310,7 +2767,7 @@ class MacroCreditLearner:
                     (not flat_is_macro_cpu[g]) and flat_is_choice_cpu[g] for g in gids_cpu
                 )
 
-                if any_dur:
+                if (not stateless_durable) and any_dur:
                     dur_k = [k for k, g in enumerate(gids_cpu) if flat_has_dur_cpu[g]]
                     dur_k_gpu = torch.tensor(dur_k, device=self.device, dtype=torch.long)
                     dur_gids_gpu = gids_gpu[dur_k_gpu]
@@ -2405,7 +2862,7 @@ class MacroCreditLearner:
                                 staged_within,
                                 post_rev_gpu,
                             ) = staged
-                            if as_t.has_chosen_post:
+                            if (not stateless_durable) and as_t.has_chosen_post:
                                 step = item.reference.steps[index]
                                 chosen_w = as_t.node.post_world_for_action(step.action_index)
                                 assert chosen_w is not None
@@ -2698,13 +3155,47 @@ class MacroCreditLearner:
                     raise FloatingPointError("macro cohort chunk forward or loss is non-finite")
                 mega_loss.backward()  # type: ignore[no-untyped-call]
                 del mega_loss
-                totals["backward_chunks"] += float(chunk_has_terms_count)
             elif not bool(finite_ok.item()):
                 raise FloatingPointError("macro cohort chunk forward is non-finite")
+            if chunk_has_terms_count:
+                totals["backward_chunks"] += float(chunk_has_terms_count)
             hidden_list.clear()
             stacked_metrics = torch.stack([slice_totals_gpu[key] for key in metric_keys]).cpu().tolist()
             for key, val in zip(metric_keys, stacked_metrics, strict=True):
                 totals[key] += float(val)
+            self._check_resource()
+
+        if stateless_durable:
+            dur_entries: list[tuple[EncodedWorldSnapshot, int]] = []
+            post_entries: list[tuple[EncodedWorldSnapshot, Tensor, Tensor | None]] = []
+            for ref_idx, item in enumerate(prepared_items):
+                base_g = ref_step_offsets[ref_idx]
+                steps = item.reference.steps
+                for idx, s in enumerate(steps):
+                    if flat_has_dur_cpu[base_g + idx]:
+                        dur_entries.append((cast(EncodedWorldSnapshot, s.snapshot), base_g + idx))
+                for step_idx, staged in staged_afterstates[ref_idx].items():
+                    as_t, post_target_gpu, _, _, _, post_rev_gpu = staged
+                    if as_t.has_chosen_post:
+                        chosen_w = as_t.node.post_world_for_action(steps[step_idx].action_index)
+                        assert chosen_w is not None
+                        post_entries.append((chosen_w, post_target_gpu, post_rev_gpu))
+            dur_v_loss, dur_s_loss = self._backward_stateless_pre_durable(
+                dur_entries=dur_entries,
+                flat_dur_target=flat_dur_target,
+                flat_stage_target=flat_dur_target,
+                flat_step_rev_gpu=flat_step_rev_gpu,
+                denom_dur_val=denom_dur_val,
+                durable_value_weight=cfg.macro_value_weight,
+                stage_baseline_weight=cfg.durable_stage_baseline_weight,
+            )
+            post_v_loss, post_s_loss = self._backward_stateless_chosen_post_durable(
+                post_entries=post_entries,
+                denom_afterstate=denom_afterstate,
+            )
+            totals["durable_value_loss"] += dur_v_loss
+            totals["durable_post_value_loss"] += post_v_loss
+            totals["durable_stage_baseline_loss"] += dur_s_loss + post_s_loss
             self._check_resource()
         return totals, maximum_chunk
 
@@ -2815,10 +3306,11 @@ class MacroCreditLearner:
                     if snap.world.token_count > max_w:
                         max_w = snap.world.token_count
                 keyed_chunks.append((max_cl, max_w, ref_idx, item, start, stop))
-        keyed_chunks.sort(key=lambda row: (row[0], row[1]))
+        keyed_chunks.sort(key=lambda row: (row[1] // 64, row[0], row[1]))
 
         maximum_chunk = max((stop - start for _, _, _, _, start, stop in keyed_chunks), default=0)
         zero_row = ac_model.initial_state(1, device=self.device)[0].detach()
+        stateless_durable = self._uses_stateless_durable_value(ac_model)
 
         denom_dur_val = max(1, denominators["durable_value_steps"])
         denom_macro_steps = max(1, denominators["macro_steps"])
@@ -2829,26 +3321,11 @@ class MacroCreditLearner:
 
         slice_start = 0
         total_chunks = len(keyed_chunks)
-        width_scale = min(1.0, (128.0 / max(128, int(ac_model.config.d_model))) ** 1.25)
-        max_local_token_budget = max(8_192, int(98_304 * width_scale))
-        max_world_token_budget = max(8_192, int(65_536 * width_scale))
-        min_slice_floor = min(cfg.chunk_batch_size, 4 if ac_model.config.d_model > 128 else 8)
-        afterstate_grad_cap = 64 if ac_model.config.d_model > 128 else 128
+        afterstate_grad_cap = 32 if int(ac_model.config.d_model) >= 256 else 128
 
         while slice_start < total_chunks:
             self._check_resource()
-            tentative_end = min(total_chunks, slice_start + cfg.chunk_batch_size)
-            worst_cl = max(1, keyed_chunks[tentative_end - 1][0])
-            worst_w = max(1, max(row[1] for row in keyed_chunks[slice_start:tentative_end]))
-            dynamic_cap = max(
-                min_slice_floor,
-                min(
-                    cfg.chunk_batch_size,
-                    max_local_token_budget // worst_cl,
-                    max_world_token_budget // worst_w,
-                ),
-            )
-            slice_end = min(total_chunks, slice_start + dynamic_cap)
+            slice_end = self._select_recurrent_chunk_slice_end(ac_model, keyed_chunks, slice_start)
             chunk_slice = [
                 (ref_idx, item, start, stop)
                 for _, _, ref_idx, item, start, stop in keyed_chunks[slice_start:slice_end]
@@ -2922,7 +3399,7 @@ class MacroCreditLearner:
                 any_combat = any(not flat_is_macro_cpu[g] for g in gids_cpu)
                 any_choice = any(flat_is_choice_cpu[g] for g in gids_cpu)
 
-                if any_dur:
+                if (not stateless_durable) and any_dur:
                     dur_k = [k for k, g in enumerate(gids_cpu) if flat_has_dur_cpu[g]]
                     dur_k_gpu = torch.tensor(dur_k, device=self.device, dtype=torch.long)
                     dur_gids_gpu = gids_gpu[dur_k_gpu]
@@ -3005,7 +3482,7 @@ class MacroCreditLearner:
                         index = start + offset
                         assert item.afterstate_targets is not None
                         as_t = item.afterstate_targets.get(index)
-                        if as_t is not None and as_t.node.post_worlds:
+                        if (not stateless_durable) and as_t is not None and as_t.node.post_worlds:
                             s_w = len(all_cand_worlds)
                             w_cnt = len(as_t.node.post_worlds)
                             all_cand_worlds.extend(as_t.node.post_worlds)
@@ -3277,10 +3754,76 @@ class MacroCreditLearner:
                 totals["backward_chunks"] += float(len(chunk_slice))
             elif not bool(finite_ok.item()):
                 raise FloatingPointError("macro distillation chunk forward is non-finite")
+            elif stateless_durable and (
+                cfg.distill_value_weight
+                or cfg.distill_afterstate_margin_weight
+                or cfg.durable_post_value_weight
+                or (has_stage_base and cfg.durable_stage_baseline_weight)
+            ):
+                totals["backward_chunks"] += float(len(chunk_slice))
             hidden_list.clear()
             stacked_metrics = torch.stack([slice_totals_gpu[key] for key in metric_keys]).cpu().tolist()
             for key, val in zip(metric_keys, stacked_metrics, strict=True):
                 totals[key] += float(val)
+            self._check_resource()
+
+        if stateless_durable:
+            dur_entries: list[tuple[EncodedWorldSnapshot, int]] = []
+            node_entries: list[
+                tuple[
+                    int,
+                    _AfterstateStepTarget,
+                    int | None,
+                    EncodedWorldSnapshot | None,
+                    Tensor | None,
+                ]
+            ] = []
+            for ref_idx, item in enumerate(prepared_items):
+                base_g = ref_step_offsets[ref_idx]
+                steps = item.reference.steps
+                for idx, s in enumerate(steps):
+                    if flat_has_dur_cpu[base_g + idx]:
+                        dur_entries.append((cast(EncodedWorldSnapshot, s.snapshot), base_g + idx))
+                assert item.afterstate_targets is not None
+                p_rev_ref = post_rev_per_ref[ref_idx]
+                for step_idx, as_t in item.afterstate_targets.items():
+                    if not as_t.node.post_worlds:
+                        continue
+                    node_max_w = max(w.world.token_count for w in as_t.node.post_worlds)
+                    p_rev_item = (
+                        None
+                        if p_rev_ref is None
+                        else p_rev_ref[step_idx].to(device=self.device, dtype=self.dtype)
+                    )
+                    s_chosen_pos: int | None = None
+                    s_chosen_w_obj: EncodedWorldSnapshot | None = None
+                    if as_t.has_chosen_post:
+                        s_chosen_pos = as_t.node.resolved_candidate_indices.index(
+                            steps[step_idx].action_index
+                        )
+                        s_chosen_w_obj = as_t.node.post_worlds[s_chosen_pos]
+                    node_entries.append((node_max_w, as_t, s_chosen_pos, s_chosen_w_obj, p_rev_item))
+
+            dur_v_loss, dur_s_loss = self._backward_stateless_pre_durable(
+                dur_entries=dur_entries,
+                flat_dur_target=flat_dur_target,
+                flat_stage_target=flat_stage_target,
+                flat_step_rev_gpu=flat_step_rev_gpu,
+                denom_dur_val=denom_dur_val,
+                durable_value_weight=cfg.distill_value_weight,
+                stage_baseline_weight=cfg.durable_stage_baseline_weight,
+            )
+            as_v_loss, as_m_loss, post_v_loss, post_s_loss = (
+                self._backward_stateless_distill_afterstates(
+                    node_entries=node_entries,
+                    denom_afterstate=denom_afterstate,
+                )
+            )
+            totals["durable_value_loss"] += dur_v_loss
+            totals["distill_afterstate_value_loss"] += as_v_loss
+            totals["distill_afterstate_margin_loss"] += as_m_loss
+            totals["durable_post_value_loss"] += post_v_loss
+            totals["durable_stage_baseline_loss"] += dur_s_loss + post_s_loss
             self._check_resource()
         return totals, maximum_chunk
 
@@ -3557,6 +4100,7 @@ class MacroCreditLearner:
                         model_override=self.teacher_model,
                         check_likelihood=False,
                         record_all_choice_logs=True,
+                        compute_durable_value=False,
                     )
                 else:
                     t_evals = [
@@ -3566,6 +4110,7 @@ class MacroCreditLearner:
                             model_override=self.teacher_model,
                             check_likelihood=False,
                             record_all_choice_logs=True,
+                            compute_durable_value=False,
                         )
                         for ref in cohort.natural_only
                     ]
@@ -3619,6 +4164,7 @@ class MacroCreditLearner:
                             cohort.natural_only,
                             check_likelihood=False,
                             record_all_choice_logs=False,
+                            compute_durable_value=False,
                         )
                     else:
                         s_evals = [
@@ -3627,6 +4173,7 @@ class MacroCreditLearner:
                                 root_index=-1,
                                 check_likelihood=False,
                                 record_all_choice_logs=False,
+                                compute_durable_value=False,
                             )
                             for ref in cohort.natural_only
                         ]

@@ -5190,7 +5190,262 @@ def test_v5_0_cross_width_teacher_student_distillation_kickstart_and_resume(tmp_
     assert m_stage_c["effective_kickstart_kl_weight"] == 0.0
 
 
+def test_durable_v9_stateless_distill_and_card_compaction_parity() -> None:
+    import copy
+    from dataclasses import replace
+    from typing import cast
+    from sts2_rl.encoding import EncodedWorldSnapshot
 
+    torch.manual_seed(20261115)
+    base_cfg = _tiny_model_config()
+    enc_cfg = base_cfg.to_encoding_config()
+    encoder = GroundedObservationEncoder(enc_cfg)
 
+    teacher_mcfg = replace(base_cfg, d_model=32, n_heads=4, ffn_dim=64, latent_slots=8, recurrent_hidden_dim=64)
+    student_mcfg = replace(base_cfg, d_model=64, n_heads=8, ffn_dim=128, latent_slots=12, recurrent_hidden_dim=128)
+    teacher = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v9(teacher_mcfg.to_model_config())).eval()
+    student_base = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v9(student_mcfg.to_model_config())).eval()
+    with torch.no_grad():
+        for mod in (teacher, student_base):
+            for p in mod.parameters():
+                if p.ndim >= 2:
+                    p.normal_(mean=0.0, std=0.05)
 
+    # 1. Verify deck_card_mask compaction invariance across empty (0-card), small (2-card), and full decks + heavy non-card padding
+    heavy_relics = [{"id": f"relic_{i}"} for i in range(18)]
+    obs_empty_deck = {
+        "phase": "map",
+        "decision_domain": "map",
+        "run": {"active": True, "act": 2, "floor": 22},
+        "player": {"character_id": "IRONCLAD", "hp": 41, "max_hp": 80, "gold": 210, "deck": [], "relics": heavy_relics, "potions": []},
+        "map": {"nodes": [{"x": 0, "y": 1, "type": "Monster"}, {"x": 1, "y": 1, "type": "Rest"}]},
+    }
+    obs_two_cards = {
+        "phase": "map",
+        "decision_domain": "map",
+        "run": {"active": True, "act": 2, "floor": 22},
+        "player": {
+            "character_id": "IRONCLAD",
+            "hp": 62,
+            "max_hp": 80,
+            "gold": 95,
+            "deck": _sample_deck()[:2],
+            "relics": heavy_relics[:6],
+            "potions": [],
+        },
+        "map": {"nodes": [{"x": 0, "y": 1, "type": "Monster"}, {"x": 1, "y": 1, "type": "Rest"}]},
+    }
+    obs_full_deck, rest_legal = _rest_surface(include_preview=True)
+    map_actions = [
+        {"action_id": "m0", "kind": "choose_map_node", "model_action_kind": "map", "is_enabled": True, "node": {"x": 0, "y": 1, "type": "Monster"}},
+        {"action_id": "m1", "kind": "choose_map_node", "model_action_kind": "map", "is_enabled": True, "node": {"x": 1, "y": 1, "type": "Rest"}},
+    ]
+    w_empty = encoder.encode(obs_empty_deck, map_actions).snapshot
+    w_two = encoder.encode(obs_two_cards, map_actions).snapshot
+    rest_dec = forward_decision(obs_full_deck, rest_legal, control_domain="macro")
+    assert rest_dec is not None
+    rest_enc = encoder.encode(obs_full_deck, [c.semantic_action for c in rest_dec.candidates])
+    w_full = rest_enc.snapshot
+    rev_mixed = torch.tensor(
+        [[0.1, 0.2, 0.0, 0.5, 0.3, 0.4], [0.0, 0.5, 0.1, 0.8, 0.2, 0.1], [0.3, 0.1, 0.2, 0.6, 0.4, 0.2]],
+        dtype=torch.float32,
+    )
+    with torch.no_grad():
+        wb_mix, dom_mix = collate_encoded_worlds(
+            (cast(EncodedWorldSnapshot, w_empty), cast(EncodedWorldSnapshot, w_two), cast(EncodedWorldSnapshot, w_full)),
+            expected_config=enc_cfg,
+            expected_fingerprint=w_full.encoding_fingerprint,
+            device="cpu",
+        )
+        v_mix, _ = student_base.forward_durable_value(wb_mix, dom_mix, None, critic_revival_context=rev_mixed, validate=False)
+        for idx_w, single_w in enumerate((w_empty, w_two, w_full)):
+            wb_one, dom_one = collate_encoded_worlds(
+                (cast(EncodedWorldSnapshot, single_w),),
+                expected_config=enc_cfg,
+                expected_fingerprint=single_w.encoding_fingerprint,
+                device="cpu",
+            )
+            v_one, _ = student_base.forward_durable_value(
+                wb_one, dom_one, None, critic_revival_context=rev_mixed[idx_w : idx_w + 1], validate=False
+            )
+            assert torch.allclose(v_mix[idx_w], v_one[0], atol=1e-6), f"card compaction mismatch at {idx_w}"
 
+    # 2. Verify Stage A (_distill_epoch_durable) & Stage C (_backward_chunks_durable_batch) stateless-decoupled parity vs unrolled sequential
+    grouped_cands = tuple(rest_dec.candidates[ref.representative_position] for ref in rest_enc.actions)
+    post_worlds_opt = synthesize_deterministic_afterstates(
+        encoder=encoder, observation=obs_full_deck, decision=rest_dec, candidates=grouped_cands
+    )
+    assert post_worlds_opt is not None and len(post_worlds_opt) == len(grouped_cands)
+    post_worlds = post_worlds_opt
+
+    combat_obs = {
+        "phase": "combat",
+        "decision_domain": "combat",
+        "run": {"active": True, "act": 2, "floor": 23},
+        "player": {"id": "ironclad", "side": "player", "hp": 56, "max_hp": 80, "energy": 3, "hand": [{"id": "strike", "cost": 1}]},
+        "combat": {"in_progress": True, "enemies": [{"id": "cultist", "side": "enemy", "hp": 40, "max_hp": 48}]},
+    }
+    combat_actions = [
+        {"action_handle": "c0", "kind": "play_card", "model_action_kind": "play_card", "is_enabled": True, "card": {"id": "strike", "cost": 1}},
+        {"action_handle": "c1", "kind": "end_turn", "model_action_kind": "end_turn", "is_enabled": True},
+    ]
+    combat_snap = encoder.encode(combat_obs, combat_actions).snapshot
+
+    def _build_multi_traj_cohort(rollout_mod: HybridDomainActorCriticModel, ver: int, tag: str) -> MacroCreditCohort:
+        trajs: list[MacroCreditTrajectory] = []
+        for t_i, extra_c in enumerate((1, 3, 2)):
+            macro_first = w_two if t_i == 1 else w_empty
+            seq_specs = [
+                (w_full, "macro", "rest_site", grouped_cands[t_i % len(grouped_cands)].branch, t_i % len(grouped_cands), 0.0, False, 21, 21),
+                (macro_first, "macro", "map", "Monster", t_i % 2, 0.08, False, 21, 22),
+                (w_full, "macro", "rest_site", grouped_cands[0].branch, 0, 0.0, False, 22, 22),
+            ]
+            for c_i in range(extra_c):
+                is_last = c_i == extra_c - 1
+                seq_specs.append(
+                    (combat_snap, "combat", "combat", "play_card", c_i % 2, 0.75 if is_last else -0.03, is_last, 23, 23)
+                )
+            temp_steps: list[HybridVTraceStep] = []
+            facts: list[MacroRewardFacts] = []
+            for snap, dom, surf, br, a_idx, rew, term, fb, fa in seq_specs:
+                disc = 0.0 if term else (0.997 ** (fa - fb))
+                temp_steps.append(
+                    HybridVTraceStep(snap, a_idx, -0.5, rew, disc, term, surf, br, dom, ver)  # type: ignore[arg-type]
+                )
+                facts.append(
+                    MacroRewardFacts(rew if term else 0.0, 0.0 if term else rew, 0.0, 0.0, 0.0, 0, 0.0, fb, fa, 1)
+                )
+            dummy_traj = MacroCreditTrajectory(
+                f"tmp-{t_i}", 9000 + 2 * t_i, ver, (), tuple(temp_steps), None, None, "factual_terminal", tuple(facts), macro_branch_epsilon=0.05
+            )
+            step_rev_cpu, _, _ = learner_bat._trajectory_critic_revival_contexts(dummy_traj)
+            real_steps: list[HybridVTraceStep] = []
+            h_cur = None
+            with torch.no_grad():
+                for idx_s, st in enumerate(temp_steps):
+                    b_s = collate_encoded_snapshots(
+                        (st.snapshot,), expected_config=enc_cfg, expected_fingerprint=st.snapshot.encoding_fingerprint, device="cpu"
+                    )
+                    out_s = rollout_mod(
+                        b_s, h_cur, critic_revival_context=step_rev_cpu[idx_s : idx_s + 1], validate=False
+                    )
+                    h_cur = out_s.recurrent_state
+                    m_s = torch.tensor(st.snapshot.action_mask.tolist(), dtype=torch.bool)
+                    lp_s = torch.log_softmax(out_s.policy_logits[0, : m_s.numel()].masked_fill(~m_s, -torch.inf), dim=0)
+                    beh_lp = macro_mixture_log_probs(lp_s, st.snapshot, 0.05) if st.control_domain == "macro" else lp_s
+                    real_steps.append(replace(st, behavior_log_probability=float(beh_lp[st.action_index].item())))
+            nodes = (
+                MacroAfterstateNode(0, "rest_site", tuple(c.branch for c in grouped_cands), post_worlds, tuple(range(len(grouped_cands))), False),
+                MacroAfterstateNode(2, "rest_site", tuple(c.branch for c in grouped_cands), post_worlds, tuple(range(len(grouped_cands))), False),
+            )
+            trajs.append(
+                MacroCreditTrajectory(
+                    f"{tag}-{t_i}",
+                    8_800_000 + 10 * ver + 2 * t_i,
+                    ver,
+                    (),
+                    tuple(real_steps),
+                    None,
+                    None,
+                    "factual_terminal",
+                    tuple(facts),
+                    afterstate_nodes=nodes,
+                    macro_branch_epsilon=0.05,
+                )
+            )
+        return MacroCreditCohort(tag, ver, (), natural_only=tuple(trajs))
+
+    base_lcfg = MacroCreditLearnerConfig(
+        target_mode="durable_afterstate_v2",
+        revival_budget=32,
+        enable_direct_vitals_context=True,
+        enable_macro_branch_prior=True,
+        enable_persistent_only_durable_value=True,
+        enable_asymmetric_revival_critic=True,
+        enable_draw_weighted_durable_value=True,
+        enable_role_conditioned_candidate_policy=True,
+        enable_deconfounded_durable_value=True,
+        enable_monotone_deconfounded_durable_value=True,
+        enable_balanced_deconfounded_durable_value=True,
+        enable_expressive_synergy_backbone=True,
+        enable_partial_afterstates=True,
+        enable_partial_afterstate_conditional_mpo=True,
+        enable_hierarchical_afterstate_mpo=True,
+        separate_value_grad_clip=True,
+        durable_stage_baseline_weight=1.0,
+        durable_warmup_updates=0,
+        combat_actor_warmup_updates=0,
+        distill_teacher_rollout_updates=1,
+        distill_total_updates=1,
+        distill_epochs_per_cohort=2,
+        distill_policy_kl_weight=1.0,
+        distill_value_weight=1.0,
+        distill_afterstate_margin_weight=2.0,
+        chunk_steps=2,
+    )
+
+    stu_seq = copy.deepcopy(student_base)
+    stu_bat = copy.deepcopy(student_base)
+    learner_seq = MacroCreditLearner(model=stu_seq, config=replace(base_lcfg, eval_batch_size=1, chunk_batch_size=1))
+    learner_bat = MacroCreditLearner(model=stu_bat, config=replace(base_lcfg, eval_batch_size=4, chunk_batch_size=8))
+    # Force learner_seq through the legacy in-loop unrolled durable path while learner_bat runs stateless sub-batching!
+    learner_seq._uses_stateless_durable_value = lambda target_model=None: False  # type: ignore[method-assign,assignment]
+    assert learner_bat._uses_stateless_durable_value() is True
+    learner_seq.set_teacher_model(teacher)
+    learner_bat.set_teacher_model(teacher)
+
+    cohort_a = _build_multi_traj_cohort(teacher, 0, "v9-stage-a")
+    m_seq_a = learner_seq.learn(cohort_a)
+    m_bat_a = learner_bat.learn(cohort_a)
+
+    for key in (
+        "macro_policy_loss",
+        "macro_value_loss",
+        "durable_value_loss",
+        "durable_post_value_loss",
+        "durable_stage_baseline_loss",
+        "combat_policy_loss",
+        "combat_value_loss",
+        "distill_macro_kl",
+        "distill_combat_kl",
+        "distill_afterstate_margin_loss",
+        "distill_afterstate_value_loss",
+        "backward_chunks",
+        "gradient_norm",
+        "parameter_delta_norm",
+    ):
+        assert float(m_bat_a[key]) == pytest.approx(float(m_seq_a[key]), abs=1e-5, rel=1e-4), (
+            f"Stage A mismatch on {key}: {m_bat_a[key]} vs {m_seq_a[key]}"
+        )
+    for (name, p_s), (_, p_b) in zip(stu_seq.named_parameters(), stu_bat.named_parameters(), strict=True):
+        if name in {"candidate_policy_head.2.bias", "branch_policy_head.3.bias"}:
+            assert torch.allclose(p_s, p_b, atol=5e-4), name
+        else:
+            assert torch.allclose(p_s, p_b, atol=2e-5, rtol=1e-4), f"Stage A param {name} diverged"
+
+    # Align parameters & optimizer before testing Stage C (_backward_chunks_durable_batch stateless vs sequential)
+    stu_seq.load_state_dict(stu_bat.state_dict())
+    learner_seq.optimizer.load_state_dict(copy.deepcopy(learner_bat.optimizer.state_dict()))
+    learner_seq.release_teacher()
+    learner_bat.release_teacher()
+
+    cohort_c = _build_multi_traj_cohort(stu_bat, 1, "v9-stage-c")
+    m_seq_c = learner_seq.learn(cohort_c)
+    m_bat_c = learner_bat.learn(cohort_c)
+    for key in (
+        "macro_policy_loss",
+        "macro_mpo_policy_loss",
+        "macro_pg_policy_loss",
+        "macro_value_loss",
+        "durable_value_loss",
+        "durable_post_value_loss",
+        "durable_stage_baseline_loss",
+        "combat_policy_loss",
+        "combat_value_loss",
+        "backward_chunks",
+        "gradient_norm",
+        "parameter_delta_norm",
+    ):
+        assert float(m_bat_c[key]) == pytest.approx(float(m_seq_c[key]), abs=1e-5, rel=1e-4), (
+            f"Stage C mismatch on {key}: {m_bat_c[key]} vs {m_seq_c[key]}"
+        )

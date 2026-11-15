@@ -2166,6 +2166,23 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 torch.cat([scaled_feats, child_feat_sum], dim=-1)
                 * card_mask_f
             )
+            max_cards = max(1, int(deck_card_mask.long().sum(dim=1).max().item()))
+            if max_cards < int(card_repr.shape[1]):
+                card_idx = torch.argsort(
+                    (~deck_card_mask).to(dtype=torch.int8),
+                    dim=1,
+                    stable=True,
+                )[:, :max_cards]
+                card_repr = card_repr.gather(
+                    1,
+                    card_idx.unsqueeze(-1).expand(-1, -1, int(card_repr.shape[-1])),
+                )
+                card_raw_feats = card_raw_feats.gather(
+                    1,
+                    card_idx.unsqueeze(-1).expand(-1, -1, int(card_raw_feats.shape[-1])),
+                )
+                deck_card_mask = deck_card_mask.gather(1, card_idx)
+                draw_prob = draw_prob.gather(1, card_idx)
         else:
             pers_world = self._mask_world_to_persistent(world)
             pers_enc = self.encode_world(pers_world, zero_domains, _validated=not validate)
