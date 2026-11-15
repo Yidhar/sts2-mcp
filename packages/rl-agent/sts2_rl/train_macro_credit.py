@@ -58,7 +58,7 @@ from sts2_rl.joint.parallel_collection import PersistentRolloutWorkerPool
 from sts2_rl.macro_branch_diagnostic import BranchLimits
 from sts2_rl.macro_root_diagnostic import FrozenPolicy, ProbeBudgetExhausted, validate_course
 from sts2_rl.macro_root_evidence import canonical_facts
-from sts2_rl.macro_root_policy import FrozenMacroRootPolicy
+from sts2_rl.macro_root_policy import FrozenMacroRootPolicy, load_frozen_macro_teacher
 from sts2_rl.models.hybrid_actor_critic import HybridActorCriticConfig, HybridDomainActorCriticModel
 from sts2_rl.semantics.clock import DECISION_CLOCK_CONTRACT_VERSION
 from sts2_rl.semantics.forward import FORWARD_COMPILER_CONTRACT_VERSION
@@ -133,6 +133,13 @@ class MacroTrainingConfig:
             raise ValueError("macro course needs a positive macro continuation horizon")
         if self.learner.target_mode == "durable_afterstate_v2" and not self.branches.terminal_only:
             raise ValueError("durable_afterstate_v2 requires branches.terminal_only=True")
+        if (
+            self.learner.distill_teacher_rollout_updates > 0
+            and self.learner.target_mode != "durable_afterstate_v2"
+        ):
+            raise ValueError(
+                "learner.distill_teacher_rollout_updates > 0 requires learner.target_mode='durable_afterstate_v2'"
+            )
         if self.branches.max_candidates > self.training.model.max_candidates:
             raise ValueError("branch candidate budget exceeds the model candidate capacity")
 
@@ -245,6 +252,8 @@ def _actor_critic_config(config: MacroTrainingConfig) -> HybridActorCriticConfig
     if config.learner.target_mode == "durable_afterstate_v2":
         return HybridActorCriticConfig(
             grounded=grounded,
+            domain_layers=config.learner.domain_layers,
+            joint_layers=config.learner.joint_layers,
             enable_hierarchical_branch_policy=True,
             enable_durable_value_head=True,
             enable_persistent_build_context=True,
@@ -263,8 +272,35 @@ def _actor_critic_config(config: MacroTrainingConfig) -> HybridActorCriticConfig
             enable_balanced_deconfounded_durable_value=(
                 config.learner.enable_balanced_deconfounded_durable_value
             ),
+            enable_expressive_synergy_backbone=(
+                config.learner.enable_expressive_synergy_backbone
+            ),
         )
-    return HybridActorCriticConfig(grounded)
+    return HybridActorCriticConfig(
+        grounded,
+        domain_layers=config.learner.domain_layers,
+        joint_layers=config.learner.joint_layers,
+    )
+
+
+def _extract_distillation_teacher_info(
+    initialization: Mapping[str, Any],
+) -> tuple[str | None, str | None]:
+    """Walk initialization provenance chain for a teacher distillation source."""
+    current: Mapping[str, Any] | None = initialization
+    visited = 0
+    while isinstance(current, Mapping) and visited < 8:
+        visited += 1
+        if current.get("mode") == "teacher_distillation_new_macro_lineage":
+            raw_path = current.get("source_path")
+            raw_sha = current.get("source_sha256")
+            return (
+                raw_path if isinstance(raw_path, str) and raw_path else None,
+                raw_sha if isinstance(raw_sha, str) and raw_sha else None,
+            )
+        prior = current.get("prior_initialization")
+        current = prior if isinstance(prior, Mapping) else None
+    return None, None
 
 
 class InMemoryTeacher:
@@ -276,6 +312,13 @@ class InMemoryTeacher:
         self.device = device
         self.hierarchical_branch_greedy = bool(model.actor_critic_config.enable_hierarchical_branch_policy)
         self._lock = threading.Lock()
+
+    def set_model(self, model: HybridDomainActorCriticModel) -> None:
+        with self._lock:
+            self.model = model
+            self.hierarchical_branch_greedy = bool(
+                model.actor_critic_config.enable_hierarchical_branch_policy
+            )
 
     def initial_state(self) -> torch.Tensor:
         with self._lock, torch.inference_mode():
@@ -422,14 +465,36 @@ def run_cohorts(
         for _ in range(max_updates):
             guard = ResourceGuard(output, config.course)
             guard.check(force=True)
+            teacher_model = getattr(learner, "teacher_model", None)
+            if (
+                teacher_model is not None
+                and learner.update >= config.learner.distill_total_updates
+            ):
+                learner.release_teacher()
+                if getattr(learner, "device", torch.device("cpu")).type == "cuda":
+                    torch.cuda.empty_cache()
+                teacher_model = None
+            rollout_model = getattr(learner, "active_rollout_model", learner.model)
+            rollout_model.eval()
             learner.model.eval()
+            rollout_policy_kind = (
+                "frozen_teacher"
+                if (teacher_model is not None and rollout_model is teacher_model)
+                else "online_student"
+            )
+            if isinstance(rollout_model, HybridDomainActorCriticModel):
+                if worker_pool is not None:
+                    worker_pool.inference_server.set_model(rollout_model)
+                elif isinstance(teacher, InMemoryTeacher):
+                    teacher.set_model(rollout_model)
             cohort_dir = output / "cohorts" / f"update-{learner.update:06d}-attempt-{uuid4().hex}"
             cohort_dir.mkdir(parents=True, exist_ok=False)
             roots: list[MacroCounterfactualRoot] = []
             natural_only: list[MacroCreditTrajectory] = []
             training_episodes: list[dict[str, Any]] = []
             _json(output / "status.json", {"state": "collecting", "committed_update": committed_update,
-                                          "next_seed_index": cursor, "attempt": str(cohort_dir)})
+                                          "next_seed_index": cursor, "attempt": str(cohort_dir),
+                                          "rollout_policy": rollout_policy_kind})
             collection_started = time.monotonic()
             consumed_seeds = config.course.roots_per_cohort
             if config.learner.target_mode == "durable_afterstate_v2":
@@ -519,13 +584,22 @@ def run_cohorts(
                 raise ValueError("cohort requires natural macro and combat coverage before its joint update")
             collection_elapsed_s = time.monotonic() - collection_started
             _json(cohort_dir / "collected.json", {"training_episodes": training_episodes, "coverage": coverage,
-                                                  "elapsed_seconds": collection_elapsed_s})
+                                                  "elapsed_seconds": collection_elapsed_s,
+                                                  "rollout_policy": rollout_policy_kind})
             _json(output / "status.json", {"state": "updating", "committed_update": committed_update,
-                                          "next_seed_index": cursor, "attempt": str(cohort_dir), "coverage": coverage})
+                                          "next_seed_index": cursor, "attempt": str(cohort_dir), "coverage": coverage,
+                                          "rollout_policy": rollout_policy_kind})
             guard.check(force=True)
             metrics = learner.learn(cohort, resource_guard=guard.check)
             if learner.update != committed_update + 1:
                 raise RuntimeError("learner must perform exactly one update per completed cohort")
+            if (
+                getattr(learner, "teacher_model", None) is not None
+                and learner.update >= config.learner.distill_total_updates
+            ):
+                learner.release_teacher()
+                if getattr(learner, "device", torch.device("cpu")).type == "cuda":
+                    torch.cuda.empty_cache()
             guard.check(force=True)
             next_cursor = cursor + consumed_seeds
             previous_cursor = cursor
@@ -539,6 +613,7 @@ def run_cohorts(
             publish()
             _json(cohort_dir / "update.json", {"committed_update": committed_update,
                                               "next_seed_index": cursor, "learner": metrics, "coverage": coverage,
+                                              "rollout_policy": rollout_policy_kind,
                                               "training_episodes": training_episodes})
             guard.check(force=True)
         summary = {"state": "bounded_training_complete", "committed_update": committed_update,
@@ -565,9 +640,25 @@ def _parser() -> argparse.ArgumentParser:
     mode.add_argument("--initialize-from-iql", type=Path)
     mode.add_argument("--initialize-from-macro-publication", type=Path,
                       help="explicit model-only new lineage; optimizer/RNG/update are reset, never exact resume")
+    mode.add_argument(
+        "--distill-from-macro-publication",
+        type=Path,
+        help=(
+            "initialize a fresh student macro lineage (including cross-width d_model=256) "
+            "and attach a frozen macro-credit publication teacher for Stage A/B distillation"
+        ),
+    )
     mode.add_argument("--migrate-runtime-from-checkpoint", type=Path,
                       help="preserve model, optimizer, RNG, update, and seed cursor across runtime/throughput upgrades")
     mode.add_argument("--resume", type=Path)
+    parser.add_argument(
+        "--teacher-publication",
+        type=Path,
+        help=(
+            "optional explicit path to the frozen teacher publication when resuming "
+            "or migrating an active distillation lineage across hosts; SHA-256 must still match"
+        ),
+    )
     parser.add_argument("--sim-exe", type=Path)
     parser.add_argument("--max-updates", type=int, default=1, help="maximum committed updates in this invocation")
     parser.add_argument("--set", action="append", default=[], dest="overrides", metavar="KEY=TOML_VALUE")
@@ -582,6 +673,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.max_updates <= 0:
             raise ValueError("--max-updates must be positive")
         config = load_macro_training_config(args.config, args.overrides)
+        if args.distill_from_macro_publication and config.learner.distill_total_updates <= 0:
+            raise ValueError(
+                "--distill-from-macro-publication requires learner.distill_total_updates > 0"
+            )
+        if args.teacher_publication and not (args.resume or args.migrate_runtime_from_checkpoint):
+            raise ValueError(
+                "--teacher-publication is only valid with --resume or --migrate-runtime-from-checkpoint"
+            )
         root = artifact_root()
         output = resolve_artifact_path(args.output_dir, root=root)
         device = explicit_device(args.device)
@@ -590,6 +689,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         source = resolve_external_input_path(
             args.initialize_from_iql
             or args.initialize_from_macro_publication
+            or args.distill_from_macro_publication
             or args.migrate_runtime_from_checkpoint
             or args.resume,
             root=root,
@@ -633,6 +733,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps({"state": "preflight_only", "training_ready": False, "config_validated": True,
                               "simulator_verified": True, "source_weights_validated": False,
                               "next_training_seed_if_new": seed_at(config.course.seed_index_offset),
+                              "student_model_config": ac_config.as_mapping(),
+                              "distillation_configured": config.learner.distill_total_updates > 0,
                               "course": config.as_mapping()}, allow_nan=False))
             return 0
         with output_owner(
@@ -642,6 +744,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ):
             _json(output / "status.json", {"state": "initializing", "lineage_id": args.lineage_id})
             configure_rocm_sdpa_backend(training.runtime.rocm_sdpa_backend, devices=(device,))
+            initial_loaded_teacher_model: HybridDomainActorCriticModel | None = None
+            extra_source_paths: list[Path] = []
             if args.initialize_from_iql or args.initialize_from_macro_publication:
                 random.seed(TRAINING_SEED_BASE)
                 np.random.seed(TRAINING_SEED_BASE)
@@ -664,12 +768,46 @@ def main(argv: Sequence[str] | None = None) -> int:
                                   "source_sha256": source_hash, "optimizer_reset": True,
                                   "rng_reset": True, "destination_update": 0,
                                   "destination_encoding": grounding_encoding_identity()}
+            elif args.distill_from_macro_publication:
+                source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+                loaded_teacher = load_frozen_macro_teacher(
+                    source,
+                    expected_encoding=training.model.to_encoding_config(),
+                    device=device,
+                    rocm_sdpa_backend=training.runtime.rocm_sdpa_backend,
+                    expected_sha256=source_hash,
+                )
+                if hashlib.sha256(source.read_bytes()).hexdigest() != source_hash:
+                    raise ValueError("distillation teacher publication changed while loading")
+                random.seed(TRAINING_SEED_BASE)
+                np.random.seed(TRAINING_SEED_BASE)
+                torch.manual_seed(TRAINING_SEED_BASE)
+                if device.type == "cuda":
+                    torch.cuda.manual_seed_all(TRAINING_SEED_BASE)
+                model = HybridDomainActorCriticModel(ac_config).to(device)
+                initial_loaded_teacher_model = loaded_teacher.model
+                extra_source_paths.append(source)
+                initialization = canonical_facts({
+                    "mode": "teacher_distillation_new_macro_lineage",
+                    "exact_resume": False,
+                    "training_state_loaded": False,
+                    "source_kind": loaded_teacher.provenance["source_kind"],
+                    "source_path": str(source),
+                    "source_sha256": source_hash,
+                    "teacher_provenance": loaded_teacher.provenance,
+                    "optimizer_reset": True,
+                    "rng_reset": True,
+                    "destination_update": 0,
+                    "destination_encoding": grounding_encoding_identity(),
+                })
             else:
                 model = HybridDomainActorCriticModel(ac_config).to(device)
                 initialization = {}
             model.requires_grad_(True)
             model.eval()
             learner = MacroCreditLearner(model=model, config=config.learner)
+            if initial_loaded_teacher_model is not None:
+                learner.set_teacher_model(initial_loaded_teacher_model)
             cursor = 0
             if args.resume:
                 payload = load_macro_checkpoint(source, identity=identity, model=model, optimizer=learner.optimizer,
@@ -699,9 +837,58 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "cursor_base_at_migration": cursor,
                     "prior_initialization": payload["initialization"],
                 }
+            if (
+                (args.resume or args.migrate_runtime_from_checkpoint)
+                and config.learner.distill_total_updates > 0
+                and learner.update < config.learner.distill_total_updates
+            ):
+                recorded_teacher_path, expected_teacher_sha = _extract_distillation_teacher_info(initialization)
+                if expected_teacher_sha is None:
+                    raise ValueError(
+                        "active distillation checkpoint (update < distill_total_updates) "
+                        "is missing teacher source_sha256 in initialization provenance"
+                    )
+                if args.teacher_publication is not None:
+                    teacher_path = resolve_external_input_path(args.teacher_publication, root=root)
+                elif recorded_teacher_path is not None:
+                    teacher_path = resolve_external_input_path(Path(recorded_teacher_path), root=root)
+                else:
+                    raise ValueError(
+                        "active distillation checkpoint requires teacher source_path or --teacher-publication"
+                    )
+                if not teacher_path.exists():
+                    raise FileNotFoundError(
+                        f"active distillation teacher publication not found: {teacher_path}; "
+                        "supply --teacher-publication if resuming across hosts"
+                    )
+                resumed_teacher = load_frozen_macro_teacher(
+                    teacher_path,
+                    expected_encoding=training.model.to_encoding_config(),
+                    device=device,
+                    rocm_sdpa_backend=training.runtime.rocm_sdpa_backend,
+                    expected_sha256=expected_teacher_sha,
+                )
+                learner.set_teacher_model(resumed_teacher.model)
+                extra_source_paths.append(teacher_path)
             _json(output / "course.json", identity.as_mapping())
             _json(output / "source_manifest.json", sources)
             protocol_incidents = output / "protocol-incidents"
+            initial_rollout_model = learner.active_rollout_model
+            guarded_sources = tuple(
+                [
+                    *(
+                        (source,)
+                        if (
+                            args.initialize_from_iql
+                            or args.initialize_from_macro_publication
+                            or args.distill_from_macro_publication
+                            or args.migrate_runtime_from_checkpoint
+                        )
+                        else ()
+                    ),
+                    *extra_source_paths,
+                ]
+            )
             with ExitStack() as pool_stack:
                 worker_pool: PersistentRolloutWorkerPool | None = None
                 teacher: FrozenPolicy
@@ -712,7 +899,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     worker_pool = pool_stack.enter_context(
                         PersistentRolloutWorkerPool(
                             num_workers=config.course.parallel_collectors,
-                            model=model,
+                            model=initial_rollout_model,
                             training_config=training,
                             device=device,
                             sim_exe_path=simulator.executable,
@@ -723,7 +910,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                     teacher = worker_pool.inference_server
                 else:
-                    teacher = InMemoryTeacher(model, training, device)
+                    teacher = InMemoryTeacher(initial_rollout_model, training, device)
                 summary = run_cohorts(
                     config=config, output=output, identity=identity, learner=learner,
                     teacher=teacher,
@@ -731,15 +918,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                                            protocol_quarantine_dir=protocol_incidents),
                     initial_seed_index=cursor, initialization=initialization, max_updates=args.max_updates,
                     initialize_boundary=not bool(args.resume), root=root,
-                    source_paths=(
-                        (source,)
-                        if (
-                            args.initialize_from_iql
-                            or args.initialize_from_macro_publication
-                            or args.migrate_runtime_from_checkpoint
-                        )
-                        else ()
-                    ),
+                    source_paths=guarded_sources,
                     worker_pool=worker_pool,
                 )
             print(json.dumps(summary, allow_nan=False))

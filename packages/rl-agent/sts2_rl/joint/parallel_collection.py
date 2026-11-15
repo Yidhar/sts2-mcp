@@ -108,6 +108,18 @@ class BatchedPolicyInferenceServer:
         """Re-enable background GPU inference after learner update commits."""
         self._paused.clear()
 
+    def set_model(self, model: HybridDomainActorCriticModel) -> None:
+        """Atomically swap the active rollout model at a cohort boundary."""
+        was_paused = self._paused.is_set()
+        self.pause_for_learner()
+        self.model = model
+        self.recurrent_hidden_dim = int(model.config.recurrent_hidden_dim)
+        self.hierarchical_branch_greedy = bool(
+            model.actor_critic_config.enable_hierarchical_branch_policy
+        )
+        if not was_paused:
+            self.resume_for_collection()
+
     def close(self) -> None:
         self._stop_event.set()
         self._paused.clear()
@@ -247,7 +259,14 @@ class BatchedPolicyInferenceServer:
             hidden_np = np.zeros((bsz, self.recurrent_hidden_dim), dtype=np.float32)
             for idx, (_, _, _, hid) in enumerate(batch_items):
                 if hid is not None:
-                    hidden_np[idx] = hid.reshape(self.recurrent_hidden_dim)
+                    if hid.size == self.recurrent_hidden_dim:
+                        hidden_np[idx] = hid.reshape(self.recurrent_hidden_dim)
+                    elif not bool(np.any(hid)):
+                        continue
+                    else:
+                        raise ValueError(
+                            f"non-zero recurrent state width {hid.size} != active model width {self.recurrent_hidden_dim}"
+                        )
             with torch.inference_mode():
                 model_dtype = next(self.model.parameters()).dtype
                 hid_t = torch.from_numpy(hidden_np)
@@ -387,6 +406,10 @@ def _rollout_worker_entry(
         slot_index = int(task["slot_index"])
         attempt_offset = int(task["attempt_offset"])
         seed = int(task["seed"])
+        if "recurrent_hidden_dim" in task:
+            policy._recurrent_hidden_dim = int(task["recurrent_hidden_dim"])
+        if "hierarchical_branch_greedy" in task:
+            policy.hierarchical_branch_greedy = bool(task["hierarchical_branch_greedy"])
         try:
             trajectory, report = collect_durable_afterstate_episode(
                 backend_factory=backend_factory,
@@ -541,6 +564,8 @@ class PersistentRolloutWorkerPool:
                     "attempt_offset": attempt_offset,
                     "seed": seed_val,
                     "teacher_version": teacher_version,
+                    "recurrent_hidden_dim": self.inference_server.recurrent_hidden_dim,
+                    "hierarchical_branch_greedy": self.inference_server.hierarchical_branch_greedy,
                     "config": config,
                     "limits": limits,
                     "output_dir": str(cohort_dir / f"episode-{attempt_offset:03d}"),

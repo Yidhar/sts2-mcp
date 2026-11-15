@@ -8,9 +8,11 @@ its historical reward identity is not confused with the diagnostic course.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 import torch
 from torch import Tensor
@@ -20,7 +22,12 @@ from sts2_baseline import (
     absolute_death_price_reward_identity,
     act_frontloaded_death_reward_identity,
 )
-from sts2_rl.encoding.snapshot import EncodedDecisionSnapshot, collate_encoded_snapshots
+from sts2_rl.encoding.snapshot import (
+    EncodedDecisionSnapshot,
+    GroundedEncodingConfig,
+    collate_encoded_snapshots,
+)
+from sts2_rl.models.grounded_candidate import GroundedCandidateConfig
 from sts2_rl.models.hybrid_actor_critic import (
     HYBRID_ACTOR_CRITIC_V2_MODEL_VERSION,
     V2_FRESH_TENSOR_PREFIXES,
@@ -163,6 +170,8 @@ class FrozenMacroRootPolicy:
                 "enable_role_conditioned_candidate_policy",
                 "enable_deconfounded_durable_value",
                 "enable_monotone_deconfounded_durable_value",
+                "enable_balanced_deconfounded_durable_value",
+                "enable_expressive_synergy_backbone",
             ):
                 if getattr(parsed_macro_source_cfg, flag_name) and not getattr(model_config, flag_name):
                     raise ValueError(
@@ -291,4 +300,128 @@ class FrozenMacroRootPolicy:
         return logits, next_hidden
 
 
-__all__ = ["FrozenMacroRootPolicy"]
+@dataclass(frozen=True, slots=True)
+class LoadedFrozenMacroTeacher:
+    model: HybridDomainActorCriticModel
+    model_config: HybridActorCriticConfig
+    provenance: dict[str, Any]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_frozen_macro_teacher(
+    model_path: Path,
+    *,
+    expected_encoding: GroundedEncodingConfig,
+    device: str | torch.device,
+    rocm_sdpa_backend: Literal["auto", "math"] = "math",
+    expected_sha256: str | None = None,
+) -> LoadedFrozenMacroTeacher:
+    """Load any ``HYBRID_MACRO_CREDIT_PUBLICATION`` at its native width/depth.
+
+    Verifies SHA-256 provenance (when provided), ``reward-v9`` identity,
+    ``policy_logits`` control ABI, and exact grounded feature/vocabulary ABI
+    compatibility against ``expected_encoding`` while permitting arbitrary
+    teacher width/depth/head flags.
+    """
+    source_path = _model_file(model_path)
+    source_sha256 = _sha256_file(source_path)
+    if expected_sha256 is not None and source_sha256 != expected_sha256:
+        raise ValueError(
+            f"frozen macro teacher SHA-256 differs from recorded provenance: {source_path}"
+        )
+    if isinstance(device, torch.device):
+        resolved_device = device
+    else:
+        dev_str = "cuda" if device == "auto" and torch.cuda.is_available() else device
+        if dev_str == "auto":
+            dev_str = "cpu"
+        resolved_device = torch.device(dev_str)
+    payload = torch.load(source_path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, Mapping):
+        raise ValueError("frozen macro teacher publication must be a mapping")
+    if payload.get("format") != HYBRID_MACRO_CREDIT_PUBLICATION:
+        raise ValueError(
+            f"frozen macro teacher expected format {HYBRID_MACRO_CREDIT_PUBLICATION!r}"
+        )
+    if payload.get("control_scores") != "policy_logits":
+        raise ValueError("frozen macro teacher publication must declare policy_logits")
+    raw_model_cfg = payload.get("model_config")
+    if not isinstance(raw_model_cfg, dict):
+        raise ValueError("frozen macro teacher publication missing model_config")
+    fallback_grounded = GroundedCandidateConfig(
+        token_feature_dim=expected_encoding.feature_dim,
+        type_vocab_size=expected_encoding.type_vocab_size,
+        role_vocab_size=expected_encoding.role_vocab_size,
+        owner_vocab_size=expected_encoding.owner_vocab_size,
+        entity_vocab_size=expected_encoding.entity_vocab_size,
+        zone_vocab_size=expected_encoding.zone_vocab_size,
+        order_vocab_size=expected_encoding.max_order_id,
+        domain_count=expected_encoding.domain_count,
+    )
+    teacher_cfg = HybridActorCriticConfig.from_mapping(
+        raw_model_cfg,
+        fallback_grounded=fallback_grounded,
+    )
+    if teacher_cfg.as_mapping() != raw_model_cfg:
+        raise ValueError("frozen macro teacher model_config failed round-trip validation")
+    teacher_encoding = GroundedEncodingConfig.from_model_config(
+        teacher_cfg.grounded,
+        max_world_tokens=expected_encoding.max_world_tokens,
+        max_candidates=expected_encoding.max_candidates,
+        max_candidate_local_tokens=expected_encoding.max_candidate_local_tokens,
+    )
+    if teacher_encoding != expected_encoding:
+        raise ValueError(
+            "frozen macro teacher grounded vocabulary/feature ABI differs from student encoding"
+        )
+    pub_reward = payload.get("reward_identity")
+    if (
+        not isinstance(pub_reward, Mapping)
+        or pub_reward.get("version") != ACT_FRONTLOADED_DEATH_REWARD_SPEC.version
+    ):
+        raise ValueError("frozen macro teacher reward_identity is not reward-v9")
+    budget = pub_reward.get("revival_budget")
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
+        raise ValueError("frozen macro teacher requires a positive revival budget")
+    if pub_reward != act_frontloaded_death_reward_identity(revival_budget=budget):
+        raise ValueError("frozen macro teacher reward_identity differs from its declared course")
+    policy_version = payload.get("policy_version")
+    if isinstance(policy_version, bool) or not isinstance(policy_version, int) or policy_version < 0:
+        raise ValueError("frozen macro teacher policy_version must be non-negative")
+    online = _online_tensors(payload)
+    configure_rocm_sdpa_backend(rocm_sdpa_backend, devices=(resolved_device,))
+    model = HybridDomainActorCriticModel(teacher_cfg)
+    model.load_state_dict(online, strict=True)
+    model.to(resolved_device)
+    model.eval()
+    model.requires_grad_(False)
+    provenance: dict[str, Any] = {
+        "source_kind": "hybrid_macro_credit_publication",
+        "source_path": str(source_path),
+        "source_sha256": source_sha256,
+        "source_format": HYBRID_MACRO_CREDIT_PUBLICATION,
+        "policy_version": int(policy_version),
+        "source_model_config": teacher_cfg.as_mapping(),
+        "source_reward_identity": dict(pub_reward),
+        "parameter_count": model.parameter_count,
+        "device": str(resolved_device),
+    }
+    return LoadedFrozenMacroTeacher(
+        model=model,
+        model_config=teacher_cfg,
+        provenance=provenance,
+    )
+
+
+__all__ = [
+    "FrozenMacroRootPolicy",
+    "LoadedFrozenMacroTeacher",
+    "load_frozen_macro_teacher",
+]

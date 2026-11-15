@@ -28,7 +28,7 @@ from sts2_rl.artifacts import artifact_root, resolve_external_input_path
 from sts2_rl.encoding import GroundedObservationEncoder
 from sts2_rl.encoding.snapshot import collate_encoded_snapshots, collate_encoded_worlds
 from sts2_rl.joint.afterstate import synthesize_deterministic_afterstates
-from sts2_rl.macro_root_policy import FrozenMacroRootPolicy
+from sts2_rl.macro_root_policy import load_frozen_macro_teacher
 from sts2_rl.models.hybrid_actor_critic import HybridDomainActorCriticModel
 from sts2_rl.semantics.forward import forward_decision
 from sts2_rl.training.config import load_training_config
@@ -830,37 +830,46 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     root = artifact_root()
     pub_path = resolve_external_input_path(args.publication, root=root)
+    resolved_exp_dir = (
+        resolve_external_input_path(args.experiment_dir, root=root)
+        if args.experiment_dir is not None
+        else None
+    )
     raw_pub = torch.load(pub_path, map_location="cpu", weights_only=True)
-    pub_budget = 64
-    if isinstance(raw_pub, Mapping):
-        raw_rew = raw_pub.get("reward_identity")
-        if isinstance(raw_rew, Mapping):
-            raw_b = raw_rew.get("revival_budget")
-            if isinstance(raw_b, int) and not isinstance(raw_b, bool) and raw_b > 0:
-                pub_budget = int(raw_b)
     base_training = load_training_config(profile="preheat")
+    max_world_tokens = base_training.model.max_world_tokens
+    if isinstance(raw_pub, Mapping):
+        raw_course = raw_pub.get("course_config")
+        if isinstance(raw_course, Mapping):
+            raw_enc = raw_course.get("encoding")
+            if isinstance(raw_enc, Mapping):
+                raw_mwt = raw_enc.get("max_world_tokens")
+                if isinstance(raw_mwt, int) and not isinstance(raw_mwt, bool) and raw_mwt > 0:
+                    max_world_tokens = int(raw_mwt)
+    if resolved_exp_dir is not None and (resolved_exp_dir / "course.json").is_file():
+        course_payload = json.loads((resolved_exp_dir / "course.json").read_text(encoding="utf-8"))
+        if isinstance(course_payload, Mapping):
+            raw_cc = course_payload.get("course_config")
+            if isinstance(raw_cc, Mapping):
+                raw_enc = raw_cc.get("encoding")
+                if isinstance(raw_enc, Mapping):
+                    raw_mwt = raw_enc.get("max_world_tokens")
+                    if isinstance(raw_mwt, int) and not isinstance(raw_mwt, bool) and raw_mwt > 0:
+                        max_world_tokens = int(raw_mwt)
     training = replace(
         base_training,
-        curriculum=replace(
-            base_training.curriculum,
-            mode="native-revival-preheat",
-            reward_objective="run",
-            revival_mechanism="engine-bailout-v1",
-            revival_budget=pub_budget,
-        ),
+        model=replace(base_training.model, max_world_tokens=max_world_tokens),
     )
-    loaded = FrozenMacroRootPolicy(
+    encoding_cfg = training.model.to_encoding_config()
+    loaded = load_frozen_macro_teacher(
         pub_path,
-        training,
-        args.device,
-        initialize_from_macro_publication=True,
-        evaluation_only_allow_zero=True,
-        actor_critic_config=None,
+        expected_encoding=encoding_cfg,
+        device=args.device,
     )
-    encoder = GroundedObservationEncoder(training.model.to_encoding_config())
+    encoder = GroundedObservationEncoder(encoding_cfg)
     recent_episodes = (
-        _collect_recent_episodes(resolve_external_input_path(args.experiment_dir, root=root), max_cohorts=args.max_cohorts)
-        if args.experiment_dir is not None
+        _collect_recent_episodes(resolved_exp_dir, max_cohorts=args.max_cohorts)
+        if resolved_exp_dir is not None
         else []
     )
     report = run_all_competence_probes(loaded.model, encoder, recent_episodes=recent_episodes)

@@ -338,3 +338,60 @@ def test_source_manifest_is_explicitly_partial_and_excludes_tests_docs() -> None
     assert all(record["path"].startswith("sts2_rl/") for record in records)
     assert all(len(record["sha256"]) == 64 for record in records)
     assert "git_head_provenance_only" in manifest
+
+
+def test_distillation_cli_preflight_and_fail_closed_guards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    source = tmp_path / "teacher_pub.pt"
+    source.write_bytes(b"teacher")
+    simulator = SimpleNamespace(executable=tmp_path / "HeadlessSim.exe", to_mapping=lambda: {"verified": True})
+    monkeypatch.setattr(cli, "resolve_headless_sim_exe", lambda _: simulator.executable)
+    monkeypatch.setattr(cli, "verify_headless_simulator", lambda _: simulator)
+
+    v50_cfg = (
+        Path(__file__).resolve().parents[1]
+        / "config/experiments/hybrid_macro_credit_v13_durable_afterstate_v50_wide256_b32_g4_turbo.toml"
+    )
+    output = tmp_path / "v50_run"
+    rc = cli.main([
+        "--config", str(v50_cfg),
+        "--output-dir", str(output),
+        "--lineage-id", "v50-unit",
+        "--device", "cpu",
+        "--distill-from-macro-publication", str(source),
+        "--dry-run",
+    ])
+    assert rc == 0
+    preflight = json.loads(capsys.readouterr().out)
+    assert preflight["state"] == "preflight_only"
+    assert preflight["distillation_configured"] is True
+    assert preflight["student_model_config"]["grounded"]["d_model"] == 256
+    assert preflight["student_model_config"]["enable_expressive_synergy_backbone"] is True
+
+    # Fail closed when distill_total_updates == 0
+    rc_zero = cli.main([
+        "--config", str(cli.DEFAULT_CONFIG),
+        "--output-dir", str(tmp_path / "bad_zero"),
+        "--lineage-id", "bad-zero",
+        "--device", "cpu",
+        "--distill-from-macro-publication", str(source),
+        "--dry-run",
+    ])
+    assert rc_zero == 1
+    capsys.readouterr()
+
+    # Fail closed when --teacher-publication is passed without --resume / --migrate-runtime-from-checkpoint
+    rc_tp = cli.main([
+        "--config", str(v50_cfg),
+        "--output-dir", str(tmp_path / "bad_tp"),
+        "--lineage-id", "bad-tp",
+        "--device", "cpu",
+        "--distill-from-macro-publication", str(source),
+        "--teacher-publication", str(source),
+        "--dry-run",
+    ])
+    assert rc_tp == 1
+    capsys.readouterr()
+

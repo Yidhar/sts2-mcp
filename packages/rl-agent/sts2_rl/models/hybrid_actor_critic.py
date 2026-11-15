@@ -62,6 +62,7 @@ DURABLE_HP_BASIS_DIM: Final = 5
 DURABLE_LIQUID_BASIS_DIM: Final = 4
 DURABLE_CYCLE_BASIS_DIM: Final = 3
 DURABLE_TILT_BETAS: Final[tuple[float, ...]] = (1.5, 3.0, 6.0)
+DURABLE_BUILD_QUERIES_V9: Final = 8
 CRITIC_REVIVAL_CONTEXT_DIM: Final = 6
 PERSISTENT_BUILD_ZONE_IDS: Final[tuple[int, ...]] = (2, 13, 15, 16, 20, 22)
 IDENTITY_BLIND_CARD_COUNT_ZONE_IDS: Final[frozenset[int]] = frozenset({2, 20})
@@ -78,6 +79,7 @@ V2_FRESH_TENSOR_PREFIXES: Final[tuple[str, ...]] = (
     "durable_stage_",
     "durable_value_head.",
     "durable_vitals_",
+    "latent_slot_readout.",
     "persistent_build_",
     "persistent_vitals_",
     "state_revival_",
@@ -111,6 +113,7 @@ class HybridActorCriticConfig:
     enable_deconfounded_durable_value: bool = False
     enable_monotone_deconfounded_durable_value: bool = False
     enable_balanced_deconfounded_durable_value: bool = False
+    enable_expressive_synergy_backbone: bool = False
 
     def __post_init__(self) -> None:
         HybridCandidateQConfig(
@@ -131,6 +134,7 @@ class HybridActorCriticConfig:
             "enable_deconfounded_durable_value",
             "enable_monotone_deconfounded_durable_value",
             "enable_balanced_deconfounded_durable_value",
+            "enable_expressive_synergy_backbone",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"hybrid actor-critic {name} must be boolean")
@@ -156,6 +160,13 @@ class HybridActorCriticConfig:
             raise ValueError(
                 "enable_balanced_deconfounded_durable_value requires enable_monotone_deconfounded_durable_value=True"
             )
+        if (
+            self.enable_expressive_synergy_backbone
+            and not self.enable_balanced_deconfounded_durable_value
+        ):
+            raise ValueError(
+                "enable_expressive_synergy_backbone requires enable_balanced_deconfounded_durable_value=True"
+            )
 
     @property
     def has_v2_extensions(self) -> bool:
@@ -172,6 +183,7 @@ class HybridActorCriticConfig:
             or self.enable_deconfounded_durable_value
             or self.enable_monotone_deconfounded_durable_value
             or self.enable_balanced_deconfounded_durable_value
+            or self.enable_expressive_synergy_backbone
         )
 
     @classmethod
@@ -330,6 +342,33 @@ class HybridActorCriticConfig:
         )
 
     @classmethod
+    def durable_v9(
+        cls,
+        grounded: GroundedCandidateConfig | None = None,
+        *,
+        domain_layers: int = 1,
+        joint_layers: int = 2,
+    ) -> HybridActorCriticConfig:
+        return cls(
+            grounded=grounded or GroundedCandidateConfig(),
+            domain_layers=domain_layers,
+            joint_layers=joint_layers,
+            enable_hierarchical_branch_policy=True,
+            enable_durable_value_head=True,
+            enable_persistent_build_context=True,
+            enable_direct_vitals_context=True,
+            enable_macro_branch_prior=True,
+            enable_persistent_only_durable_value=True,
+            enable_asymmetric_revival_critic=True,
+            enable_draw_weighted_durable_value=True,
+            enable_role_conditioned_candidate_policy=True,
+            enable_deconfounded_durable_value=True,
+            enable_monotone_deconfounded_durable_value=True,
+            enable_balanced_deconfounded_durable_value=True,
+            enable_expressive_synergy_backbone=True,
+        )
+
+    @classmethod
     def from_mapping(
         cls,
         mapping: dict[str, Any],
@@ -337,15 +376,21 @@ class HybridActorCriticConfig:
         fallback_grounded: GroundedCandidateConfig,
     ) -> HybridActorCriticConfig:
         version = mapping.get("version")
+        raw_grounded = mapping.get("grounded")
+        resolved_grounded = (
+            GroundedCandidateConfig(**raw_grounded)
+            if isinstance(raw_grounded, dict)
+            else fallback_grounded
+        )
         if version == HYBRID_ACTOR_CRITIC_MODEL_VERSION:
             return cls(
-                grounded=fallback_grounded,
+                grounded=resolved_grounded,
                 domain_layers=int(mapping.get("domain_layers", 1)),
                 joint_layers=int(mapping.get("joint_layers", 2)),
             )
         if version == HYBRID_ACTOR_CRITIC_V2_MODEL_VERSION:
             return cls(
-                grounded=fallback_grounded,
+                grounded=resolved_grounded,
                 domain_layers=int(mapping.get("domain_layers", 1)),
                 joint_layers=int(mapping.get("joint_layers", 2)),
                 enable_hierarchical_branch_policy=bool(
@@ -383,6 +428,9 @@ class HybridActorCriticConfig:
                 ),
                 enable_balanced_deconfounded_durable_value=bool(
                     mapping.get("enable_balanced_deconfounded_durable_value", False)
+                ),
+                enable_expressive_synergy_backbone=bool(
+                    mapping.get("enable_expressive_synergy_backbone", False)
                 ),
             )
         raise ValueError(f"unsupported hybrid actor-critic model_config version: {version!r}")
@@ -447,6 +495,12 @@ class HybridActorCriticConfig:
                 base.update(
                     enable_balanced_deconfounded_durable_value=(
                         self.enable_balanced_deconfounded_durable_value
+                    ),
+                )
+            if self.enable_expressive_synergy_backbone:
+                base.update(
+                    enable_expressive_synergy_backbone=(
+                        self.enable_expressive_synergy_backbone
                     ),
                 )
         return base
@@ -605,9 +659,25 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             nn.SiLU(),
             nn.Linear(cfg.ffn_dim, 1),
         )
+        if actor_critic.enable_expressive_synergy_backbone:
+            slot_in_dim = cfg.latent_slots * cfg.d_model
+            slot_out = nn.Linear(cfg.d_model, cfg.d_model)
+            nn.init.zeros_(slot_out.weight)
+            nn.init.zeros_(slot_out.bias)
+            self.latent_slot_readout = nn.Sequential(
+                nn.LayerNorm(slot_in_dim),
+                nn.Linear(slot_in_dim, cfg.d_model),
+                nn.GELU(),
+                slot_out,
+            )
         if actor_critic.enable_persistent_build_context:
+            n_build_queries = (
+                DURABLE_BUILD_QUERIES_V9
+                if actor_critic.enable_expressive_synergy_backbone
+                else 4
+            )
             self.persistent_build_queries = nn.Parameter(
-                torch.empty(1, 4, cfg.d_model)
+                torch.empty(1, n_build_queries, cfg.d_model)
             )
             nn.init.normal_(self.persistent_build_queries, mean=0.0, std=0.02)
             self.persistent_build_attn = nn.MultiheadAttention(
@@ -617,6 +687,17 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 batch_first=True,
             )
             self.persistent_build_norm = nn.LayerNorm(cfg.d_model)
+            if actor_critic.enable_expressive_synergy_backbone:
+                bslot_in_dim = n_build_queries * cfg.d_model
+                bslot_out = nn.Linear(cfg.d_model, cfg.d_model)
+                nn.init.zeros_(bslot_out.weight)
+                nn.init.zeros_(bslot_out.bias)
+                self.persistent_build_slot_readout = nn.Sequential(
+                    nn.LayerNorm(bslot_in_dim),
+                    nn.Linear(bslot_in_dim, cfg.d_model),
+                    nn.SiLU(),
+                    bslot_out,
+                )
             self.persistent_build_to_state = nn.Linear(cfg.d_model, cfg.d_model)
             nn.init.zeros_(self.persistent_build_to_state.weight)
             nn.init.zeros_(self.persistent_build_to_state.bias)
@@ -826,6 +907,32 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 self.durable_deck_out = nn.Linear(cfg.ffn_dim * 3, 1)
                 nn.init.zeros_(self.durable_deck_out.weight)
                 nn.init.zeros_(self.durable_deck_out.bias)
+                if actor_critic.enable_expressive_synergy_backbone:
+                    synergy_heads = (
+                        cfg.n_heads if cfg.ffn_dim % cfg.n_heads == 0 else 1
+                    )
+                    self.durable_deck_synergy_null = nn.Parameter(
+                        torch.zeros(1, 1, cfg.ffn_dim)
+                    )
+                    self.durable_deck_synergy_norm1 = nn.LayerNorm(cfg.ffn_dim)
+                    self.durable_deck_synergy_attn = nn.MultiheadAttention(
+                        cfg.ffn_dim,
+                        synergy_heads,
+                        dropout=cfg.dropout,
+                        batch_first=True,
+                    )
+                    nn.init.zeros_(self.durable_deck_synergy_attn.out_proj.weight)
+                    if self.durable_deck_synergy_attn.out_proj.bias is not None:
+                        nn.init.zeros_(self.durable_deck_synergy_attn.out_proj.bias)
+                    syn_ffn_out = nn.Linear(cfg.ffn_dim, cfg.ffn_dim)
+                    nn.init.zeros_(syn_ffn_out.weight)
+                    nn.init.zeros_(syn_ffn_out.bias)
+                    self.durable_deck_synergy_ffn = nn.Sequential(
+                        nn.LayerNorm(cfg.ffn_dim),
+                        nn.Linear(cfg.ffn_dim, cfg.ffn_dim),
+                        nn.SiLU(),
+                        syn_ffn_out,
+                    )
                 if actor_critic.enable_monotone_deconfounded_durable_value:
                     self.durable_deck_tilted_out = nn.Linear(
                         cfg.ffn_dim * 3,
@@ -929,7 +1036,13 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 key_padding_mask=key_log_bias,
                 need_weights=False,
             )
-        pooled: Tensor = self.persistent_build_norm(queries + delta).mean(dim=1)
+        normed_slots: Tensor = self.persistent_build_norm(queries + delta)
+        pooled: Tensor = normed_slots.mean(dim=1)
+        if self.actor_critic_config.enable_expressive_synergy_backbone:
+            slot_delta: Tensor = self.persistent_build_slot_readout(
+                normed_slots.reshape(batch_size, -1)
+            )
+            pooled = pooled + slot_delta
         return pooled
 
     @staticmethod
@@ -1343,7 +1456,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         )
         latents = self.world_to_latent_norm(latent_queries + latent_delta)
         latents = self.latent_encoder(latents)
-        state_embedding = self.state_norm(latents.mean(dim=1))
+        state_embedding = self._readout_world_state(latents)
         return (
             WorldEncoding(
                 latents=latents,
@@ -1356,6 +1469,39 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 relation_binding_ids=world.relation_binding_ids,
             ),
             world_tokens,
+        )
+
+    def _readout_world_state(self, latents: Tensor) -> Tensor:
+        base_state: Tensor = self.state_norm(latents.mean(dim=1))
+        if not self.actor_critic_config.enable_expressive_synergy_backbone:
+            return base_state
+        batch_size = int(latents.shape[0])
+        slot_delta: Tensor = self.latent_slot_readout(latents.reshape(batch_size, -1))
+        return base_state + slot_delta
+
+    def encode_world(
+        self,
+        world: WorldTokenBatch,
+        domain_ids: Tensor,
+        *,
+        _validated: bool = False,
+    ) -> WorldEncoding:
+        encoded = super().encode_world(world, domain_ids, _validated=_validated)
+        if not self.actor_critic_config.enable_expressive_synergy_backbone:
+            return encoded
+        batch_size = int(encoded.latents.shape[0])
+        slot_delta: Tensor = self.latent_slot_readout(
+            encoded.latents.reshape(batch_size, -1)
+        )
+        return WorldEncoding(
+            latents=encoded.latents,
+            state_embedding=encoded.state_embedding + slot_delta,
+            tokens=encoded.tokens,
+            world_mask=encoded.world_mask,
+            entity_ids=encoded.entity_ids,
+            entity_aux_ids=encoded.entity_aux_ids,
+            definition_binding_ids=encoded.definition_binding_ids,
+            relation_binding_ids=encoded.relation_binding_ids,
         )
 
     def _extract_scaled_vitals(
@@ -1792,6 +1938,45 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             card_hidden = nn.functional.silu(
                 self.durable_deck_card_fc(self.durable_deck_norm(card_repr)) + deck_ctx
             )
+            if self.actor_critic_config.enable_expressive_synergy_backbone:
+                syn_batch = int(card_hidden.shape[0])
+                syn_card_mask = (
+                    deck_card_mask
+                    if deck_card_mask is not None
+                    else (draw_prob > 0.0)
+                )
+                syn_mask_f = syn_card_mask.unsqueeze(-1).to(dtype=card_hidden.dtype)
+                normed_cards = self.durable_deck_synergy_norm1(card_hidden)
+                null_seq = self.durable_deck_synergy_null.expand(syn_batch, -1, -1).to(
+                    dtype=card_hidden.dtype
+                )
+                normed_seq = torch.cat([null_seq, normed_cards], dim=1)
+                card_syn_w = torch.where(
+                    syn_card_mask,
+                    (DECK_REFERENCE_SIZE * draw_prob.clamp_min(0.0)).to(dtype=card_hidden.dtype),
+                    torch.zeros_like(draw_prob, dtype=card_hidden.dtype),
+                )
+                null_syn_w = torch.ones(
+                    (syn_batch, 1),
+                    dtype=card_hidden.dtype,
+                    device=card_hidden.device,
+                )
+                full_syn_w = torch.cat([null_syn_w, card_syn_w], dim=1)
+                syn_neg_val = -1e4 if card_hidden.dtype == torch.float16 else -1e9
+                syn_key_log_bias = torch.where(
+                    full_syn_w > 0.0,
+                    torch.log(full_syn_w.clamp_min(1e-12)),
+                    torch.full_like(full_syn_w, syn_neg_val),
+                )
+                syn_delta = self._weighted_multihead_attention(
+                    self.durable_deck_synergy_attn,
+                    normed_cards,
+                    normed_seq,
+                    syn_key_log_bias,
+                )
+                card_hidden = card_hidden + syn_delta * syn_mask_f
+                syn_ffn_delta: Tensor = self.durable_deck_synergy_ffn(card_hidden)
+                card_hidden = card_hidden + syn_ffn_delta * syn_mask_f
             raw_hidden = nn.functional.silu(self.durable_deck_raw_fc(card_raw_feats))
             bilinear_card = torch.cat(
                 [card_hidden, raw_hidden, card_hidden * raw_hidden],

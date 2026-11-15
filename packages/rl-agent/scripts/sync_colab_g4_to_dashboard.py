@@ -727,12 +727,16 @@ def sync_once(
                         else ("durable_afterstate_v3" if "v3" in lineage else "durable_afterstate_v2")
                     ),
                     "version": (
-                        "sts2-durable-afterstate-v4"
-                        if "v4" in lineage
+                        "sts2-durable-afterstate-v5-wide256"
+                        if "v5" in lineage
                         else (
-                            "sts2-durable-afterstate-v3"
-                            if "v3" in lineage
-                            else "sts2-durable-afterstate-v2"
+                            "sts2-durable-afterstate-v4"
+                            if "v4" in lineage
+                            else (
+                                "sts2-durable-afterstate-v3"
+                                if "v3" in lineage
+                                else "sts2-durable-afterstate-v2"
+                            )
                         )
                     ),
                     "curriculum": {
@@ -838,7 +842,22 @@ def sync_once(
         mpo_loss = _finite(lrn.get("macro_mpo_policy_loss")) or 0.0
         pg_loss = _finite(lrn.get("macro_pg_policy_loss")) or 0.0
         combat_loss = _finite(lrn.get("combat_policy_loss")) or 0.0
-        total_loss = v_dur + v_post + mpo_loss + pg_loss + combat_loss
+        distill_stage = str(lrn.get("distillation_stage") or "pure_rl")
+        distill_mac = _finite(lrn.get("distill_macro_kl")) or 0.0
+        distill_com = _finite(lrn.get("distill_combat_kl")) or 0.0
+        distill_margin = _finite(lrn.get("distill_afterstate_margin_loss")) or 0.0
+        ks_weight = _finite(lrn.get("effective_kickstart_kl_weight")) or 0.0
+        eff_macro_actor = (
+            distill_mac + distill_margin
+            if distill_stage == "teacher_rollout_distill"
+            else mpo_loss + pg_loss + ks_weight * distill_mac
+        )
+        eff_combat_actor = (
+            distill_com
+            if distill_stage == "teacher_rollout_distill"
+            else combat_loss + ks_weight * distill_com
+        )
+        total_loss = v_dur + v_post + eff_macro_actor + eff_combat_actor
         grad_norm = _finite(lrn.get("gradient_norm"))
 
         events_to_append.append(
@@ -847,16 +866,25 @@ def sync_once(
                 "unix_s": monotonic_ts(base_ts + 0.2),
                 "environment_steps": cumulative_env_steps,
                 "policy_version": upd_num,
+                "distillation_stage": distill_stage,
+                "rollout_policy": u.get("rollout_policy"),
+                "distill_macro_kl": distill_mac,
+                "distill_combat_kl": distill_com,
+                "distill_afterstate_margin_loss": distill_margin,
                 "loss": total_loss,
                 "online_objective_loss": total_loss,
                 "value_loss": v_dur + v_post,
-                "policy_loss": mpo_loss + pg_loss,
-                "hybrid_macro_loss": v_dur + v_post + mpo_loss + pg_loss,
-                "hybrid_combat_loss": combat_loss,
+                "policy_loss": eff_macro_actor,
+                "hybrid_macro_loss": v_dur + v_post + eff_macro_actor,
+                "hybrid_combat_loss": eff_combat_actor,
                 "hybrid_macro_value_loss": v_dur,
-                "hybrid_macro_q_loss": v_post,
-                "hybrid_macro_actor_loss": mpo_loss if mpo_loss != 0.0 else pg_loss,
-                "hybrid_combat_actor_loss": combat_loss,
+                "hybrid_macro_q_loss": v_post + distill_margin,
+                "hybrid_macro_actor_loss": (
+                    distill_mac
+                    if distill_stage == "teacher_rollout_distill"
+                    else (mpo_loss if mpo_loss != 0.0 else pg_loss)
+                ),
+                "hybrid_combat_actor_loss": eff_combat_actor,
                 "gradient_norm": grad_norm,
             }
         )

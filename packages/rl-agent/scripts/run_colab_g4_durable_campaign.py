@@ -402,6 +402,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lineage-id", required=True)
     parser.add_argument("--initialize-from-iql", type=Path)
     parser.add_argument("--initialize-from-macro-publication", type=Path)
+    parser.add_argument("--distill-from-macro-publication", type=Path)
     parser.add_argument("--migrate-runtime-from-checkpoint", type=Path)
     parser.add_argument("--resume-from-drive", action="store_true")
     parser.add_argument("--device", default="cuda")
@@ -442,17 +443,26 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
         if args.initialize_from_macro_publication is not None
         else None
     )
+    distill_source = (
+        resolve_external_input_path(args.distill_from_macro_publication, root=root)
+        if args.distill_from_macro_publication is not None
+        else None
+    )
     migrate_source = (
         resolve_external_input_path(args.migrate_runtime_from_checkpoint, root=root)
         if args.migrate_runtime_from_checkpoint is not None
         else None
     )
-    init_count = sum(src is not None for src in (iql_source, macro_source, migrate_source))
+    init_count = sum(
+        src is not None for src in (iql_source, macro_source, distill_source, migrate_source)
+    )
     if init_count > 1:
         raise ValueError("specify at most one initialization/migration source")
 
     local_ckpt = output_dir / "checkpoint.pt"
     drive_ckpt = drive_dir / "checkpoint.pt"
+    local_teacher_cache = root / "teachers" / f"{lineage_id}_teacher_publication.pt"
+    drive_teacher_backup = drive_dir / "teacher_publication.pt"
     if (
         not local_ckpt.is_file()
         and migrate_source is None
@@ -465,8 +475,19 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
     if not local_ckpt.is_file() and init_count == 0:
         raise ValueError(
             "no local or restored checkpoint.pt found; supply --initialize-from-iql, "
-            "--initialize-from-macro-publication, or --migrate-runtime-from-checkpoint"
+            "--initialize-from-macro-publication, --distill-from-macro-publication, "
+            "or --migrate-runtime-from-checkpoint"
         )
+
+    if distill_source is not None:
+        if not distill_source.is_file():
+            raise FileNotFoundError(f"distillation teacher publication not found: {distill_source}")
+        if not local_teacher_cache.is_file() or local_teacher_cache.resolve() != distill_source.resolve():
+            _atomic_copy_file(distill_source, local_teacher_cache, verify_sha256=True)
+        if not drive_teacher_backup.is_file():
+            _atomic_copy_file(local_teacher_cache, drive_teacher_backup, verify_sha256=True)
+    elif drive_teacher_backup.is_file() and not local_teacher_cache.is_file():
+        _atomic_copy_file(drive_teacher_backup, local_teacher_cache, verify_sha256=True)
 
     if not local_ckpt.is_file() and migrate_source is not None:
         copied_files = _copy_migration_history(migrate_source.parent, output_dir)
@@ -573,10 +594,16 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
             cmd.extend(["--set", item])
         if local_ckpt.is_file():
             cmd.extend(["--resume", str(local_ckpt)])
+            if local_teacher_cache.is_file():
+                cmd.extend(["--teacher-publication", str(local_teacher_cache)])
         elif migrate_source is not None:
             cmd.extend(["--migrate-runtime-from-checkpoint", str(migrate_source)])
+            if local_teacher_cache.is_file():
+                cmd.extend(["--teacher-publication", str(local_teacher_cache)])
         elif iql_source is not None:
             cmd.extend(["--initialize-from-iql", str(iql_source)])
+        elif distill_source is not None:
+            cmd.extend(["--distill-from-macro-publication", str(local_teacher_cache)])
         else:
             assert macro_source is not None
             cmd.extend(["--initialize-from-macro-publication", str(macro_source)])

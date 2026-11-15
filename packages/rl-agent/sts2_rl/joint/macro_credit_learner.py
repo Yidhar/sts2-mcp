@@ -85,6 +85,9 @@ class MacroCreditLearnerConfig:
     enable_deconfounded_durable_value: bool = False
     enable_monotone_deconfounded_durable_value: bool = False
     enable_balanced_deconfounded_durable_value: bool = False
+    enable_expressive_synergy_backbone: bool = False
+    domain_layers: int = 1
+    joint_layers: int = 2
     enable_partial_afterstates: bool = False
     enable_partial_afterstate_conditional_mpo: bool = False
     enable_manual_confirm_selection_afterstates: bool = False
@@ -100,6 +103,13 @@ class MacroCreditLearnerConfig:
     macro_pg_adv_clip: float = 0.25
     macro_pg_kl_weight: float = 0.05
     macro_pg_within_branch_entropy_only: bool = False
+    distill_teacher_rollout_updates: int = 0
+    distill_total_updates: int = 0
+    distill_epochs_per_cohort: int = 3
+    distill_policy_kl_weight: float = 1.0
+    distill_value_weight: float = 0.5
+    distill_afterstate_margin_weight: float = 1.0
+    kickstart_kl_weight: float = 0.25
 
     def __post_init__(self) -> None:
         for bool_name in (
@@ -114,6 +124,7 @@ class MacroCreditLearnerConfig:
             "enable_deconfounded_durable_value",
             "enable_monotone_deconfounded_durable_value",
             "enable_balanced_deconfounded_durable_value",
+            "enable_expressive_synergy_backbone",
             "enable_partial_afterstates",
             "enable_partial_afterstate_conditional_mpo",
             "enable_manual_confirm_selection_afterstates",
@@ -147,6 +158,17 @@ class MacroCreditLearnerConfig:
                 "macro credit enable_balanced_deconfounded_durable_value requires enable_monotone_deconfounded_durable_value=True"
             )
         if (
+            self.enable_expressive_synergy_backbone
+            and not self.enable_balanced_deconfounded_durable_value
+        ):
+            raise ValueError(
+                "macro credit enable_expressive_synergy_backbone requires enable_balanced_deconfounded_durable_value=True"
+            )
+        for layer_name in ("domain_layers", "joint_layers"):
+            layer_val = getattr(self, layer_name)
+            if isinstance(layer_val, bool) or not isinstance(layer_val, int) or not 1 <= layer_val <= 12:
+                raise ValueError(f"macro credit {layer_name} must be an integer in [1, 12]")
+        if (
             self.enable_partial_afterstate_conditional_mpo
             and not self.enable_partial_afterstates
         ):
@@ -160,7 +182,7 @@ class MacroCreditLearnerConfig:
             )
         if self.trainable_scope not in {"all", "macro_only"}:
             raise ValueError(f"macro credit trainable_scope must be 'all' or 'macro_only', got {self.trainable_scope}")
-        for name in ("chunk_steps", "combat_unroll_steps"):
+        for name in ("chunk_steps", "combat_unroll_steps", "distill_epochs_per_cohort"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 16:
                 raise ValueError(f"macro credit {name} must be an integer in [1, 16]")
@@ -168,10 +190,24 @@ class MacroCreditLearnerConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"macro credit {name} must be a positive integer")
-        for name in ("durable_warmup_updates", "combat_actor_warmup_updates", "revival_budget"):
+        for name in (
+            "durable_warmup_updates",
+            "combat_actor_warmup_updates",
+            "revival_budget",
+            "distill_teacher_rollout_updates",
+            "distill_total_updates",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"macro credit {name} must be a non-negative integer")
+        if self.distill_teacher_rollout_updates > self.distill_total_updates:
+            raise ValueError(
+                "macro credit distill_teacher_rollout_updates must be <= distill_total_updates"
+            )
+        if self.distill_total_updates > 0 and self.target_mode != "durable_afterstate_v2":
+            raise ValueError(
+                "macro credit teacher distillation requires target_mode='durable_afterstate_v2'"
+            )
         positive = (
             "learning_rate",
             "shared_learning_rate_scale",
@@ -198,6 +234,10 @@ class MacroCreditLearnerConfig:
             "durable_post_value_weight",
             "durable_stage_baseline_weight",
             "macro_pg_kl_weight",
+            "distill_policy_kl_weight",
+            "distill_value_weight",
+            "distill_afterstate_margin_weight",
+            "kickstart_kl_weight",
         )
         for name in (*positive, *non_negative, "macro_trace_lambda"):
             value = getattr(self, name)
@@ -351,12 +391,14 @@ class MacroCreditLearner:
     def __init__(
         self, *, model: nn.Module, config: MacroCreditLearnerConfig | None = None,
         update: int = 0, forward: MacroCreditForward | None = None,
+        teacher_model: HybridDomainActorCriticModel | None = None,
     ) -> None:
         self.model = model
         self.config = config or MacroCreditLearnerConfig()
         self.update = update
         self._validate_update()
         self._forward_override = forward
+        self.teacher_model: HybridDomainActorCriticModel | None = None
         if self.config.target_mode == "durable_afterstate_v2":
             if self._forward_override is not None:
                 raise ValueError("durable_afterstate_v2 requires a HybridDomainActorCriticModel without forward override")
@@ -485,10 +527,42 @@ class MacroCreditLearner:
             groups.append({"params": shared, "lr": self.config.learning_rate * self.config.shared_learning_rate_scale})
         self.optimizer = torch.optim.AdamW(groups, weight_decay=self.config.weight_decay)
         self.model.eval()
+        self.set_teacher_model(teacher_model)
         self.metrics: dict[str, Any] = {"version": MACRO_CREDIT_LEARNER_VERSION, "update": self.update}
         self._failed = False
         self._resource_guard: Callable[[], None] | None = None
         self._resource_checks = 0
+
+    def set_teacher_model(self, teacher_model: HybridDomainActorCriticModel | None) -> None:
+        if teacher_model is None:
+            self.teacher_model = None
+            return
+        if not isinstance(teacher_model, HybridDomainActorCriticModel):
+            raise TypeError("teacher_model must be a HybridDomainActorCriticModel")
+        if teacher_model is self.model:
+            raise ValueError("teacher_model must be a distinct frozen model instance")
+        if (
+            self.config.target_mode == "durable_afterstate_v2"
+            and not teacher_model.actor_critic_config.enable_durable_value_head
+        ):
+            raise ValueError("teacher_model requires enable_durable_value_head=True")
+        teacher_model.to(self.device)
+        teacher_model.eval()
+        teacher_model.requires_grad_(False)
+        self.teacher_model = teacher_model
+
+    def release_teacher(self) -> None:
+        self.teacher_model = None
+
+    @property
+    def active_rollout_model(self) -> HybridDomainActorCriticModel:
+        if self.update < self.config.distill_teacher_rollout_updates:
+            if self.teacher_model is None:
+                raise RuntimeError(
+                    "distill_teacher_rollout_updates requires an attached frozen teacher_model"
+                )
+            return self.teacher_model
+        return cast(HybridDomainActorCriticModel, self.model)
 
     @property
     def policy_version(self) -> int:
@@ -498,11 +572,12 @@ class MacroCreditLearner:
         if isinstance(self.update, bool) or not isinstance(self.update, int) or self.update < 0:
             raise ValueError("macro learner update must be a non-negative integer")
 
-    def _use_revival_ctx(self) -> bool:
+    def _use_revival_ctx(self, target_model: nn.Module | None = None) -> bool:
+        mod = self.model if target_model is None else target_model
         return bool(
             self.config.enable_asymmetric_revival_critic
-            and isinstance(self.model, HybridDomainActorCriticModel)
-            and self.model.actor_critic_config.enable_asymmetric_revival_critic
+            and isinstance(mod, HybridDomainActorCriticModel)
+            and mod.actor_critic_config.enable_asymmetric_revival_critic
         )
 
     def _critic_revival_vector(self, revivals_used: int, cum_revival_penalty: float) -> list[float]:
@@ -552,20 +627,22 @@ class MacroCreditLearner:
         hidden: Tensor | None,
         *,
         critic_revival_context: Tensor | None = None,
+        model_override: HybridDomainActorCriticModel | None = None,
     ) -> tuple[Tensor, Tensor, Tensor | None, Tensor]:
         self._check_resource()
         durable_value: Tensor | None = None
-        if self._forward_override is not None:
+        active_mod = self.model if model_override is None else model_override
+        if self._forward_override is not None and model_override is None:
             logits, value, next_hidden = self._forward_override(snapshot, hidden)
         else:
             batch = collate_encoded_snapshots(
                 (snapshot,), expected_config=snapshot.config,
                 expected_fingerprint=snapshot.encoding_fingerprint, device=self.device,
             )
-            if self._use_revival_ctx():
+            if self._use_revival_ctx(active_mod):
                 output = cast(
                     HybridActorCriticOutput,
-                    cast(HybridDomainActorCriticModel, self.model)(
+                    cast(HybridDomainActorCriticModel, active_mod)(
                         batch,
                         hidden,
                         critic_revival_context=critic_revival_context,
@@ -573,7 +650,7 @@ class MacroCreditLearner:
                     ),
                 )
             else:
-                output = cast(HybridActorCriticOutput, self.model(batch, hidden, validate=False))
+                output = cast(HybridActorCriticOutput, active_mod(batch, hidden, validate=False))
             logits, value, next_hidden = output.policy_logits[0], output.value.reshape(()), output.recurrent_state
             if output.durable_value is not None:
                 durable_value = output.durable_value.reshape(())
@@ -600,8 +677,13 @@ class MacroCreditLearner:
         hidden: Tensor | None,
         *,
         critic_revival_context: Tensor | None = None,
+        model_override: HybridDomainActorCriticModel | None = None,
     ) -> Tensor:
         self._check_resource()
+        active_mod = cast(
+            HybridDomainActorCriticModel,
+            self.model if model_override is None else model_override,
+        )
         world_batch, domain_ids = collate_encoded_worlds(
             worlds,
             expected_config=worlds[0].config,
@@ -618,7 +700,7 @@ class MacroCreditLearner:
             if critic_revival_context is None
             else critic_revival_context.expand(len(worlds), -1).contiguous()
         )
-        durable_vals, _ = cast(HybridDomainActorCriticModel, self.model).forward_durable_value(
+        durable_vals, _ = active_mod.forward_durable_value(
             world_batch,
             domain_ids,
             expanded_hidden,
@@ -647,8 +729,17 @@ class MacroCreditLearner:
         return logs, entropy, bool(int(mask.sum().item()) > 1)
 
     @torch.no_grad()
-    def _evaluate(self, trajectory: MacroCreditTrajectory, *, root_index: int | None = None) -> _Evaluation:
+    def _evaluate(
+        self,
+        trajectory: MacroCreditTrajectory,
+        *,
+        root_index: int | None = None,
+        model_override: HybridDomainActorCriticModel | None = None,
+        check_likelihood: bool = True,
+        record_all_choice_logs: bool = False,
+    ) -> _Evaluation:
         _configure_cuda_tf32(self.device, self.config.allow_tf32)
+        active_mod = self.model if model_override is None else model_override
         hidden: Tensor | None = None
         calls = 0
         is_durable_v2 = self.config.target_mode == "durable_afterstate_v2"
@@ -663,13 +754,13 @@ class MacroCreditLearner:
             if is_durable_v2
             else set()
         )
-        use_rev = self._use_revival_ctx()
+        use_rev = self._use_revival_ctx(active_mod)
         step_rev_cpu: Tensor | None = None
         boot_rev_cpu: Tensor | None = None
         if use_rev:
             step_rev_cpu, _, boot_rev_cpu = self._trajectory_critic_revival_contexts(trajectory)
         for snapshot in trajectory.prefix:
-            _, _, _, hidden = self._forward_full(snapshot, hidden)
+            _, _, _, hidden = self._forward_full(snapshot, hidden, model_override=model_override)
             hidden = hidden.detach()
             calls += 1
         boundaries: dict[int, Tensor | None] = {}
@@ -692,11 +783,12 @@ class MacroCreditLearner:
                 step.snapshot,
                 hidden,
                 critic_revival_context=rev_step_gpu,
+                model_override=model_override,
             )
             hidden = hidden.detach()
             policy, _, _ = self._policy(step, logits)
             selected = policy[step.action_index]
-            if not (index == 0 and trajectory.root_intervened):
+            if check_likelihood and not (index == 0 and trajectory.root_intervened):
                 reconstructed_behavior = macro_mixture_log_probs(
                     policy,
                     step.snapshot,
@@ -719,7 +811,9 @@ class MacroCreditLearner:
                 if index in afterstate_indices:
                     step_log_probs[index] = policy.detach().cpu().clone()
                     post_step_hidden[index] = hidden.detach().cpu().clone()
-                elif step.control_domain == "macro" and int(step.snapshot.action_mask.sum()) > 1:
+                elif (
+                    record_all_choice_logs or step.control_domain == "macro"
+                ) and int(step.snapshot.action_mask.sum()) > 1:
                     step_log_probs[index] = policy.detach().cpu().clone()
             values.append(value.detach().cpu().clone())
             logs.append(selected.detach().cpu().clone())
@@ -736,6 +830,7 @@ class MacroCreditLearner:
                 trajectory.bootstrap_snapshot,
                 hidden,
                 critic_revival_context=boot_rev_gpu,
+                model_override=model_override,
             )
             bootstrap = bootstrap_val.detach().cpu().clone()
             if is_durable_v2:
@@ -807,10 +902,20 @@ class MacroCreditLearner:
         return result.value_targets, result.action_value_targets
 
     @torch.no_grad()
-    def _evaluate_durable_batch(self, references: Sequence[MacroCreditTrajectory]) -> list[_Evaluation]:
+    def _evaluate_durable_batch(
+        self,
+        references: Sequence[MacroCreditTrajectory],
+        *,
+        model_override: HybridDomainActorCriticModel | None = None,
+        check_likelihood: bool = True,
+        record_all_choice_logs: bool = False,
+    ) -> list[_Evaluation]:
         _configure_cuda_tf32(self.device, self.config.allow_tf32)
-        ac_model = cast(HybridDomainActorCriticModel, self.model)
-        use_rev = self._use_revival_ctx()
+        ac_model = cast(
+            HybridDomainActorCriticModel,
+            self.model if model_override is None else model_override,
+        )
+        use_rev = self._use_revival_ctx(ac_model)
         results: list[_Evaluation] = []
         batch_cap = self.config.eval_batch_size
         for group_start in range(0, len(references), batch_cap):
@@ -826,7 +931,11 @@ class MacroCreditLearner:
             calls = [0] * m
             for i, traj in enumerate(group):
                 for snap in traj.prefix:
-                    _, _, _, next_h = self._forward_full(snap, hidden[i : i + 1] if has_hidden[i] else None)
+                    _, _, _, next_h = self._forward_full(
+                        snap,
+                        hidden[i : i + 1] if has_hidden[i] else None,
+                        model_override=ac_model,
+                    )
                     hidden[i] = next_h[0].detach()
                     has_hidden[i] = True
                     calls[i] += 1
@@ -952,7 +1061,7 @@ class MacroCreditLearner:
                         cand_n = step.snapshot.candidate_count
                         policy = logs_t_cpu[k, :cand_n].clone()
                         selected = policy[step.action_index]
-                        if not (t == 0 and traj.root_intervened):
+                        if check_likelihood and not (t == 0 and traj.root_intervened):
                             reconstructed = macro_mixture_log_probs(policy, step.snapshot, traj.macro_branch_epsilon)
                             err = abs(float(reconstructed[step.action_index].item()) - step.behavior_log_probability)
                             max_errors[i] = max(max_errors[i], err)
@@ -969,7 +1078,9 @@ class MacroCreditLearner:
                             assert post_hid_cpu is not None
                             step_log_probs_list[i][t] = policy
                             post_step_hidden_list[i][t] = post_hid_cpu[k : k + 1].clone()
-                        elif step.control_domain == "macro" and int(step.snapshot.action_mask.sum()) > 1:
+                        elif (
+                            record_all_choice_logs or step.control_domain == "macro"
+                        ) and int(step.snapshot.action_mask.sum()) > 1:
                             step_log_probs_list[i][t] = policy
                         calls[i] += 1
 
@@ -1084,18 +1195,31 @@ class MacroCreditLearner:
 
     @torch.no_grad()
     def _prepare_durable_natural_batch(
-        self, references: Sequence[MacroCreditTrajectory]
+        self,
+        references: Sequence[MacroCreditTrajectory],
+        *,
+        model_override: HybridDomainActorCriticModel | None = None,
+        check_likelihood: bool = True,
+        record_all_choice_logs: bool = False,
     ) -> tuple[list[_PreparedReference], int, float]:
         if not references:
             return [], 0, 0.0
-        ac_model = cast(HybridDomainActorCriticModel, self.model)
-        use_rev = self._use_revival_ctx()
+        ac_model = cast(
+            HybridDomainActorCriticModel,
+            self.model if model_override is None else model_override,
+        )
+        use_rev = self._use_revival_ctx(ac_model)
         rev_all = (
             [self._trajectory_critic_revival_contexts(ref) for ref in references]
             if use_rev
             else None
         )
-        evaluations = self._evaluate_durable_batch(references)
+        evaluations = self._evaluate_durable_batch(
+            references,
+            model_override=model_override,
+            check_likelihood=check_likelihood,
+            record_all_choice_logs=record_all_choice_logs,
+        )
         flat_worlds: list[EncodedWorldSnapshot] = []
         flat_hiddens: list[Tensor] = []
         flat_revs: list[Tensor] = []
@@ -1241,13 +1365,27 @@ class MacroCreditLearner:
         return prepared_out, total_calls, max_error
 
     @torch.no_grad()
-    def _prepare_durable_natural(self, reference: MacroCreditTrajectory) -> tuple[_PreparedReference, int, float]:
-        use_rev = self._use_revival_ctx()
+    def _prepare_durable_natural(
+        self,
+        reference: MacroCreditTrajectory,
+        *,
+        model_override: HybridDomainActorCriticModel | None = None,
+        check_likelihood: bool = True,
+        record_all_choice_logs: bool = False,
+    ) -> tuple[_PreparedReference, int, float]:
+        active_mod = self.model if model_override is None else model_override
+        use_rev = self._use_revival_ctx(active_mod)
         step_rev_cpu: Tensor | None = None
         post_rev_cpu: Tensor | None = None
         if use_rev:
             step_rev_cpu, post_rev_cpu, _ = self._trajectory_critic_revival_contexts(reference)
-        evaluation = self._evaluate(reference, root_index=-1)
+        evaluation = self._evaluate(
+            reference,
+            root_index=-1,
+            model_override=model_override,
+            check_likelihood=check_likelihood,
+            record_all_choice_logs=record_all_choice_logs,
+        )
         assert (
             evaluation.durable_values is not None
             and evaluation.step_log_probs is not None
@@ -1296,6 +1434,7 @@ class MacroCreditLearner:
                     node.post_worlds,
                     saved_hidden,
                     critic_revival_context=post_rev_gpu,
+                    model_override=model_override,
                 )
                 .detach()
                 .cpu()
@@ -1449,7 +1588,14 @@ class MacroCreditLearner:
         )
 
     def _backward_chunk(
-        self, prepared: _PreparedReference, start: int, stop: int, denominators: Mapping[str, int],
+        self,
+        prepared: _PreparedReference,
+        start: int,
+        stop: int,
+        denominators: Mapping[str, int],
+        *,
+        teacher_step_logs: Mapping[int, Tensor] | None = None,
+        kickstart_kl_weight: float = 0.0,
     ) -> dict[str, float]:
         self._check_resource()
         saved = prepared.evaluation.boundary_hidden[start]
@@ -1469,6 +1615,10 @@ class MacroCreditLearner:
                 "combat_policy_loss",
                 "combat_value_loss",
                 "combat_entropy",
+                "distill_macro_kl",
+                "distill_combat_kl",
+                "distill_afterstate_margin_loss",
+                "distill_afterstate_value_loss",
                 "backward_chunks",
             )
         }
@@ -1766,6 +1916,22 @@ class MacroCreditLearner:
                             terms.append(0.5 * cfg.combat_policy_weight * actor)
                         if cfg.combat_entropy_weight:
                             terms.append(-0.5 * cfg.combat_entropy_weight * normalized_entropy)
+            if choice and kickstart_kl_weight > 0.0 and teacher_step_logs is not None:
+                ks_t_cpu = teacher_step_logs.get(index)
+                if ks_t_cpu is not None:
+                    ks_t_gpu = ks_t_cpu.to(device=self.device, dtype=logs.dtype)
+                    ks_valid = torch.isfinite(ks_t_gpu)
+                    ks_safe_t = ks_t_gpu.masked_fill(~ks_valid, 0.0)
+                    ks_safe_s = logs[: ks_t_gpu.numel()].masked_fill(~ks_valid, 0.0)
+                    ks_probs_t = ks_t_gpu.exp().masked_fill(~ks_valid, 0.0)
+                    ks_kl = (ks_probs_t * (ks_safe_t - ks_safe_s)).sum()
+                    if step.control_domain == "macro":
+                        norm_ks = ks_kl / max(1, denominators["macro_policy_steps"])
+                        totals["distill_macro_kl"] += float(norm_ks.detach().clamp_min(0.0).item())
+                    else:
+                        norm_ks = ks_kl / max(1, denominators["combat_policy_steps"])
+                        totals["distill_combat_kl"] += float(norm_ks.detach().clamp_min(0.0).item())
+                    terms.append(0.5 * kickstart_kl_weight * norm_ks)
         if terms:
             loss = torch.stack(terms).sum()
             if not bool(torch.isfinite(loss).item()):
@@ -1779,6 +1945,9 @@ class MacroCreditLearner:
         self,
         prepared_items: Sequence[_PreparedReference],
         denominators: Mapping[str, int],
+        *,
+        kickstart_teacher_logs: Sequence[Mapping[int, Tensor]] | None = None,
+        kickstart_kl_weight: float = 0.0,
     ) -> tuple[dict[str, float], int]:
         ac_model = cast(HybridDomainActorCriticModel, self.model)
         cfg = self.config
@@ -1800,6 +1969,10 @@ class MacroCreditLearner:
                 "combat_policy_loss",
                 "combat_value_loss",
                 "combat_entropy",
+                "distill_macro_kl",
+                "distill_combat_kl",
+                "distill_afterstate_margin_loss",
+                "distill_afterstate_value_loss",
                 "backward_chunks",
             )
         }
@@ -1928,6 +2101,8 @@ class MacroCreditLearner:
                             )
                         if is_ch and durable_actor_active:
                             contrib = contrib or bool(cfg.macro_policy_weight) or bool(cfg.macro_entropy_weight)
+                    if is_ch and kickstart_kl_weight > 0.0 and kickstart_teacher_logs is not None:
+                        contrib = True
                 else:
                     contrib = (
                         (is_c_entry and (bool(cfg.macro_value_weight) or has_stage_w))
@@ -1936,6 +2111,11 @@ class MacroCreditLearner:
                             is_ch
                             and combat_actor_active
                             and (bool(cfg.combat_policy_weight) or bool(cfg.combat_entropy_weight))
+                        )
+                        or (
+                            is_ch
+                            and kickstart_kl_weight > 0.0
+                            and kickstart_teacher_logs is not None
                         )
                     )
                 flat_is_macro_cpu.append(is_mac)
@@ -2017,19 +2197,25 @@ class MacroCreditLearner:
             "combat_policy_loss",
             "combat_value_loss",
             "combat_entropy",
+            "distill_macro_kl",
+            "distill_combat_kl",
+            "distill_afterstate_margin_loss",
+            "distill_afterstate_value_loss",
         )
 
         slice_start = 0
         total_chunks = len(keyed_chunks)
-        max_local_token_budget = 98_304
-        max_world_token_budget = 65_536
+        width_scale = min(1.0, (128.0 / max(128, int(ac_model.config.d_model))) ** 1.25)
+        max_local_token_budget = max(8_192, int(98_304 * width_scale))
+        max_world_token_budget = max(8_192, int(65_536 * width_scale))
+        min_slice_floor = min(cfg.chunk_batch_size, 4 if ac_model.config.d_model > 128 else 8)
         while slice_start < total_chunks:
             self._check_resource()
             tentative_end = min(total_chunks, slice_start + cfg.chunk_batch_size)
             worst_cl = max(1, keyed_chunks[tentative_end - 1][0])
             worst_w = max(1, max(row[1] for row in keyed_chunks[slice_start:tentative_end]))
             dynamic_cap = max(
-                8,
+                min_slice_floor,
                 min(
                     cfg.chunk_batch_size,
                     max_local_token_budget // worst_cl,
@@ -2458,6 +2644,53 @@ class MacroCreditLearner:
                             if cfg.combat_entropy_weight:
                                 batch_terms.append(-0.5 * cfg.combat_entropy_weight * c_ent)
 
+                if (
+                    kickstart_kl_weight > 0.0
+                    and kickstart_teacher_logs is not None
+                    and any(flat_is_choice_cpu[g] for g in gids_cpu)
+                ):
+                    c_cap_ks = int(safe_logs.shape[1])
+                    ks_rows_k: list[int] = []
+                    ks_is_mac: list[bool] = []
+                    ks_t_logs_rows: list[Tensor] = []
+                    for k, c in enumerate(active_c):
+                        g_id = gids_cpu[k]
+                        if flat_is_choice_cpu[g_id]:
+                            r_idx_c, _, start_c, _ = chunk_slice[c]
+                            step_idx_c = start_c + offset
+                            ks_t_logs_cpu = kickstart_teacher_logs[r_idx_c].get(step_idx_c)
+                            if ks_t_logs_cpu is not None:
+                                ks_rows_k.append(k)
+                                ks_is_mac.append(flat_is_macro_cpu[g_id])
+                                padded_ks = torch.full((c_cap_ks,), -torch.inf, dtype=torch.float32)
+                                padded_ks[: ks_t_logs_cpu.numel()] = ks_t_logs_cpu.float()
+                                ks_t_logs_rows.append(padded_ks)
+                    if ks_rows_k:
+                        k_ks_gpu = torch.tensor(ks_rows_k, device=self.device, dtype=torch.long)
+                        is_mac_ks_gpu = torch.tensor(ks_is_mac, device=self.device, dtype=torch.bool)
+                        t_ks_gpu = torch.stack(ks_t_logs_rows, dim=0).to(
+                            device=self.device, dtype=safe_logs.dtype
+                        )
+                        valid_ks = torch.isfinite(t_ks_gpu) & masks[k_ks_gpu]
+                        safe_t_ks = t_ks_gpu.masked_fill(~valid_ks, 0.0)
+                        probs_t_ks = t_ks_gpu.exp().masked_fill(~valid_ks, 0.0)
+                        safe_s_ks = safe_logs[k_ks_gpu].masked_fill(~valid_ks, 0.0)
+                        ks_kl_vec = (probs_t_ks * (safe_t_ks - safe_s_ks)).sum(dim=-1)
+                        if any(ks_is_mac):
+                            ks_mac_kl = torch.where(is_mac_ks_gpu, ks_kl_vec, 0.0).sum() / denom_macro_pol
+                            slice_totals_gpu["distill_macro_kl"] = (
+                                slice_totals_gpu["distill_macro_kl"]
+                                + ks_mac_kl.detach().clamp_min(0.0).double()
+                            )
+                            batch_terms.append(0.5 * kickstart_kl_weight * ks_mac_kl)
+                        if any(not flag for flag in ks_is_mac):
+                            ks_com_kl = torch.where(~is_mac_ks_gpu, ks_kl_vec, 0.0).sum() / denom_combat_pol
+                            slice_totals_gpu["distill_combat_kl"] = (
+                                slice_totals_gpu["distill_combat_kl"]
+                                + ks_com_kl.detach().clamp_min(0.0).double()
+                            )
+                            batch_terms.append(0.5 * kickstart_kl_weight * ks_com_kl)
+
             if batch_terms:
                 mega_loss = torch.stack(batch_terms).sum()
                 batch_terms.clear()
@@ -2468,6 +2701,582 @@ class MacroCreditLearner:
                 totals["backward_chunks"] += float(chunk_has_terms_count)
             elif not bool(finite_ok.item()):
                 raise FloatingPointError("macro cohort chunk forward is non-finite")
+            hidden_list.clear()
+            stacked_metrics = torch.stack([slice_totals_gpu[key] for key in metric_keys]).cpu().tolist()
+            for key, val in zip(metric_keys, stacked_metrics, strict=True):
+                totals[key] += float(val)
+            self._check_resource()
+        return totals, maximum_chunk
+
+    def _distill_epoch_durable(
+        self,
+        prepared_items: Sequence[_PreparedReference],
+        student_boundaries: Sequence[Mapping[int, Tensor | None]],
+        denominators: Mapping[str, int],
+    ) -> tuple[dict[str, float], int]:
+        ac_model = cast(HybridDomainActorCriticModel, self.model)
+        cfg = self.config
+        has_stage_base = bool(ac_model.actor_critic_config.enable_monotone_deconfounded_durable_value)
+        metric_keys = (
+            "macro_policy_loss",
+            "macro_mpo_policy_loss",
+            "macro_mpo_within_policy_loss",
+            "macro_pg_policy_loss",
+            "macro_entropy",
+            "macro_value_loss",
+            "durable_value_loss",
+            "durable_post_value_loss",
+            "durable_stage_baseline_loss",
+            "combat_policy_loss",
+            "combat_value_loss",
+            "combat_entropy",
+            "distill_macro_kl",
+            "distill_combat_kl",
+            "distill_afterstate_margin_loss",
+            "distill_afterstate_value_loss",
+        )
+        totals = {key: 0.0 for key in (*metric_keys, "backward_chunks")}
+        if not prepared_items:
+            return totals, 0
+
+        use_rev = self._use_revival_ctx(ac_model)
+        step_rev_list: list[Tensor] = []
+        post_rev_per_ref: list[Tensor | None] = []
+        for item in prepared_items:
+            if use_rev:
+                if item.step_revival_ctx is not None and item.post_revival_ctx is not None:
+                    step_rev_list.append(item.step_revival_ctx)
+                    post_rev_per_ref.append(item.post_revival_ctx)
+                else:
+                    s_r, p_r, _ = self._trajectory_critic_revival_contexts(item.reference)
+                    step_rev_list.append(s_r)
+                    post_rev_per_ref.append(p_r)
+            else:
+                post_rev_per_ref.append(None)
+
+        ref_step_offsets: list[int] = []
+        flat_is_macro_cpu: list[bool] = []
+        flat_has_dur_cpu: list[bool] = []
+        flat_is_choice_cpu: list[bool] = []
+        cursor_steps = 0
+        for item in prepared_items:
+            ref_step_offsets.append(cursor_steps)
+            steps = item.reference.steps
+            for idx, s in enumerate(steps):
+                is_mac = s.control_domain == "macro"
+                is_c_entry = (not is_mac) and (idx == 0 or steps[idx - 1].control_domain == "macro")
+                flat_is_macro_cpu.append(is_mac)
+                flat_has_dur_cpu.append(is_mac or is_c_entry)
+                flat_is_choice_cpu.append(bool(int(s.snapshot.action_mask.sum()) > 1))
+            cursor_steps += len(steps)
+
+        flat_macro_val = torch.cat(
+            [0.5 * item.evaluation.values + 0.5 * item.macro_values for item in prepared_items],
+            dim=0,
+        ).to(device=self.device, dtype=self.dtype)
+        flat_combat_val = torch.cat(
+            [0.5 * item.evaluation.values + 0.5 * item.combat_values for item in prepared_items],
+            dim=0,
+        ).to(device=self.device, dtype=self.dtype)
+        flat_dur_target = torch.cat(
+            [
+                0.5 * cast(Tensor, item.evaluation.durable_values)
+                + 0.5 * cast(Tensor, item.durable_state_targets)
+                for item in prepared_items
+            ],
+            dim=0,
+        ).to(device=self.device, dtype=self.dtype)
+        flat_stage_target = torch.cat(
+            [cast(Tensor, item.durable_state_targets) for item in prepared_items],
+            dim=0,
+        ).to(device=self.device, dtype=self.dtype)
+        flat_step_rev_gpu = (
+            torch.cat(step_rev_list, dim=0).to(device=self.device, dtype=self.dtype)
+            if use_rev
+            else None
+        )
+        flat_is_macro_gpu = torch.tensor(flat_is_macro_cpu, device=self.device, dtype=torch.bool)
+        flat_is_choice_gpu = torch.tensor(flat_is_choice_cpu, device=self.device, dtype=torch.bool)
+
+        keyed_chunks: list[tuple[int, int, int, _PreparedReference, int, int]] = []
+        for ref_idx, item in enumerate(prepared_items):
+            steps = item.reference.steps
+            for start in range(0, len(steps), cfg.chunk_steps):
+                stop = min(start + cfg.chunk_steps, len(steps))
+                max_cl = 1
+                max_w = 1
+                for s in steps[start:stop]:
+                    snap = s.snapshot
+                    loc_d = np.diff(snap.local_offsets)
+                    l_max = max(1, int(loc_d.max())) if loc_d.size else 1
+                    cl = snap.candidate_count * l_max
+                    if cl > max_cl:
+                        max_cl = cl
+                    if snap.world.token_count > max_w:
+                        max_w = snap.world.token_count
+                keyed_chunks.append((max_cl, max_w, ref_idx, item, start, stop))
+        keyed_chunks.sort(key=lambda row: (row[0], row[1]))
+
+        maximum_chunk = max((stop - start for _, _, _, _, start, stop in keyed_chunks), default=0)
+        zero_row = ac_model.initial_state(1, device=self.device)[0].detach()
+
+        denom_dur_val = max(1, denominators["durable_value_steps"])
+        denom_macro_steps = max(1, denominators["macro_steps"])
+        denom_afterstate = max(1, denominators["afterstate_steps"])
+        denom_macro_pol = max(1, denominators["macro_policy_steps"])
+        denom_combat_steps = max(1, denominators["combat_steps"])
+        denom_combat_pol = max(1, denominators["combat_policy_steps"])
+
+        slice_start = 0
+        total_chunks = len(keyed_chunks)
+        width_scale = min(1.0, (128.0 / max(128, int(ac_model.config.d_model))) ** 1.25)
+        max_local_token_budget = max(8_192, int(98_304 * width_scale))
+        max_world_token_budget = max(8_192, int(65_536 * width_scale))
+        min_slice_floor = min(cfg.chunk_batch_size, 4 if ac_model.config.d_model > 128 else 8)
+        afterstate_grad_cap = 64 if ac_model.config.d_model > 128 else 128
+
+        while slice_start < total_chunks:
+            self._check_resource()
+            tentative_end = min(total_chunks, slice_start + cfg.chunk_batch_size)
+            worst_cl = max(1, keyed_chunks[tentative_end - 1][0])
+            worst_w = max(1, max(row[1] for row in keyed_chunks[slice_start:tentative_end]))
+            dynamic_cap = max(
+                min_slice_floor,
+                min(
+                    cfg.chunk_batch_size,
+                    max_local_token_budget // worst_cl,
+                    max_world_token_budget // worst_w,
+                ),
+            )
+            slice_end = min(total_chunks, slice_start + dynamic_cap)
+            chunk_slice = [
+                (ref_idx, item, start, stop)
+                for _, _, ref_idx, item, start, stop in keyed_chunks[slice_start:slice_end]
+            ]
+            slice_start = slice_end
+
+            hidden_list: list[Tensor] = []
+            for ref_idx, _, start, _ in chunk_slice:
+                saved = student_boundaries[ref_idx].get(start)
+                hidden_list.append(
+                    zero_row if saved is None else saved[0].to(device=self.device, dtype=self.dtype)
+                )
+
+            max_len = max(stop - start for _, _, start, stop in chunk_slice)
+            batch_terms: list[Tensor] = []
+            slice_totals_gpu: dict[str, Tensor] = {
+                key: torch.zeros((), device=self.device, dtype=torch.float64) for key in metric_keys
+            }
+            finite_ok = torch.ones((), device=self.device, dtype=torch.bool)
+
+            for offset in range(max_len):
+                self._check_resource()
+                active_c = [c for c, (_, _, start, stop) in enumerate(chunk_slice) if start + offset < stop]
+                snaps = tuple(
+                    chunk_slice[c][1].reference.steps[chunk_slice[c][2] + offset].snapshot for c in active_c
+                )
+                gids_cpu = [
+                    ref_step_offsets[chunk_slice[c][0]] + chunk_slice[c][2] + offset for c in active_c
+                ]
+                gids_gpu = torch.tensor(gids_cpu, device=self.device, dtype=torch.long)
+
+                batch = collate_encoded_snapshots(
+                    snaps,
+                    expected_config=snaps[0].config,
+                    expected_fingerprint=snaps[0].encoding_fingerprint,
+                    device=self.device,
+                    validate=False,
+                )
+                active_hidden = torch.stack([hidden_list[c] for c in active_c], dim=0)
+                active_rev = None if flat_step_rev_gpu is None else flat_step_rev_gpu[gids_gpu]
+                output = cast(
+                    HybridActorCriticOutput,
+                    ac_model(
+                        batch,
+                        active_hidden,
+                        critic_revival_context=active_rev,
+                        compute_durable_value=False,
+                        validate=False,
+                    ),
+                )
+                for k, c in enumerate(active_c):
+                    hidden_list[c] = output.recurrent_state[k]
+
+                masks = batch.candidates.action_mask
+                all_logs = torch.log_softmax(output.policy_logits.masked_fill(~masks, -torch.inf), dim=-1)
+                safe_logs = all_logs.masked_fill(~masks, 0.0)
+                finite_ok = (
+                    finite_ok
+                    & torch.isfinite(output.policy_logits).all()
+                    & torch.isfinite(output.value).all()
+                    & torch.isfinite(output.recurrent_state).all()
+                    & torch.isfinite(safe_logs).all()
+                )
+                probs = all_logs.exp().masked_fill(~masks, 0.0)
+                all_entropies = -(probs * safe_logs).sum(dim=-1)
+
+                is_macro_k = flat_is_macro_gpu[gids_gpu]
+                is_choice_k = flat_is_choice_gpu[gids_gpu]
+                any_dur = any(flat_has_dur_cpu[g] for g in gids_cpu)
+                any_macro = any(flat_is_macro_cpu[g] for g in gids_cpu)
+                any_combat = any(not flat_is_macro_cpu[g] for g in gids_cpu)
+                any_choice = any(flat_is_choice_cpu[g] for g in gids_cpu)
+
+                if any_dur:
+                    dur_k = [k for k, g in enumerate(gids_cpu) if flat_has_dur_cpu[g]]
+                    dur_k_gpu = torch.tensor(dur_k, device=self.device, dtype=torch.long)
+                    dur_gids_gpu = gids_gpu[dur_k_gpu]
+                    dur_world_batch = WorldTokenBatch(
+                        features=batch.world.features[dur_k_gpu],
+                        type_ids=batch.world.type_ids[dur_k_gpu],
+                        role_ids=batch.world.role_ids[dur_k_gpu],
+                        owner_ids=batch.world.owner_ids[dur_k_gpu],
+                        entity_ids=batch.world.entity_ids[dur_k_gpu],
+                        entity_aux_ids=batch.world.entity_aux_ids[dur_k_gpu],
+                        definition_binding_ids=batch.world.definition_binding_ids[dur_k_gpu],
+                        relation_binding_ids=batch.world.relation_binding_ids[dur_k_gpu],
+                        zone_ids=batch.world.zone_ids[dur_k_gpu],
+                        order_ids=batch.world.order_ids[dur_k_gpu],
+                        mask=batch.world.mask[dur_k_gpu],
+                    )
+                    dur_rev = None if active_rev is None else active_rev[dur_k_gpu]
+                    dur_vals, _ = ac_model.forward_durable_value(
+                        dur_world_batch,
+                        batch.domain_ids[dur_k_gpu],
+                        active_hidden[dur_k_gpu],
+                        critic_revival_context=dur_rev,
+                        validate=False,
+                    )
+                    finite_ok = finite_ok & torch.isfinite(dur_vals).all()
+                    durable_loss = (
+                        F.smooth_l1_loss(dur_vals, flat_dur_target[dur_gids_gpu], reduction="sum")
+                        / denom_dur_val
+                    )
+                    slice_totals_gpu["durable_value_loss"] = (
+                        slice_totals_gpu["durable_value_loss"] + durable_loss.detach().double()
+                    )
+                    if cfg.distill_value_weight:
+                        batch_terms.append(0.5 * cfg.distill_value_weight * durable_loss)
+                    if has_stage_base:
+                        if cfg.durable_stage_baseline_weight:
+                            stage_vals = ac_model.forward_durable_stage_baseline(
+                                dur_world_batch,
+                                critic_revival_context=dur_rev,
+                            )
+                        else:
+                            with torch.no_grad():
+                                stage_vals = ac_model.forward_durable_stage_baseline(
+                                    dur_world_batch,
+                                    critic_revival_context=dur_rev,
+                                )
+                        finite_ok = finite_ok & torch.isfinite(stage_vals).all()
+                        stage_loss = (
+                            F.smooth_l1_loss(
+                                stage_vals, flat_stage_target[dur_gids_gpu], reduction="sum"
+                            )
+                            / denom_dur_val
+                        )
+                        slice_totals_gpu["durable_stage_baseline_loss"] = (
+                            slice_totals_gpu["durable_stage_baseline_loss"]
+                            + stage_loss.detach().double()
+                        )
+                        if cfg.durable_stage_baseline_weight:
+                            batch_terms.append(0.5 * cfg.durable_stage_baseline_weight * stage_loss)
+
+                if any_macro:
+                    macro_huber = F.smooth_l1_loss(
+                        output.value, flat_macro_val[gids_gpu], reduction="none"
+                    )
+                    m_val_loss = torch.where(is_macro_k, macro_huber, 0.0).sum() / denom_macro_steps
+                    slice_totals_gpu["macro_value_loss"] = (
+                        slice_totals_gpu["macro_value_loss"] + m_val_loss.detach().double()
+                    )
+                    if cfg.distill_value_weight:
+                        batch_terms.append(0.5 * cfg.distill_value_weight * m_val_loss)
+
+                    all_cand_worlds: list[EncodedWorldSnapshot] = []
+                    all_cand_hiddens: list[Tensor] = []
+                    all_cand_revs: list[Tensor] = []
+                    node_specs: list[
+                        tuple[int, int, Tensor, int | None, Tensor, EncodedWorldSnapshot | None, Tensor | None]
+                    ] = []
+                    for k, c in enumerate(active_c):
+                        ref_idx, item, start, _ = chunk_slice[c]
+                        index = start + offset
+                        assert item.afterstate_targets is not None
+                        as_t = item.afterstate_targets.get(index)
+                        if as_t is not None and as_t.node.post_worlds:
+                            s_w = len(all_cand_worlds)
+                            w_cnt = len(as_t.node.post_worlds)
+                            all_cand_worlds.extend(as_t.node.post_worlds)
+                            all_cand_hiddens.extend([output.recurrent_state[k]] * w_cnt)
+                            p_rev_ref = post_rev_per_ref[ref_idx]
+                            p_rev_item = (
+                                None
+                                if p_rev_ref is None
+                                else p_rev_ref[index].to(device=self.device, dtype=self.dtype)
+                            )
+                            if p_rev_item is not None:
+                                all_cand_revs.extend([p_rev_item] * w_cnt)
+                            step_obj = item.reference.steps[index]
+                            chosen_pos: int | None = None
+                            chosen_w_obj: EncodedWorldSnapshot | None = None
+                            if as_t.has_chosen_post:
+                                chosen_pos = as_t.node.resolved_candidate_indices.index(
+                                    step_obj.action_index
+                                )
+                                chosen_w_obj = as_t.node.post_worlds[chosen_pos]
+                            node_specs.append(
+                                (
+                                    s_w,
+                                    s_w + w_cnt,
+                                    as_t.action_values.to(device=self.device, dtype=self.dtype),
+                                    chosen_pos,
+                                    as_t.post_target.to(device=self.device, dtype=self.dtype),
+                                    chosen_w_obj,
+                                    p_rev_item,
+                                )
+                            )
+
+                    if all_cand_worlds:
+                        q_s_parts: list[Tensor] = []
+                        n_all_w = len(all_cand_worlds)
+                        for ws in range(0, n_all_w, afterstate_grad_cap):
+                            self._check_resource()
+                            we = min(ws + afterstate_grad_cap, n_all_w)
+                            sub_w = tuple(all_cand_worlds[ws:we])
+                            wb_sub, dom_sub = collate_encoded_worlds(
+                                sub_w,
+                                expected_config=sub_w[0].config,
+                                expected_fingerprint=sub_w[0].encoding_fingerprint,
+                                device=self.device,
+                                validate=False,
+                            )
+                            sub_rev = (
+                                torch.stack(all_cand_revs[ws:we], dim=0)
+                                if all_cand_revs
+                                else None
+                            )
+                            q_sub, _ = ac_model.forward_durable_value(
+                                wb_sub,
+                                dom_sub,
+                                torch.stack(all_cand_hiddens[ws:we], dim=0),
+                                critic_revival_context=sub_rev,
+                                validate=False,
+                            )
+                            q_s_parts.append(q_sub)
+                        q_s_all = torch.cat(q_s_parts, dim=0)
+                        finite_ok = finite_ok & torch.isfinite(q_s_all).all()
+
+                        node_val_losses: list[Tensor] = []
+                        node_margin_losses: list[Tensor] = []
+                        chosen_post_losses: list[Tensor] = []
+                        chosen_stage_worlds: list[EncodedWorldSnapshot] = []
+                        chosen_stage_revs: list[Tensor] = []
+                        chosen_stage_targets: list[Tensor] = []
+                        for (
+                            s_w,
+                            e_w,
+                            q_t_gpu,
+                            chosen_pos,
+                            post_t_gpu,
+                            chosen_w_obj,
+                            p_rev_item,
+                        ) in node_specs:
+                            q_s_node = q_s_all[s_w:e_w]
+                            node_val_losses.append(F.smooth_l1_loss(q_s_node, q_t_gpu))
+                            if q_s_node.numel() > 1:
+                                node_margin_losses.append(
+                                    F.smooth_l1_loss(
+                                        q_s_node - q_s_node.mean(),
+                                        q_t_gpu - q_t_gpu.mean(),
+                                    )
+                                )
+                            if chosen_pos is not None and chosen_w_obj is not None:
+                                post_blend = 0.5 * q_t_gpu[chosen_pos] + 0.5 * post_t_gpu
+                                chosen_post_losses.append(
+                                    F.smooth_l1_loss(q_s_node[chosen_pos], post_blend)
+                                )
+                                if has_stage_base:
+                                    chosen_stage_worlds.append(chosen_w_obj)
+                                    if p_rev_item is not None:
+                                        chosen_stage_revs.append(p_rev_item)
+                                    chosen_stage_targets.append(post_t_gpu)
+
+                        if node_val_losses:
+                            as_val_loss = torch.stack(node_val_losses).sum() / denom_afterstate
+                            slice_totals_gpu["distill_afterstate_value_loss"] = (
+                                slice_totals_gpu["distill_afterstate_value_loss"]
+                                + as_val_loss.detach().double()
+                            )
+                            if cfg.distill_value_weight:
+                                batch_terms.append(0.5 * cfg.distill_value_weight * as_val_loss)
+                        if node_margin_losses:
+                            as_margin_loss = (
+                                torch.stack(node_margin_losses).sum() / denom_afterstate
+                            )
+                            slice_totals_gpu["distill_afterstate_margin_loss"] = (
+                                slice_totals_gpu["distill_afterstate_margin_loss"]
+                                + as_margin_loss.detach().double()
+                            )
+                            if cfg.distill_afterstate_margin_weight:
+                                batch_terms.append(
+                                    0.5 * cfg.distill_afterstate_margin_weight * as_margin_loss
+                                )
+                        if chosen_post_losses:
+                            post_loss = torch.stack(chosen_post_losses).sum() / denom_afterstate
+                            slice_totals_gpu["durable_post_value_loss"] = (
+                                slice_totals_gpu["durable_post_value_loss"]
+                                + post_loss.detach().double()
+                            )
+                            if cfg.durable_post_value_weight:
+                                batch_terms.append(0.5 * cfg.durable_post_value_weight * post_loss)
+                        if has_stage_base and chosen_stage_worlds:
+                            cw_tuple = tuple(chosen_stage_worlds)
+                            cwb, _ = collate_encoded_worlds(
+                                cw_tuple,
+                                expected_config=cw_tuple[0].config,
+                                expected_fingerprint=cw_tuple[0].encoding_fingerprint,
+                                device=self.device,
+                                validate=False,
+                            )
+                            crev = (
+                                torch.stack(chosen_stage_revs, dim=0)
+                                if chosen_stage_revs
+                                else None
+                            )
+                            ctarg = torch.stack(chosen_stage_targets, dim=0)
+                            if cfg.durable_stage_baseline_weight:
+                                p_stage_vals = ac_model.forward_durable_stage_baseline(
+                                    cwb,
+                                    critic_revival_context=crev,
+                                )
+                            else:
+                                with torch.no_grad():
+                                    p_stage_vals = ac_model.forward_durable_stage_baseline(
+                                        cwb,
+                                        critic_revival_context=crev,
+                                    )
+                            finite_ok = finite_ok & torch.isfinite(p_stage_vals).all()
+                            p_stage_loss = (
+                                F.smooth_l1_loss(p_stage_vals, ctarg, reduction="sum")
+                                / denom_afterstate
+                            )
+                            slice_totals_gpu["durable_stage_baseline_loss"] = (
+                                slice_totals_gpu["durable_stage_baseline_loss"]
+                                + p_stage_loss.detach().double()
+                            )
+                            if cfg.durable_stage_baseline_weight:
+                                batch_terms.append(
+                                    0.5 * cfg.durable_stage_baseline_weight * p_stage_loss
+                                )
+
+                if any_combat:
+                    is_combat_k = ~is_macro_k
+                    combat_huber = F.smooth_l1_loss(
+                        output.value, flat_combat_val[gids_gpu], reduction="none"
+                    )
+                    c_val_loss = torch.where(is_combat_k, combat_huber, 0.0).sum() / denom_combat_steps
+                    slice_totals_gpu["combat_value_loss"] = (
+                        slice_totals_gpu["combat_value_loss"] + c_val_loss.detach().double()
+                    )
+                    if cfg.distill_value_weight:
+                        batch_terms.append(0.5 * cfg.distill_value_weight * c_val_loss)
+
+                if any_choice:
+                    c_cap_ch = int(safe_logs.shape[1])
+                    ch_rows_k: list[int] = []
+                    ch_is_mac: list[bool] = []
+                    ch_t_logs_rows: list[Tensor] = []
+                    for k, c in enumerate(active_c):
+                        g_id = gids_cpu[k]
+                        if flat_is_choice_cpu[g_id]:
+                            _, item_c, start_c, _ = chunk_slice[c]
+                            step_idx_c = start_c + offset
+                            assert item_c.evaluation.step_log_probs is not None
+                            t_logs_cpu = item_c.evaluation.step_log_probs[step_idx_c]
+                            ch_rows_k.append(k)
+                            ch_is_mac.append(flat_is_macro_cpu[g_id])
+                            padded_ch = torch.full((c_cap_ch,), -torch.inf, dtype=torch.float32)
+                            padded_ch[: t_logs_cpu.numel()] = t_logs_cpu.float()
+                            ch_t_logs_rows.append(padded_ch)
+                    k_ch_gpu = torch.tensor(ch_rows_k, device=self.device, dtype=torch.long)
+                    is_mac_ch_gpu = torch.tensor(ch_is_mac, device=self.device, dtype=torch.bool)
+                    t_ch_gpu = torch.stack(ch_t_logs_rows, dim=0).to(
+                        device=self.device, dtype=safe_logs.dtype
+                    )
+                    valid_ch = torch.isfinite(t_ch_gpu) & masks[k_ch_gpu]
+                    safe_t_ch = t_ch_gpu.masked_fill(~valid_ch, 0.0)
+                    probs_t_ch = t_ch_gpu.exp().masked_fill(~valid_ch, 0.0)
+                    safe_s_ch = safe_logs[k_ch_gpu].masked_fill(~valid_ch, 0.0)
+                    kl_ch_vec = (probs_t_ch * (safe_t_ch - safe_s_ch)).sum(dim=-1)
+
+                    if any(ch_is_mac):
+                        m_kl = torch.where(is_mac_ch_gpu, kl_ch_vec, 0.0).sum() / denom_macro_pol
+                        m_kl_det = m_kl.detach().clamp_min(0.0).double()
+                        slice_totals_gpu["distill_macro_kl"] = (
+                            slice_totals_gpu["distill_macro_kl"] + m_kl_det
+                        )
+                        slice_totals_gpu["macro_policy_loss"] = (
+                            slice_totals_gpu["macro_policy_loss"] + m_kl_det
+                        )
+                        macro_ent_src = (
+                            hierarchical_macro_entropy(
+                                safe_logs,
+                                masks,
+                                batch.candidates.policy_branch_ids,
+                                include_branch_entropy=not cfg.macro_pg_within_branch_entropy_only,
+                            )
+                            if cfg.enable_macro_branch_prior
+                            else all_entropies
+                        )
+                        m_ent = (
+                            torch.where(is_macro_k & is_choice_k, macro_ent_src, 0.0)
+                            .detach()
+                            .sum()
+                            / denom_macro_pol
+                        )
+                        slice_totals_gpu["macro_entropy"] = (
+                            slice_totals_gpu["macro_entropy"] + m_ent.double()
+                        )
+                        if cfg.distill_policy_kl_weight and cfg.macro_policy_weight:
+                            batch_terms.append(
+                                0.5 * cfg.distill_policy_kl_weight * cfg.macro_policy_weight * m_kl
+                            )
+
+                    if any(not flag for flag in ch_is_mac):
+                        c_kl = torch.where(~is_mac_ch_gpu, kl_ch_vec, 0.0).sum() / denom_combat_pol
+                        c_kl_det = c_kl.detach().clamp_min(0.0).double()
+                        slice_totals_gpu["distill_combat_kl"] = (
+                            slice_totals_gpu["distill_combat_kl"] + c_kl_det
+                        )
+                        slice_totals_gpu["combat_policy_loss"] = (
+                            slice_totals_gpu["combat_policy_loss"] + c_kl_det
+                        )
+                        c_ent = (
+                            torch.where((~is_macro_k) & is_choice_k, all_entropies, 0.0)
+                            .detach()
+                            .sum()
+                            / denom_combat_pol
+                        )
+                        slice_totals_gpu["combat_entropy"] = (
+                            slice_totals_gpu["combat_entropy"] + c_ent.double()
+                        )
+                        if cfg.distill_policy_kl_weight and cfg.combat_policy_weight:
+                            batch_terms.append(
+                                0.5 * cfg.distill_policy_kl_weight * cfg.combat_policy_weight * c_kl
+                            )
+
+            if batch_terms:
+                mega_loss = torch.stack(batch_terms).sum()
+                batch_terms.clear()
+                if not bool((finite_ok & torch.isfinite(mega_loss)).item()):
+                    raise FloatingPointError("macro distillation chunk forward or loss is non-finite")
+                mega_loss.backward()  # type: ignore[no-untyped-call]
+                del mega_loss
+                totals["backward_chunks"] += float(len(chunk_slice))
+            elif not bool(finite_ok.item()):
+                raise FloatingPointError("macro distillation chunk forward is non-finite")
             hidden_list.clear()
             stacked_metrics = torch.stack([slice_totals_gpu[key] for key in metric_keys]).cpu().tolist()
             for key, val in zip(metric_keys, stacked_metrics, strict=True):
@@ -2499,12 +3308,126 @@ class MacroCreditLearner:
             "projection_kl_to_updated_policy": max(0.0, float(fitting_kl.item())),
         }
 
+    def _clip_and_step_optimizer(self) -> tuple[float, dict[str, float]]:
+        groups = {"policy_head": 0.0, "value_head": 0.0, "domain_stream": 0.0, "shared": 0.0}
+        for name, parameter in self.model.named_parameters():
+            if parameter.grad is not None:
+                if not bool(torch.isfinite(parameter.grad).all().item()):
+                    raise FloatingPointError("macro gradient is non-finite")
+                if name.startswith(
+                    (
+                        "candidate_policy_head",
+                        "candidate_role_",
+                        "branch_policy_head",
+                        "branch_vitals_",
+                    )
+                ):
+                    group = "policy_head"
+                elif name.startswith(
+                    (
+                        "state_value_head",
+                        "state_revival_",
+                        "durable_cycle_",
+                        "durable_deck_",
+                        "durable_hp_",
+                        "durable_liquid_",
+                        "durable_progress_vitals_",
+                        "durable_stage_",
+                        "durable_value_head",
+                        "durable_vitals_",
+                        "durable_revival_",
+                    )
+                ):
+                    group = "value_head"
+                elif name.startswith(("macro_stream", "combat_stream", "persistent_build_", "persistent_vitals_")):
+                    group = "domain_stream"
+                else:
+                    group = "shared"
+                groups[group] += float(parameter.grad.detach().double().square().sum().item())
+        if self.config.separate_value_grad_clip:
+            val_gn = (
+                float(
+                    torch.nn.utils.clip_grad_norm_(
+                        self._value_head_parameters,
+                        self.config.gradient_clip_norm,
+                        error_if_nonfinite=True,
+                    ).item()
+                )
+                if self._value_head_parameters
+                else 0.0
+            )
+            stage_gn = (
+                float(
+                    torch.nn.utils.clip_grad_norm_(
+                        self._stage_baseline_parameters,
+                        self.config.gradient_clip_norm,
+                        error_if_nonfinite=True,
+                    ).item()
+                )
+                if self._stage_baseline_parameters
+                else 0.0
+            )
+            non_val_gn = (
+                float(
+                    torch.nn.utils.clip_grad_norm_(
+                        self._non_value_parameters,
+                        self.config.gradient_clip_norm,
+                        error_if_nonfinite=True,
+                    ).item()
+                )
+                if self._non_value_parameters
+                else 0.0
+            )
+            gradient_norm_val = math.hypot(val_gn, stage_gn, non_val_gn)
+        else:
+            gradient_norm_val = float(
+                torch.nn.utils.clip_grad_norm_(
+                    self._parameters,
+                    self.config.gradient_clip_norm,
+                    error_if_nonfinite=True,
+                ).item()
+            )
+        self._check_resource()
+        self.optimizer.step()
+        self._check_resource()
+        if not _finite_tree(self.model.state_dict()) or not _finite_tree(self.optimizer.state_dict()):
+            raise FloatingPointError("macro optimizer step produced non-finite state")
+        return gradient_norm_val, groups
+
     def learn(self, cohort: MacroCreditCohort, *, resource_guard: Callable[[], None] | None = None) -> dict[str, Any]:
         if self._failed:
             raise RuntimeError("failed macro learner must reload its last committed checkpoint")
         self._validate_update()
         if not isinstance(cohort, MacroCreditCohort) or cohort.teacher_version != self.update:
             raise ValueError("macro cohort must match the learner's exact fresh teacher version")
+        in_stage_a = self.update < self.config.distill_teacher_rollout_updates
+        in_stage_b = (
+            self.config.distill_teacher_rollout_updates
+            <= self.update
+            < self.config.distill_total_updates
+        )
+        if (in_stage_a or in_stage_b) and self.teacher_model is None:
+            raise RuntimeError(
+                f"update {self.update} < distill_total_updates={self.config.distill_total_updates} "
+                "requires an attached frozen teacher_model"
+            )
+        distillation_stage = (
+            "teacher_rollout_distill"
+            if in_stage_a
+            else ("on_policy_kickstart" if in_stage_b else "pure_rl")
+        )
+        if in_stage_b:
+            ks_span = max(
+                1,
+                self.config.distill_total_updates - self.config.distill_teacher_rollout_updates,
+            )
+            ks_prog = (self.update - self.config.distill_teacher_rollout_updates) / ks_span
+            effective_kickstart_kl_weight = (
+                self.config.kickstart_kl_weight * 0.5 * (1.0 + math.cos(math.pi * ks_prog))
+            )
+        else:
+            effective_kickstart_kl_weight = 0.0
+
         self._resource_guard = resource_guard
         self._resource_checks = 0
         self._check_resource()
@@ -2579,26 +3502,77 @@ class MacroCreditLearner:
         prepared: list[_PreparedReference] = []
         target_calls = 0
         maximum_error = 0.0
-        for root in cohort.roots:
-            item, calls, error = self._prepare(root)
-            prepared.append(item)
-            target_calls += calls
-            maximum_error = max(maximum_error, error)
-        if (
-            self.config.target_mode == "durable_afterstate_v2"
-            and self.config.eval_batch_size > 1
-            and len(cohort.natural_only) > 1
-        ):
-            batch_items, batch_calls, batch_error = self._prepare_durable_natural_batch(cohort.natural_only)
-            prepared.extend(batch_items)
-            target_calls += batch_calls
-            maximum_error = max(maximum_error, batch_error)
+        kickstart_teacher_logs: list[dict[int, Tensor]] | None = None
+        if in_stage_a:
+            assert self.teacher_model is not None
+            if self.config.eval_batch_size > 1 and len(cohort.natural_only) > 1:
+                batch_items, batch_calls, batch_error = self._prepare_durable_natural_batch(
+                    cohort.natural_only,
+                    model_override=self.teacher_model,
+                    check_likelihood=True,
+                    record_all_choice_logs=True,
+                )
+                prepared.extend(batch_items)
+                target_calls += batch_calls
+                maximum_error = max(maximum_error, batch_error)
+            else:
+                for reference in cohort.natural_only:
+                    item, calls, error = self._prepare_durable_natural(
+                        reference,
+                        model_override=self.teacher_model,
+                        check_likelihood=True,
+                        record_all_choice_logs=True,
+                    )
+                    prepared.append(item)
+                    target_calls += calls
+                    maximum_error = max(maximum_error, error)
         else:
-            for reference in cohort.natural_only:
-                item, calls, error = self._prepare_natural(reference)
+            for root in cohort.roots:
+                item, calls, error = self._prepare(root)
                 prepared.append(item)
                 target_calls += calls
                 maximum_error = max(maximum_error, error)
+            if (
+                self.config.target_mode == "durable_afterstate_v2"
+                and self.config.eval_batch_size > 1
+                and len(cohort.natural_only) > 1
+            ):
+                batch_items, batch_calls, batch_error = self._prepare_durable_natural_batch(
+                    cohort.natural_only
+                )
+                prepared.extend(batch_items)
+                target_calls += batch_calls
+                maximum_error = max(maximum_error, batch_error)
+            else:
+                for reference in cohort.natural_only:
+                    item, calls, error = self._prepare_natural(reference)
+                    prepared.append(item)
+                    target_calls += calls
+                    maximum_error = max(maximum_error, error)
+            if in_stage_b and effective_kickstart_kl_weight > 0.0 and cohort.natural_only:
+                assert self.teacher_model is not None
+                if self.config.eval_batch_size > 1 and len(cohort.natural_only) > 1:
+                    t_evals = self._evaluate_durable_batch(
+                        cohort.natural_only,
+                        model_override=self.teacher_model,
+                        check_likelihood=False,
+                        record_all_choice_logs=True,
+                    )
+                else:
+                    t_evals = [
+                        self._evaluate(
+                            ref,
+                            root_index=-1,
+                            model_override=self.teacher_model,
+                            check_likelihood=False,
+                            record_all_choice_logs=True,
+                        )
+                        for ref in cohort.natural_only
+                    ]
+                target_calls += sum(ev.forward_calls for ev in t_evals)
+                kickstart_teacher_logs = [
+                    cast(dict[int, Tensor], ev.step_log_probs) for ev in t_evals
+                ]
         before = [parameter.detach().cpu().clone() for parameter in self._parameters]
         totals = {
             key: 0.0
@@ -2615,113 +3589,102 @@ class MacroCreditLearner:
                 "combat_policy_loss",
                 "combat_value_loss",
                 "combat_entropy",
+                "distill_macro_kl",
+                "distill_combat_kl",
+                "distill_afterstate_margin_loss",
+                "distill_afterstate_value_loss",
                 "backward_chunks",
             )
         }
         maximum_chunk = 0
+        distill_epochs_executed = (
+            self.config.distill_epochs_per_cohort if in_stage_a else 1
+        )
         # This remains set through ALL post-step validation/CPU copies/metrics,
         # including BaseException interruptions. Only complete success clears it.
         self._failed = True
         try:
-            if (
-                self.config.target_mode == "durable_afterstate_v2"
-                and self.config.chunk_batch_size > 1
-                and prepared
-            ):
-                batch_totals, maximum_chunk = self._backward_chunks_durable_batch(prepared, denominators)
-                for key, value in batch_totals.items():
-                    totals[key] += value
-            else:
-                for item in prepared:
-                    for start in range(0, len(item.reference.steps), self.config.chunk_steps):
-                        stop = min(start + self.config.chunk_steps, len(item.reference.steps))
-                        output = self._backward_chunk(item, start, stop, denominators)
-                        for key, value in output.items():
-                            totals[key] += value
-                        maximum_chunk = max(maximum_chunk, stop - start)
-            groups = {"policy_head": 0.0, "value_head": 0.0, "domain_stream": 0.0, "shared": 0.0}
-            for name, parameter in self.model.named_parameters():
-                if parameter.grad is not None:
-                    if not bool(torch.isfinite(parameter.grad).all().item()):
-                        raise FloatingPointError("macro gradient is non-finite")
-                    if name.startswith(
-                        (
-                            "candidate_policy_head",
-                            "candidate_role_",
-                            "branch_policy_head",
-                            "branch_vitals_",
+            if in_stage_a:
+                total_bw_chunks = 0.0
+                gradient_norm_val = 0.0
+                groups: dict[str, float] = {
+                    "policy_head": 0.0,
+                    "value_head": 0.0,
+                    "domain_stream": 0.0,
+                    "shared": 0.0,
+                }
+                for ep_idx in range(distill_epochs_executed):
+                    if self.config.eval_batch_size > 1 and len(cohort.natural_only) > 1:
+                        s_evals = self._evaluate_durable_batch(
+                            cohort.natural_only,
+                            check_likelihood=False,
+                            record_all_choice_logs=False,
                         )
-                    ):
-                        group = "policy_head"
-                    elif name.startswith(
-                        (
-                            "state_value_head",
-                            "state_revival_",
-                            "durable_cycle_",
-                            "durable_deck_",
-                            "durable_hp_",
-                            "durable_liquid_",
-                            "durable_progress_vitals_",
-                            "durable_stage_",
-                            "durable_value_head",
-                            "durable_vitals_",
-                            "durable_revival_",
-                        )
-                    ):
-                        group = "value_head"
-                    elif name.startswith(("macro_stream", "combat_stream", "persistent_build_", "persistent_vitals_")):
-                        group = "domain_stream"
                     else:
-                        group = "shared"
-                    groups[group] += float(parameter.grad.detach().double().square().sum().item())
-            if self.config.separate_value_grad_clip:
-                val_gn = (
-                    float(
-                        torch.nn.utils.clip_grad_norm_(
-                            self._value_head_parameters,
-                            self.config.gradient_clip_norm,
-                            error_if_nonfinite=True,
-                        ).item()
+                        s_evals = [
+                            self._evaluate(
+                                ref,
+                                root_index=-1,
+                                check_likelihood=False,
+                                record_all_choice_logs=False,
+                            )
+                            for ref in cohort.natural_only
+                        ]
+                    target_calls += sum(ev.forward_calls for ev in s_evals)
+                    student_boundaries = [ev.boundary_hidden for ev in s_evals]
+                    self.optimizer.zero_grad(set_to_none=True)
+                    ep_totals, ep_max_chunk = self._distill_epoch_durable(
+                        prepared,
+                        student_boundaries,
+                        denominators,
                     )
-                    if self._value_head_parameters
-                    else 0.0
-                )
-                stage_gn = (
-                    float(
-                        torch.nn.utils.clip_grad_norm_(
-                            self._stage_baseline_parameters,
-                            self.config.gradient_clip_norm,
-                            error_if_nonfinite=True,
-                        ).item()
-                    )
-                    if self._stage_baseline_parameters
-                    else 0.0
-                )
-                non_val_gn = (
-                    float(
-                        torch.nn.utils.clip_grad_norm_(
-                            self._non_value_parameters,
-                            self.config.gradient_clip_norm,
-                            error_if_nonfinite=True,
-                        ).item()
-                    )
-                    if self._non_value_parameters
-                    else 0.0
-                )
-                gradient_norm_val = math.hypot(val_gn, stage_gn, non_val_gn)
+                    maximum_chunk = max(maximum_chunk, ep_max_chunk)
+                    total_bw_chunks += ep_totals["backward_chunks"]
+                    gradient_norm_val, groups = self._clip_and_step_optimizer()
+                    if ep_idx == distill_epochs_executed - 1:
+                        for key, value in ep_totals.items():
+                            totals[key] = value
+                totals["backward_chunks"] = total_bw_chunks
             else:
-                gradient_norm_val = float(
-                    torch.nn.utils.clip_grad_norm_(
-                        self._parameters,
-                        self.config.gradient_clip_norm,
-                        error_if_nonfinite=True,
-                    ).item()
-                )
-            self._check_resource()
-            self.optimizer.step()
-            self._check_resource()
-            if not _finite_tree(self.model.state_dict()) or not _finite_tree(self.optimizer.state_dict()):
-                raise FloatingPointError("macro optimizer step produced non-finite state")
+                if (
+                    self.config.target_mode == "durable_afterstate_v2"
+                    and self.config.chunk_batch_size > 1
+                    and prepared
+                ):
+                    batch_totals, maximum_chunk = self._backward_chunks_durable_batch(
+                        prepared,
+                        denominators,
+                        kickstart_teacher_logs=kickstart_teacher_logs,
+                        kickstart_kl_weight=effective_kickstart_kl_weight,
+                    )
+                    for key, value in batch_totals.items():
+                        totals[key] += value
+                else:
+                    nat_offset = len(cohort.roots)
+                    for item_idx, item in enumerate(prepared):
+                        item_ks_logs = (
+                            kickstart_teacher_logs[item_idx - nat_offset]
+                            if (
+                                kickstart_teacher_logs is not None
+                                and item.root is None
+                                and item_idx >= nat_offset
+                            )
+                            else None
+                        )
+                        for start in range(0, len(item.reference.steps), self.config.chunk_steps):
+                            stop = min(start + self.config.chunk_steps, len(item.reference.steps))
+                            output = self._backward_chunk(
+                                item,
+                                start,
+                                stop,
+                                denominators,
+                                teacher_step_logs=item_ks_logs,
+                                kickstart_kl_weight=effective_kickstart_kl_weight,
+                            )
+                            for key, value in output.items():
+                                totals[key] += value
+                            maximum_chunk = max(maximum_chunk, stop - start)
+                gradient_norm_val, groups = self._clip_and_step_optimizer()
         except BaseException:
             self.optimizer.zero_grad(set_to_none=True)
             self._failed = True
@@ -2732,20 +3695,40 @@ class MacroCreditLearner:
         self.update += 1
         cfg = self.config
         is_durable_v2 = cfg.target_mode == "durable_afterstate_v2"
-        durable_actor_active = (not is_durable_v2) or (prior_update >= cfg.durable_warmup_updates)
-        combat_actor_active = (not is_durable_v2) or (prior_update >= cfg.combat_actor_warmup_updates)
-        macro_loss = (
-            cfg.macro_policy_weight * totals["macro_policy_loss"]
-            + cfg.macro_value_weight * (totals["macro_value_loss"] + totals["durable_value_loss"])
-            + cfg.durable_post_value_weight * totals["durable_post_value_loss"]
-            + cfg.durable_stage_baseline_weight * totals["durable_stage_baseline_loss"]
-            - (cfg.macro_entropy_weight * totals["macro_entropy"] if is_durable_v2 else 0.0)
-        )
-        combat_loss = (
-            (cfg.combat_policy_weight * totals["combat_policy_loss"] if combat_actor_active else 0.0)
-            + cfg.combat_value_weight * totals["combat_value_loss"]
-            - (cfg.combat_entropy_weight * totals["combat_entropy"] if combat_actor_active else 0.0)
-        )
+        durable_actor_active = in_stage_a or (not is_durable_v2) or (prior_update >= cfg.durable_warmup_updates)
+        combat_actor_active = in_stage_a or (not is_durable_v2) or (prior_update >= cfg.combat_actor_warmup_updates)
+        if in_stage_a:
+            macro_loss = (
+                cfg.distill_policy_kl_weight * cfg.macro_policy_weight * totals["macro_policy_loss"]
+                + cfg.distill_value_weight
+                * (
+                    totals["macro_value_loss"]
+                    + totals["durable_value_loss"]
+                    + totals["distill_afterstate_value_loss"]
+                )
+                + cfg.distill_afterstate_margin_weight * totals["distill_afterstate_margin_loss"]
+                + cfg.durable_post_value_weight * totals["durable_post_value_loss"]
+                + cfg.durable_stage_baseline_weight * totals["durable_stage_baseline_loss"]
+            )
+            combat_loss = (
+                cfg.distill_policy_kl_weight * cfg.combat_policy_weight * totals["combat_policy_loss"]
+                + cfg.distill_value_weight * totals["combat_value_loss"]
+            )
+        else:
+            macro_loss = (
+                cfg.macro_policy_weight * totals["macro_policy_loss"]
+                + cfg.macro_value_weight * (totals["macro_value_loss"] + totals["durable_value_loss"])
+                + cfg.durable_post_value_weight * totals["durable_post_value_loss"]
+                + cfg.durable_stage_baseline_weight * totals["durable_stage_baseline_loss"]
+                + effective_kickstart_kl_weight * totals["distill_macro_kl"]
+                - (cfg.macro_entropy_weight * totals["macro_entropy"] if is_durable_v2 else 0.0)
+            )
+            combat_loss = (
+                (cfg.combat_policy_weight * totals["combat_policy_loss"] if combat_actor_active else 0.0)
+                + cfg.combat_value_weight * totals["combat_value_loss"]
+                + effective_kickstart_kl_weight * totals["distill_combat_kl"]
+                - (cfg.combat_entropy_weight * totals["combat_entropy"] if combat_actor_active else 0.0)
+            )
         root_targets = [{
             "root_id": item.root.root_id, "action_values": item.action_values.tolist(),
             "teacher_probabilities": item.projection.teacher_probabilities.tolist(),
@@ -2764,9 +3747,12 @@ class MacroCreditLearner:
         self.metrics = {
             "version": MACRO_CREDIT_LEARNER_VERSION, "update": self.update, "teacher_version": cohort.teacher_version,
             "policy_lag": 0, "cohort_id": cohort.cohort_id, "target_mode": cfg.target_mode,
+            "distillation_stage": distillation_stage,
+            "distill_epochs_executed": distill_epochs_executed,
+            "effective_kickstart_kl_weight": effective_kickstart_kl_weight,
             "durable_actor_active": durable_actor_active,
             "combat_actor_active": combat_actor_active,
-            "effective_macro_kl": cfg.macro_kl if durable_actor_active else 0.0,
+            "effective_macro_kl": (0.0 if in_stage_a else (cfg.macro_kl if durable_actor_active else 0.0)),
             "effective_combat_policy_weight": cfg.combat_policy_weight if combat_actor_active else 0.0,
             **denominators, **totals,
             "macro_domain_weight": 0.5, "combat_domain_weight": 0.5,
@@ -2787,7 +3773,12 @@ class MacroCreditLearner:
             **{f"{name}_gradient_norm": math.sqrt(value) for name, value in groups.items()},
             "parameter_delta_norm": math.sqrt(delta_squared),
             "target_forward_calls": target_calls,
-            "training_forward_calls": denominators["macro_steps"] + denominators["combat_steps"] + (denominators["afterstate_steps"] if is_durable_v2 else 0),
+            "training_forward_calls": distill_epochs_executed
+            * (
+                denominators["macro_steps"]
+                + denominators["combat_steps"]
+                + (denominators["afterstate_steps"] if is_durable_v2 else 0)
+            ),
             "max_autograd_steps": maximum_chunk, "maximum_likelihood_error": maximum_error,
             "cohort_storage_bytes": cohort.storage_nbytes(), "elapsed_seconds": time.monotonic() - started,
             "resource_checks": self._resource_checks,

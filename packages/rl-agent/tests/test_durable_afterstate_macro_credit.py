@@ -4669,6 +4669,528 @@ def test_v4_6_partial_afterstate_conditional_mpo_orthogonality_and_batch_parity(
         assert m8_b[key] == pytest.approx(m8_s[key], abs=1e-5), key
 
 
+def test_v5_0_durable_v9_wide_synergy_split_invariance_and_config_loading() -> None:
+    from sts2_rl.train_macro_credit import _actor_critic_config
+
+    exp_dir = Path(__file__).resolve().parents[1] / "config" / "experiments"
+    b32_cfg = load_macro_training_config(
+        exp_dir / "hybrid_macro_credit_v13_durable_afterstate_v50_wide256_b32_g4_turbo.toml"
+    )
+    b16_cfg = load_macro_training_config(
+        exp_dir / "hybrid_macro_credit_v13_durable_afterstate_v50_wide256_b16_g4_turbo.toml"
+    )
+    assert b32_cfg.training.model.d_model == 256
+    assert b32_cfg.training.model.n_heads == 8
+    assert b32_cfg.training.model.ffn_dim == 1024
+    assert b32_cfg.training.model.latent_slots == 24
+    assert b32_cfg.training.model.recurrent_hidden_dim == 512
+    assert b32_cfg.learner.domain_layers == 2
+    assert b32_cfg.learner.joint_layers == 3
+    assert b32_cfg.learner.enable_expressive_synergy_backbone is True
+    assert b32_cfg.learner.distill_teacher_rollout_updates == 8
+    assert b32_cfg.learner.distill_total_updates == 28
+    assert b32_cfg.learner.revival_budget == 32
+    assert b16_cfg.learner.revival_budget == 16
+
+    wide_ac_cfg = _actor_critic_config(b32_cfg)
+    assert (
+        HybridActorCriticConfig.from_mapping(
+            wide_ac_cfg.as_mapping(),
+            fallback_grounded=_tiny_model_config().to_model_config(),
+        )
+        == wide_ac_cfg
+    )
+    wide_meta_model = HybridDomainActorCriticModel(wide_ac_cfg)
+    n_params = sum(p.numel() for p in wide_meta_model.parameters())
+    assert 35_000_000 <= n_params <= 45_000_000
+    del wide_meta_model
+
+    # Compact durable_v9 model for fast numerical verification of synergy self-attention & slot readouts
+    compact_mcfg = ModelConfig(
+        d_model=64,
+        n_heads=4,
+        ffn_dim=128,
+        world_layers=2,
+        latent_slots=8,
+        latent_layers=2,
+        local_layers=2,
+        candidate_layers=2,
+        recurrent_hidden_dim=128,
+        dropout=0.0,
+        max_world_tokens=256,
+        max_candidates=32,
+        max_candidate_local_tokens=16,
+    )
+    v9_cfg = HybridActorCriticConfig.durable_v9(
+        compact_mcfg.to_model_config(),
+        domain_layers=2,
+        joint_layers=3,
+    )
+    assert (
+        HybridActorCriticConfig.from_mapping(
+            v9_cfg.as_mapping(),
+            fallback_grounded=_tiny_model_config().to_model_config(),
+        )
+        == v9_cfg
+    )
+    v9_model = HybridDomainActorCriticModel(v9_cfg).eval()
+    assert v9_model.latent_slot_readout is not None
+    assert v9_model.persistent_build_slot_readout is not None
+    assert v9_model.durable_deck_synergy_attn is not None
+    assert v9_model.durable_deck_synergy_ffn is not None
+    assert v9_model.persistent_build_queries is not None
+    assert tuple(v9_model.persistent_build_queries.shape) == (1, 8, 64)
+
+    # Perturb zero-initialized synergy output projections and value heads so card-to-card
+    # self-attention actively shapes V_durable, then verify exact grouped-vs-split invariance!
+    torch.manual_seed(5009)
+    with torch.no_grad():
+        for mod in (
+            v9_model.durable_deck_synergy_attn,
+            v9_model.durable_deck_synergy_ffn,
+            v9_model.durable_value_head,
+            v9_model.durable_deck_out,
+            v9_model.durable_deck_tilted_out,
+        ):
+            assert mod is not None
+            for p in mod.parameters():
+                p.add_(0.15 * torch.randn_like(p))
+
+    encoder = GroundedObservationEncoder(compact_mcfg.to_encoding_config())
+    strike_base = {
+        "id": "CARD.STRIKE_IRONCLAD",
+        "type": "Attack",
+        "rarity": "Basic",
+        "cost": 1,
+        "is_upgradable": True,
+        "is_removable": True,
+        "dynamic_vars": {"Damage": 6},
+    }
+    inflame = {
+        "id": "CARD.INFLAME",
+        "type": "Power",
+        "rarity": "Uncommon",
+        "cost": 1,
+        "is_upgradable": True,
+        "is_removable": True,
+        "dynamic_vars": {"Strength": 2},
+    }
+    shrug = {
+        "id": "CARD.SHRUG_IT_OFF",
+        "type": "Skill",
+        "rarity": "Common",
+        "cost": 1,
+        "is_upgradable": True,
+        "is_removable": True,
+        "dynamic_vars": {"Block": 8, "Cards": 1},
+    }
+    grouped_obs, _ = _rest_surface([{**strike_base, "quantity": 5}, copy.deepcopy(inflame), copy.deepcopy(shrug)], include_preview=False)
+    split_obs, _ = _rest_surface(
+        [copy.deepcopy(strike_base) for _ in range(5)] + [copy.deepcopy(inflame), copy.deepcopy(shrug)],
+        include_preview=False,
+    )
+    g_snap = encoder.encode_world_snapshot(grouped_obs)
+    s_snap = encoder.encode_world_snapshot(split_obs)
+    world_batch, domain_ids = collate_encoded_worlds(
+        (g_snap, s_snap),
+        expected_config=compact_mcfg.to_encoding_config(),
+        expected_fingerprint=g_snap.encoding_fingerprint,
+        device="cpu",
+    )
+    rev = torch.tensor([[0.25, 0.75, 0.0, 0.5, 0.0, 0.5]] * 2, dtype=torch.float32)
+    with torch.no_grad():
+        vd, _ = v9_model.forward_durable_value(
+            world_batch,
+            domain_ids,
+            critic_revival_context=rev,
+            validate=False,
+        )
+    assert abs(float(vd[0].item() - vd[1].item())) < 1e-5
+
+    probe_report = run_all_competence_probes(v9_model, encoder)
+    assert probe_report["multiset_split_invariance"]["grouped_vs_split_abs_diff"] < 1e-5
+
+
+def test_v5_0_cross_width_teacher_student_distillation_kickstart_and_resume(tmp_path: Path) -> None:
+    from dataclasses import asdict, replace
+
+    from sts2_baseline import act_frontloaded_death_reward_identity
+    from sts2_rl.joint.macro_checkpoint import (
+        MacroCheckpointIdentity,
+        load_macro_checkpoint,
+        publish_macro_checkpoint,
+        save_macro_checkpoint,
+    )
+    from sts2_rl.joint.macro_credit_learner import MACRO_CREDIT_LEARNER_VERSION
+    from sts2_rl.joint.parallel_collection import BatchedPolicyInferenceServer
+    from sts2_rl.macro_root_evidence import canonical_facts
+    from sts2_rl.macro_root_policy import load_frozen_macro_teacher
+    from sts2_rl.train_macro_credit import _extract_distillation_teacher_info
+
+    torch.manual_seed(5050)
+    teacher_mcfg = ModelConfig(
+        d_model=32,
+        n_heads=4,
+        ffn_dim=64,
+        world_layers=1,
+        latent_slots=4,
+        latent_layers=1,
+        local_layers=1,
+        candidate_layers=1,
+        recurrent_hidden_dim=64,
+        dropout=0.0,
+        max_world_tokens=256,
+        max_candidates=32,
+        max_candidate_local_tokens=16,
+    )
+    student_mcfg = ModelConfig(
+        d_model=64,
+        n_heads=4,
+        ffn_dim=128,
+        world_layers=2,
+        latent_slots=8,
+        latent_layers=2,
+        local_layers=2,
+        candidate_layers=2,
+        recurrent_hidden_dim=128,
+        dropout=0.0,
+        max_world_tokens=256,
+        max_candidates=32,
+        max_candidate_local_tokens=16,
+    )
+    enc_cfg = student_mcfg.to_encoding_config()
+    assert teacher_mcfg.to_encoding_config() == enc_cfg
+    encoder = GroundedObservationEncoder(enc_cfg)
+
+    teacher_ac_cfg = HybridActorCriticConfig.durable_v8(teacher_mcfg.to_model_config())
+    teacher_src = HybridDomainActorCriticModel(teacher_ac_cfg).eval()
+    with torch.no_grad():
+        for p in teacher_src.parameters():
+            p.add_(0.20 * torch.randn_like(p))
+
+    # Save & publish the narrow 32-dim teacher as a real macro-credit publication
+    teacher_dir = tmp_path / "teacher_run"
+    teacher_dir.mkdir(parents=True)
+    teacher_ident = MacroCheckpointIdentity(
+        course_config={
+            "version": "sts2-synchronous-macro-credit-course-v1",
+            "encoding": grounding_encoding_identity(),
+            "training": {"model": asdict(teacher_mcfg)},
+        },
+        model_config=teacher_ac_cfg.as_mapping(),
+        reward_identity=act_frontloaded_death_reward_identity(revival_budget=32),
+        lineage_id="unit-teacher-32",
+        learner_version=MACRO_CREDIT_LEARNER_VERSION,
+    )
+    dummy_opt = torch.optim.AdamW(teacher_src.parameters(), lr=1e-4)
+    save_macro_checkpoint(
+        teacher_dir / "checkpoint.pt",
+        identity=teacher_ident,
+        model=teacher_src,
+        optimizer=dummy_opt,
+        update=40,
+        next_seed_index=1920,
+        initialization={"mode": "unit-teacher"},
+        artifact_root=tmp_path,
+    )
+    pub_info = publish_macro_checkpoint(
+        teacher_dir / "checkpoint.pt",
+        teacher_dir / "publication.pt",
+        identity=teacher_ident,
+        artifact_root=tmp_path,
+    )
+    assert pub_info["policy_version"] == 40
+
+    # Load frozen 32-dim teacher against 64-dim student encoding config
+    loaded_teacher = load_frozen_macro_teacher(
+        teacher_dir / "publication.pt",
+        expected_encoding=enc_cfg,
+        device="cpu",
+    )
+    assert loaded_teacher.model_config.grounded.d_model == 32
+    assert all(not p.requires_grad for p in loaded_teacher.model.parameters())
+    with pytest.raises(ValueError, match="SHA-256"):
+        load_frozen_macro_teacher(
+            teacher_dir / "publication.pt",
+            expected_encoding=enc_cfg,
+            device="cpu",
+            expected_sha256="0" * 64,
+        )
+
+    student_ac_cfg = HybridActorCriticConfig.durable_v9(
+        student_mcfg.to_model_config(),
+        domain_layers=2,
+        joint_layers=3,
+    )
+    student = HybridDomainActorCriticModel(student_ac_cfg).eval()
+    lcfg = MacroCreditLearnerConfig(
+        target_mode="durable_afterstate_v2",
+        domain_layers=2,
+        joint_layers=3,
+        enable_direct_vitals_context=True,
+        enable_macro_branch_prior=True,
+        enable_persistent_only_durable_value=True,
+        enable_asymmetric_revival_critic=True,
+        enable_draw_weighted_durable_value=True,
+        enable_role_conditioned_candidate_policy=True,
+        enable_deconfounded_durable_value=True,
+        enable_monotone_deconfounded_durable_value=True,
+        enable_balanced_deconfounded_durable_value=True,
+        enable_expressive_synergy_backbone=True,
+        enable_partial_afterstates=True,
+        enable_partial_afterstate_conditional_mpo=True,
+        enable_manual_confirm_selection_afterstates=True,
+        durable_stage_baseline_weight=0.0,
+        enable_hierarchical_afterstate_mpo=True,
+        revival_budget=32,
+        zero_macro_pace_penalty=True,
+        clip_macro_pg_fallback=True,
+        macro_pg_within_branch_entropy_only=True,
+        separate_value_grad_clip=True,
+        learning_rate=5e-4,
+        shared_learning_rate_scale=0.70,
+        durable_warmup_updates=0,
+        combat_actor_warmup_updates=0,
+        distill_teacher_rollout_updates=1,
+        distill_total_updates=2,
+        distill_epochs_per_cohort=3,
+        distill_policy_kl_weight=1.0,
+        distill_value_weight=0.5,
+        distill_afterstate_margin_weight=1.0,
+        kickstart_kl_weight=0.25,
+        eval_batch_size=8,
+        chunk_batch_size=8,
+    )
+    learner = MacroCreditLearner(model=student, config=lcfg)
+    learner.set_teacher_model(loaded_teacher.model)
+    assert learner.active_rollout_model is loaded_teacher.model
+
+    # Build macro + combat snapshots & deterministic afterstate post-worlds
+    rest_obs, rest_legal = _rest_surface(include_preview=True)
+    rest_dec = forward_decision(rest_obs, rest_legal, control_domain="macro")
+    assert rest_dec is not None
+    rest_enc = encoder.encode(rest_obs, [c.semantic_action for c in rest_dec.candidates])
+    rest_snap = rest_enc.snapshot
+    grouped_cands = tuple(rest_dec.candidates[ref.representative_position] for ref in rest_enc.actions)
+    post_worlds = synthesize_deterministic_afterstates(
+        encoder=encoder,
+        observation=rest_obs,
+        decision=rest_dec,
+        candidates=grouped_cands,
+    )
+    assert post_worlds is not None and len(post_worlds) == len(grouped_cands)
+    as_node = MacroAfterstateNode(
+        step_index=0,
+        surface="rest_site",
+        candidate_branches=tuple(c.branch for c in grouped_cands),
+        post_worlds=post_worlds,
+        candidate_indices=tuple(range(len(grouped_cands))),
+        is_partial=False,
+    )
+
+    combat_obs = {
+        "phase": "combat",
+        "decision_domain": "combat",
+        "run": {"active": True, "act": 1, "floor": 7},
+        "player": {"id": "ironclad", "side": "player", "hp": 56, "max_hp": 80, "energy": 3, "hand": [{"id": "strike", "cost": 1}]},
+        "combat": {"in_progress": True, "enemies": [{"id": "cultist", "side": "enemy", "hp": 40, "max_hp": 48}]},
+    }
+    combat_actions = [
+        {"action_handle": "c0", "kind": "play_card", "model_action_kind": "play_card", "is_enabled": True, "card": {"id": "strike", "cost": 1}},
+        {"action_handle": "c1", "kind": "end_turn", "model_action_kind": "end_turn", "is_enabled": True},
+    ]
+    combat_snap = encoder.encode(combat_obs, combat_actions).snapshot
+
+    # Verify BatchedPolicyInferenceServer cross-width hot-swap (32-dim teacher <-> 64-dim student)
+    server = BatchedPolicyInferenceServer(
+        model=learner.active_rollout_model,
+        encoding_config=enc_cfg,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+    )
+    try:
+        h_init_t = server.initial_state()
+        assert tuple(h_init_t.shape) == (1, 64)
+        logits_t_srv, h_next_t = server.forward(rest_snap, h_init_t)
+        assert tuple(h_next_t.shape) == (1, 64)
+        assert logits_t_srv.isfinite().all()
+    finally:
+        server.close()
+
+    def _make_cohort(rollout_model: HybridDomainActorCriticModel, version: int, tag: str) -> MacroCreditCohort:
+        rev0 = torch.zeros((1, 6), dtype=torch.float32)
+        with torch.no_grad():
+            b0 = collate_encoded_snapshots(
+                (rest_snap,), expected_config=enc_cfg, expected_fingerprint=rest_snap.encoding_fingerprint, device="cpu"
+            )
+            out0 = rollout_model(b0, None, critic_revival_context=rev0, validate=False)
+            m0 = torch.tensor(rest_snap.action_mask.tolist(), dtype=torch.bool)
+            tl0 = torch.log_softmax(out0.policy_logits[0, : m0.numel()].masked_fill(~m0, -torch.inf), dim=0)
+            pr0 = macro_mixture_log_probs(tl0, rest_snap, 0.04)
+
+            b1 = collate_encoded_snapshots(
+                (combat_snap,), expected_config=enc_cfg, expected_fingerprint=combat_snap.encoding_fingerprint, device="cpu"
+            )
+            out1 = rollout_model(b1, out0.recurrent_state, critic_revival_context=rev0, validate=False)
+            m1 = torch.tensor(combat_snap.action_mask.tolist(), dtype=torch.bool)
+            lp1 = torch.log_softmax(out1.policy_logits[0, : m1.numel()].masked_fill(~m1, -torch.inf), dim=0)
+
+        s0 = HybridVTraceStep(
+            rest_snap, 0, float(pr0[0].item()), 0.0, 1.0, False, "rest_site", grouped_cands[0].branch, "macro", version
+        )
+        f0 = MacroRewardFacts(0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 6, 6, 1)
+        s1 = HybridVTraceStep(
+            combat_snap, 0, float(lp1[0].item()), 0.45, 0.0, True, "combat", "play_card", "combat", version
+        )
+        f1 = MacroRewardFacts(0.45, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 7, 7, 1)
+        traj = MacroCreditTrajectory(
+            f"{tag}-0", 6_700_500 + 2 * version, version, (), (s0, s1), None, None, "factual_terminal",
+            (f0, f1), macro_branch_epsilon=0.04, afterstate_nodes=(as_node,),
+        )
+        return MacroCreditCohort(tag, version, (), natural_only=(traj,))
+
+    def _macro_kl_to_teacher(stu: HybridDomainActorCriticModel) -> float:
+        rev0 = torch.zeros((1, 6), dtype=torch.float32)
+        with torch.no_grad():
+            b0 = collate_encoded_snapshots(
+                (rest_snap,), expected_config=enc_cfg, expected_fingerprint=rest_snap.encoding_fingerprint, device="cpu"
+            )
+            out_t = loaded_teacher.model(b0, None, critic_revival_context=rev0, validate=False)
+            out_s = stu(b0, None, critic_revival_context=rev0, validate=False)
+            m0 = torch.tensor(rest_snap.action_mask.tolist(), dtype=torch.bool)
+            lp_t = torch.log_softmax(out_t.policy_logits[0, : m0.numel()][m0], dim=0)
+            lp_s = torch.log_softmax(out_s.policy_logits[0, : m0.numel()][m0], dim=0)
+            return float((lp_t.exp() * (lp_t - lp_s)).sum().item())
+
+    kl_before = _macro_kl_to_teacher(student)
+    synergy_before = student.durable_deck_synergy_attn.out_proj.weight.detach().clone()  # type: ignore[union-attr]
+    latent_slot_before = student.latent_slot_readout[0].weight.detach().clone()  # type: ignore[index]
+    build_slot_before = student.persistent_build_slot_readout[0].weight.detach().clone()  # type: ignore[index]
+
+    # Stage A (update 0 -> 1): Teacher-collected cohort -> multi-epoch distillation
+    teacher_cohort = _make_cohort(loaded_teacher.model, 0, "stage-a")
+    m_stage_a = learner.learn(teacher_cohort)
+    assert learner.update == 1
+    assert m_stage_a["distillation_stage"] == "teacher_rollout_distill"
+    assert m_stage_a["distill_epochs_executed"] == 3
+    assert m_stage_a["distill_macro_kl"] >= 0.0
+    assert m_stage_a["distill_combat_kl"] >= 0.0
+    assert m_stage_a["distill_afterstate_margin_loss"] >= 0.0
+    assert m_stage_a["parameter_delta_norm"] > 0.0
+    kl_after = _macro_kl_to_teacher(student)
+    assert kl_after < kl_before
+    assert not torch.allclose(student.durable_deck_synergy_attn.out_proj.weight, synergy_before)  # type: ignore[union-attr]
+    assert not torch.allclose(student.latent_slot_readout[0].weight, latent_slot_before)  # type: ignore[index]
+    assert not torch.allclose(student.persistent_build_slot_readout[0].weight, build_slot_before)  # type: ignore[index]
+
+    # Checkpoint save + resume round-trip across Stage A -> Stage B transition!
+    student_dir = tmp_path / "student_run"
+    student_dir.mkdir(parents=True)
+    student_ident = MacroCheckpointIdentity(
+        course_config={
+            "version": "sts2-synchronous-macro-credit-course-v1",
+            "encoding": grounding_encoding_identity(),
+            "training": {"model": asdict(student_mcfg)},
+        },
+        model_config=student_ac_cfg.as_mapping(),
+        reward_identity=act_frontloaded_death_reward_identity(revival_budget=32),
+        lineage_id="unit-student-64",
+        learner_version=MACRO_CREDIT_LEARNER_VERSION,
+    )
+    init_meta = canonical_facts({
+        "mode": "teacher_distillation_new_macro_lineage",
+        "source_path": loaded_teacher.provenance["source_path"],
+        "source_sha256": loaded_teacher.provenance["source_sha256"],
+        "teacher_provenance": loaded_teacher.provenance,
+    })
+    save_macro_checkpoint(
+        student_dir / "checkpoint.pt",
+        identity=student_ident,
+        model=student,
+        optimizer=learner.optimizer,
+        update=learner.update,
+        next_seed_index=48,
+        initialization=init_meta,
+        artifact_root=tmp_path,
+        source_paths=(teacher_dir / "publication.pt",),
+    )
+
+    resumed_student = HybridDomainActorCriticModel(student_ac_cfg).eval()
+    resumed_learner = MacroCreditLearner(model=resumed_student, config=lcfg)
+    ckpt_payload = load_macro_checkpoint(
+        student_dir / "checkpoint.pt",
+        identity=student_ident,
+        model=resumed_student,
+        optimizer=resumed_learner.optimizer,
+        artifact_root=tmp_path,
+    )
+    resumed_learner.update = int(ckpt_payload["update"])
+    rec_path, rec_sha = _extract_distillation_teacher_info(ckpt_payload["initialization"])
+    assert rec_path == loaded_teacher.provenance["source_path"]
+    assert rec_sha == loaded_teacher.provenance["source_sha256"]
+    reattached = load_frozen_macro_teacher(
+        Path(rec_path), expected_encoding=enc_cfg, device="cpu", expected_sha256=rec_sha
+    )
+    resumed_learner.set_teacher_model(reattached.model)
+    assert resumed_learner.active_rollout_model is resumed_student  # update=1 >= distill_teacher_rollout_updates=1
+
+    # Verify inference server swaps cleanly from 32-dim teacher (hidden 64) to 64-dim student (hidden 128)
+    swap_server = BatchedPolicyInferenceServer(
+        model=reattached.model,
+        encoding_config=enc_cfg,
+        device=torch.device("cpu"),
+        max_batch_size=4,
+    )
+    try:
+        assert tuple(swap_server.initial_state().shape) == (1, 64)
+        swap_server.set_model(resumed_student)
+        h_stu = swap_server.initial_state()
+        assert tuple(h_stu.shape) == (1, 128)
+        logits_s_srv, h_stu_next = swap_server.forward(rest_snap, h_stu)
+        assert tuple(h_stu_next.shape) == (1, 128)
+        assert logits_s_srv.isfinite().all()
+    finally:
+        swap_server.close()
+
+    # Stage B (update 1 -> 2): On-policy student cohort + Kickstarting KL (plus batched-vs-sequential parity!)
+    student_cohort_b = _make_cohort(resumed_student, 1, "stage-b")
+    seq_student = copy.deepcopy(resumed_student)
+    seq_learner = MacroCreditLearner(
+        model=seq_student,
+        config=replace(lcfg, eval_batch_size=1, chunk_batch_size=1),
+    )
+    seq_learner.optimizer.load_state_dict(copy.deepcopy(resumed_learner.optimizer.state_dict()))
+    seq_learner.update = 1
+    seq_learner.set_teacher_model(reattached.model)
+
+    m_stage_b = resumed_learner.learn(student_cohort_b)
+    m_stage_b_seq = seq_learner.learn(student_cohort_b)
+    assert resumed_learner.update == 2
+    assert m_stage_b["distillation_stage"] == "on_policy_kickstart"
+    assert m_stage_b["effective_kickstart_kl_weight"] == pytest.approx(0.25, abs=1e-6)
+    assert m_stage_b["distill_macro_kl"] >= 0.0
+    assert m_stage_b["distill_combat_kl"] >= 0.0
+    for key in (
+        "macro_loss",
+        "combat_loss",
+        "distill_macro_kl",
+        "distill_combat_kl",
+        "gradient_norm",
+        "parameter_delta_norm",
+    ):
+        assert m_stage_b[key] == pytest.approx(m_stage_b_seq[key], abs=1e-5), key
+
+    # Stage C (update 2 -> 3): Teacher released -> pure RL
+    resumed_learner.release_teacher()
+    assert resumed_learner.teacher_model is None
+    student_cohort_c = _make_cohort(resumed_student, 2, "stage-c")
+    m_stage_c = resumed_learner.learn(student_cohort_c)
+    assert resumed_learner.update == 3
+    assert m_stage_c["distillation_stage"] == "pure_rl"
+    assert m_stage_c["effective_kickstart_kl_weight"] == 0.0
+
+
+
 
 
 
