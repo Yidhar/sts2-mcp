@@ -69,6 +69,11 @@ def is_recoverable_episode_exception(exc: BaseException) -> bool:
     """Return whether a single-episode failure should resample a replacement seed."""
     if getattr(exc, "recoverable", False) is True:
         return True
+    if isinstance(exc, ValueError) and (
+        "world observation exceeds grounded token capacity" in str(exc)
+        or "exceeds grounded candidate capacity" in str(exc)
+    ):
+        return True
     return isinstance(exc, ProbeBudgetExhausted) and str(exc) in _RECOVERABLE_EPISODE_BUDGET_REASONS
 
 
@@ -79,6 +84,7 @@ class StochasticBranchAuthority(BranchAuthority):
     macro_branch_epsilon: float = 0.0
     collect_afterstates: bool = False
     allow_partial_afterstates: bool = False
+    allow_single_pick_manual_confirm: bool = False
 
     def __init__(
         self,
@@ -92,6 +98,7 @@ class StochasticBranchAuthority(BranchAuthority):
         macro_branch_epsilon: float = 0.0,
         collect_afterstates: bool = False,
         allow_partial_afterstates: bool = False,
+        allow_single_pick_manual_confirm: bool = False,
     ) -> None:
         super().__init__(policy, seed, limits, forced_candidate)
         training_seed(seed)
@@ -105,10 +112,13 @@ class StochasticBranchAuthority(BranchAuthority):
             raise ValueError("collect_afterstates must be boolean")
         if not isinstance(allow_partial_afterstates, bool):
             raise ValueError("allow_partial_afterstates must be boolean")
+        if not isinstance(allow_single_pick_manual_confirm, bool):
+            raise ValueError("allow_single_pick_manual_confirm must be boolean")
         self.teacher_version = teacher_version
         self.macro_branch_epsilon = float(macro_branch_epsilon)
         self.collect_afterstates = collect_afterstates
         self.allow_partial_afterstates = allow_partial_afterstates
+        self.allow_single_pick_manual_confirm = allow_single_pick_manual_confirm
         self._sampling_rng = np.random.default_rng(np.random.SeedSequence([seed, 0x4D414352]))
         self._encoder = GroundedObservationEncoder(config.model.to_encoding_config())
         self.current_snapshot: EncodedDecisionSnapshot | None = None
@@ -188,6 +198,7 @@ class StochasticBranchAuthority(BranchAuthority):
                     observation=observation,
                     decision=decision,
                     candidates=candidates,
+                    allow_single_pick_manual_confirm=self.allow_single_pick_manual_confirm,
                 )
                 if partial is not None:
                     det_indices, post_worlds = partial
@@ -202,6 +213,7 @@ class StochasticBranchAuthority(BranchAuthority):
                     observation=observation,
                     decision=decision,
                     candidates=candidates,
+                    allow_single_pick_manual_confirm=self.allow_single_pick_manual_confirm,
                 )
                 if post_worlds_full is not None:
                     self.current_afterstates = post_worlds_full
@@ -767,6 +779,7 @@ def collect_durable_afterstate_episode(
     output_dir: Path,
     macro_branch_epsilon: float = 0.0,
     allow_partial_afterstates: bool = False,
+    allow_single_pick_manual_confirm: bool = False,
     maximum_snapshot_bytes: int = 256 * 1024 * 1024,
     maximum_group_seconds: float = 1800.0,
     artifact_root: Path | None = None,
@@ -826,6 +839,7 @@ def collect_durable_afterstate_episode(
             macro_branch_epsilon=macro_branch_epsilon,
             collect_afterstates=True,
             allow_partial_afterstates=allow_partial_afterstates,
+            allow_single_pick_manual_confirm=allow_single_pick_manual_confirm,
         )
         with ExitStack() as stack:
             output = stack.enter_context((output_dir / "episode.jsonl").open("x", encoding="utf-8", newline="\n"))
@@ -894,6 +908,7 @@ def collect_durable_afterstate_cohort(
     cohort_id: str,
     macro_branch_epsilon: float = 0.0,
     allow_partial_afterstates: bool = False,
+    allow_single_pick_manual_confirm: bool = False,
     parallel_collectors: int = 1,
     replacement_seed_fn: Callable[[int], int] | None = None,
     max_recoverable_incidents: int = 4,
@@ -930,6 +945,7 @@ def collect_durable_afterstate_cohort(
                 cohort_id=cohort_id,
                 macro_branch_epsilon=macro_branch_epsilon,
                 allow_partial_afterstates=allow_partial_afterstates,
+                allow_single_pick_manual_confirm=allow_single_pick_manual_confirm,
                 replacement_seed_fn=replacement_seed_fn,
                 max_recoverable_incidents=max_recoverable_incidents,
                 maximum_episode_snapshot_bytes=maximum_episode_snapshot_bytes,
@@ -972,6 +988,7 @@ def collect_durable_afterstate_cohort(
                     output_dir=cohort_dir / f"episode-{current_offset:03d}",
                     macro_branch_epsilon=macro_branch_epsilon,
                     allow_partial_afterstates=allow_partial_afterstates,
+                    allow_single_pick_manual_confirm=allow_single_pick_manual_confirm,
                     maximum_snapshot_bytes=min(maximum_episode_snapshot_bytes, maximum_cohort_snapshot_bytes),
                     maximum_group_seconds=min(maximum_episode_seconds, remaining_seconds),
                     artifact_root=artifact_root,

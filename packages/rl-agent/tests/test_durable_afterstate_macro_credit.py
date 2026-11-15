@@ -3497,3 +3497,665 @@ def test_v4_4_configs_and_learner_batched_parity_with_partial_nodes_and_pg_fallb
         assert m6_b[key] == pytest.approx(m6_s[key], abs=1e-5), key
 
 
+def test_v4_5_monotone_gold_and_concave_hp_invariance_under_adversarial_confounding() -> None:
+    torch.manual_seed(4501)
+    cfg = _tiny_model_config()
+    enc_cfg = cfg.to_encoding_config()
+    encoder = GroundedObservationEncoder(enc_cfg)
+    grounded = cfg.to_model_config()
+    model = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v7(grounded))
+    model.eval()
+
+    base_deck = [
+        {"id": "CARD.STRIKE_IRONCLAD", "type": "Attack", "rarity": "Basic", "cost": 1, "dynamic_vars": {"Damage": 6}}
+        for _ in range(5)
+    ] + [
+        {"id": "CARD.DEFEND_IRONCLAD", "type": "Skill", "rarity": "Basic", "cost": 1, "dynamic_vars": {"Block": 5}}
+        for _ in range(5)
+    ]
+
+    def make_world(
+        *,
+        hp: int,
+        max_hp: int = 80,
+        gold: int = 100,
+        act: int = 1,
+        floor: int = 6,
+        room_model_id: str = "MonsterRoom",
+        phase: str = "map",
+    ) -> Any:
+        obs = {
+            "phase": phase,
+            "decision_domain": "map",
+            "run": {
+                "active": True,
+                "act": act,
+                "floor": floor,
+                "ascension": 0,
+                "room_model_id": room_model_id,
+                "room_type": room_model_id.lower(),
+            },
+            "player": {
+                "character_id": "IRONCLAD",
+                "hp": hp,
+                "max_hp": max_hp,
+                "gold": gold,
+                "open_potion_slots": 2,
+                "deck": copy.deepcopy(base_deck),
+                "relics": [{"id": "RELIC.BURNING_BLOOD", "has_upon_pickup_effect": False}],
+                "potions": [],
+            },
+        }
+        return encoder.encode_world_snapshot(obs)
+
+    # 1. Markov path-independence & room-metadata invariance at initialization
+    w_monster = make_world(hp=50, gold=120, act=1, floor=6, room_model_id="MonsterRoom", phase="map")
+    w_rest = make_world(hp=50, gold=120, act=1, floor=6, room_model_id="RestSiteRoom", phase="rest_site")
+    wb_init, dom_init = collate_encoded_worlds(
+        (w_monster, w_rest),
+        expected_config=enc_cfg,
+        expected_fingerprint=w_monster.encoding_fingerprint,
+        device="cpu",
+    )
+    rand_h = torch.randn(2, grounded.recurrent_hidden_dim)
+    vals_h0, _ = model.forward_durable_value(wb_init, dom_init, None)
+    vals_hr, _ = model.forward_durable_value(wb_init, dom_init, rand_h)
+    assert torch.allclose(vals_h0, vals_hr, atol=1e-6)
+    assert float((vals_h0[0] - vals_h0[1]).abs().item()) < 1e-6
+
+    # 2. Adversarially confounded training: early high HP + high gold -> -1.8, late low HP + 0 gold -> +0.9
+    train_worlds = (
+        make_world(hp=80, gold=350, act=1, floor=2, room_model_id="MonsterRoom"),
+        make_world(hp=76, gold=280, act=1, floor=4, room_model_id="EventRoom"),
+        make_world(hp=22, gold=10, act=2, floor=28, room_model_id="RestSiteRoom"),
+        make_world(hp=18, gold=0, act=3, floor=40, room_model_id="BossRoom"),
+    )
+    wb_adv, dom_adv = collate_encoded_worlds(
+        train_worlds,
+        expected_config=enc_cfg,
+        expected_fingerprint=train_worlds[0].encoding_fingerprint,
+        device="cpu",
+    )
+    targets_adv = torch.tensor([-1.8, -1.5, 0.6, 0.9], dtype=torch.float32)
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
+    for _ in range(40):
+        opt.zero_grad(set_to_none=True)
+        pred_v, _ = model.forward_durable_value(wb_adv, dom_adv, None)
+        pred_s = model.forward_durable_stage_baseline(wb_adv)
+        loss = torch.nn.functional.smooth_l1_loss(pred_v, targets_adv) + torch.nn.functional.smooth_l1_loss(
+            pred_s, targets_adv
+        )
+        loss.backward()
+        opt.step()
+
+    # 3. Even after adversarial confounded training, gold & HP remain strictly monotone and concave!
+    gold_worlds = tuple(make_world(hp=55, gold=g, act=2, floor=20) for g in (0, 75, 150, 300))
+    wb_g, dom_g = collate_encoded_worlds(
+        gold_worlds,
+        expected_config=enc_cfg,
+        expected_fingerprint=gold_worlds[0].encoding_fingerprint,
+        device="cpu",
+    )
+    vg = model.forward_durable_value(wb_g, dom_g, None)[0].detach()
+    assert float(vg[1] - vg[0]) >= -1e-6
+    assert float(vg[2] - vg[1]) >= -1e-6
+    assert float(vg[3] - vg[2]) >= -1e-6
+    assert float(vg[3] - vg[0]) > 0.0
+
+    hp_worlds = tuple(make_world(hp=h, max_hp=80, gold=100, act=1, floor=12) for h in (20, 44, 56, 80))
+    wb_h, dom_h = collate_encoded_worlds(
+        hp_worlds,
+        expected_config=enc_cfg,
+        expected_fingerprint=hp_worlds[0].encoding_fingerprint,
+        device="cpu",
+    )
+    vh = model.forward_durable_value(wb_h, dom_h, None)[0].detach()
+    low_heal_gain = float((vh[1] - vh[0]).item())
+    high_heal_gain = float((vh[3] - vh[2]).item())
+    assert low_heal_gain > 0.0
+    assert high_heal_gain >= -1e-6
+    assert low_heal_gain > high_heal_gain
+
+
+def test_v4_5_tilted_top_quantile_deck_utility_skip_vs_filler_and_multiset_split() -> None:
+    torch.manual_seed(4502)
+    cfg = _tiny_model_config()
+    enc_cfg = cfg.to_encoding_config()
+    encoder = GroundedObservationEncoder(enc_cfg)
+    grounded = cfg.to_model_config()
+    model = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v7(grounded))
+    model.eval()
+
+    card_basic = {"id": "CARD.PROBE_BASIC", "type": "Attack", "rarity": "Basic", "cost": 1, "dynamic_vars": {"Damage": 6}}
+    card_filler = {"id": "CARD.PROBE_FILLER", "type": "Attack", "rarity": "Common", "cost": 1, "dynamic_vars": {"Damage": 8}}
+    card_engine = {"id": "CARD.PROBE_ENGINE", "type": "Power", "rarity": "Rare", "cost": 0, "dynamic_vars": {"Magic": 5}}
+
+    def world_for_deck(cards: list[dict[str, Any]]) -> Any:
+        obs = {
+            "phase": "map",
+            "decision_domain": "map",
+            "run": {"active": True, "act": 2, "floor": 22, "ascension": 0},
+            "player": {
+                "character_id": "IRONCLAD",
+                "hp": 60,
+                "max_hp": 80,
+                "gold": 120,
+                "open_potion_slots": 2,
+                "deck": copy.deepcopy(cards),
+                "relics": [{"id": "RELIC.BURNING_BLOOD", "has_upon_pickup_effect": False}],
+                "potions": [],
+            },
+        }
+        return encoder.encode_world_snapshot(obs)
+
+    # Train deck heads on pure compositional deck archetypes:
+    # starter basics (-0.8), mediocre filler soup (-0.2), tight engine deck (+1.4), bloated engine+filler (+0.3)
+    d_starter = [card_basic] * 10
+    d_filler_soup = [card_basic] * 6 + [card_filler] * 6
+    d_engine_clean = [card_basic] * 8 + [card_engine] * 2
+    d_engine_bloated = [card_basic] * 8 + [card_engine] * 2 + [card_filler] * 8
+    train_w = (
+        world_for_deck(d_starter),
+        world_for_deck(d_filler_soup),
+        world_for_deck(d_engine_clean),
+        world_for_deck(d_engine_bloated),
+    )
+    wb_tr, dom_tr = collate_encoded_worlds(
+        train_w,
+        expected_config=enc_cfg,
+        expected_fingerprint=train_w[0].encoding_fingerprint,
+        device="cpu",
+    )
+    y_tr = torch.tensor([-0.8, -0.2, 1.4, 0.3], dtype=torch.float32)
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
+    for _ in range(60):
+        opt.zero_grad(set_to_none=True)
+        pv, _ = model.forward_durable_value(wb_tr, dom_tr, None)
+        loss = torch.nn.functional.smooth_l1_loss(pv, y_tr)
+        loss.backward()
+        opt.step()
+
+    # Evaluate marginal decisions from d_engine_clean (8x basic + 2x engine):
+    # - Skip (stay d_engine_clean) MUST beat Take(card_filler) even though filler > basic!
+    # - Take(card_engine) MUST beat Skip!
+    # - Remove(card_basic) MUST beat Skip!
+    eval_w = (
+        world_for_deck(d_engine_clean),  # Skip / Base
+        world_for_deck(d_engine_clean + [card_filler]),  # Take mediocre filler
+        world_for_deck(d_engine_clean + [card_engine]),  # Take strong engine
+        world_for_deck([card_basic] * 7 + [card_engine] * 2),  # Remove basic
+    )
+    wb_ev, dom_ev = collate_encoded_worlds(
+        eval_w,
+        expected_config=enc_cfg,
+        expected_fingerprint=eval_w[0].encoding_fingerprint,
+        device="cpu",
+    )
+    ve = model.forward_durable_value(wb_ev, dom_ev, None)[0].detach()
+    v_skip = float(ve[0].item())
+    v_take_filler = float(ve[1].item())
+    v_take_engine = float(ve[2].item())
+    v_remove_basic = float(ve[3].item())
+    assert v_skip > v_take_filler
+    assert v_take_engine > v_skip
+    assert v_remove_basic > v_skip
+
+    # Verify competence probe suite including new gold_monotonicity & deck_bloat_resistance probes
+    probe_report = run_all_competence_probes(model, encoder)
+    assert probe_report["multiset_split_invariance"]["grouped_vs_split_abs_diff"] < 1e-5
+    assert probe_report["gold_monotonicity"]["non_decreasing_fraction"] == pytest.approx(1.0)
+    assert "clean_minus_bloated_adv" in probe_report["deck_bloat_resistance"]
+
+
+def test_v4_5_headless_sim_manual_confirm_selection_upgrade_and_remove_afterstates() -> None:
+    from sts2_rl.joint.afterstate import synthesize_partial_deterministic_afterstates
+
+    cfg = _tiny_model_config()
+    enc_cfg = cfg.to_encoding_config()
+    encoder = GroundedObservationEncoder(enc_cfg)
+
+    deck = [
+        {
+            "id": "CARD.BASH",
+            "instance_id": "inst_bash",
+            "type": "Attack",
+            "rarity": "Basic",
+            "cost": 2,
+            "is_upgradable": True,
+            "is_removable": True,
+            "dynamic_vars": {"Damage": 8},
+            "upgrade_preview": {
+                "id": "CARD.BASH",
+                "type": "Attack",
+                "rarity": "Basic",
+                "cost": 2,
+                "upgraded": True,
+                "dynamic_vars": {"Damage": 10},
+            },
+        },
+        {
+            "id": "CARD.STRIKE_IRONCLAD",
+            "instance_id": "inst_strike",
+            "type": "Attack",
+            "rarity": "Basic",
+            "cost": 1,
+            "is_upgradable": True,
+            "is_removable": True,
+            "dynamic_vars": {"Damage": 6},
+            "upgrade_preview": {
+                "id": "CARD.STRIKE_IRONCLAD",
+                "type": "Attack",
+                "rarity": "Basic",
+                "cost": 1,
+                "upgraded": True,
+                "dynamic_vars": {"Damage": 9},
+            },
+        },
+    ]
+
+    # Exact HeadlessSim FullRunApiStateBuilder.BuildCardSelectState shape:
+    # requires_manual_confirmation=True, screen_type="DeckUpgrade"/"DeckGeneric", prompt="card_selection.TO_*"
+    sim_upg_obs = {
+        "phase": "card_selection",
+        "decision_domain": "card_selection",
+        "run": {"active": True, "act": 1, "floor": 4, "ascension": 0},
+        "player": {
+            "character_id": "IRONCLAD",
+            "hp": 68,
+            "max_hp": 80,
+            "gold": 110,
+            "open_potion_slots": 2,
+            "deck": copy.deepcopy(deck),
+            "relics": [{"id": "RELIC.BURNING_BLOOD", "has_upon_pickup_effect": False}],
+            "potions": [],
+        },
+        "card_selection": {
+            "screen_type": "DeckUpgrade",
+            "prompt": "card_selection.TO_UPGRADE",
+            "requires_manual_confirmation": True,
+            "can_confirm": False,
+            "can_cancel": False,
+            "min_select": 1,
+            "max_select": 1,
+            "selected_count": 0,
+            "selectable_cards": copy.deepcopy(deck),
+            "selected_cards": [],
+        },
+    }
+    upg_actions = [
+        {
+            "action_id": f"sel:{idx}",
+            "kind": "select_card",
+            "model_action_kind": "card_selection",
+            "selection": "add",
+            "is_enabled": True,
+            "card": copy.deepcopy(card),
+        }
+        for idx, card in enumerate(deck)
+    ]
+    upg_dec = forward_decision(sim_upg_obs, upg_actions, control_domain="macro")
+    assert upg_dec is not None and upg_dec.surface == "selection"
+
+    # Backward-compatible default (False) fails closed on manual confirm
+    assert synthesize_deterministic_afterstates(encoder=encoder, observation=sim_upg_obs, decision=upg_dec) is None
+    assert (
+        synthesize_partial_deterministic_afterstates(encoder=encoder, observation=sim_upg_obs, decision=upg_dec)
+        is None
+    )
+
+    # v4.5 allow_single_pick_manual_confirm=True unlocks exact post-upgrade worlds!
+    upg_worlds = synthesize_deterministic_afterstates(
+        encoder=encoder,
+        observation=sim_upg_obs,
+        decision=upg_dec,
+        allow_single_pick_manual_confirm=True,
+    )
+    assert upg_worlds is not None and len(upg_worlds) == 2
+
+    sim_rem_obs = copy.deepcopy(sim_upg_obs)
+    sim_rem_obs["card_selection"]["screen_type"] = "DeckGeneric"
+    sim_rem_obs["card_selection"]["prompt"] = "card_selection.TO_REMOVE"
+    rem_dec = forward_decision(sim_rem_obs, upg_actions, control_domain="macro")
+    assert rem_dec is not None
+    rem_partial = synthesize_partial_deterministic_afterstates(
+        encoder=encoder,
+        observation=sim_rem_obs,
+        decision=rem_dec,
+        allow_single_pick_manual_confirm=True,
+    )
+    assert rem_partial is not None
+    assert rem_partial[0] == (0, 1) and len(rem_partial[1]) == 2
+
+    expected_rem0 = {
+        "phase": "map",
+        "decision_domain": "map",
+        "run": {"active": True, "act": 1, "floor": 4, "ascension": 0},
+        "player": {
+            "character_id": "IRONCLAD",
+            "hp": 68,
+            "max_hp": 80,
+            "gold": 110,
+            "open_potion_slots": 2,
+            "deck": [copy.deepcopy(deck[1])],
+            "relics": [{"id": "RELIC.BURNING_BLOOD", "has_upon_pickup_effect": False}],
+            "potions": [],
+        },
+    }
+    expected_rem0_w = encoder.encode_world_snapshot(expected_rem0)
+    wb_rem_cmp, _ = collate_encoded_worlds(
+        (rem_partial[1][0], expected_rem0_w),
+        expected_config=enc_cfg,
+        expected_fingerprint=expected_rem0_w.encoding_fingerprint,
+        device="cpu",
+    )
+    assert torch.allclose(wb_rem_cmp.features[0], wb_rem_cmp.features[1])
+
+    # Safety: multi-pick (max_select=2), cancelable (can_cancel=True), or already-selected (can_confirm=True) fail closed!
+    for bad_patch in (
+        {"max_select": 2},
+        {"can_cancel": True},
+        {"can_confirm": True},
+        {"selected_count": 1},
+        {"prompt": "card_selection.TO_TRANSFORM"},
+    ):
+        bad_obs = copy.deepcopy(sim_rem_obs)
+        bad_obs["card_selection"].update(bad_patch)
+        assert (
+            synthesize_deterministic_afterstates(
+                encoder=encoder,
+                observation=bad_obs,
+                decision=rem_dec,
+                allow_single_pick_manual_confirm=True,
+            )
+            is None
+        )
+
+
+def test_v4_5_hotstart_from_v5_and_v6_toml_and_learner_batch_parity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import dataclasses
+
+    from sts2_baseline import act_frontloaded_death_reward_identity
+    from sts2_rl.joint.afterstate import synthesize_partial_deterministic_afterstates
+    from sts2_rl.macro_root_policy import HYBRID_MACRO_CREDIT_PUBLICATION, FrozenMacroRootPolicy
+    from sts2_rl.models.hybrid_actor_critic import initialize_actor_critic_from_macro_publication
+    from sts2_rl.train_macro_credit import _actor_critic_config
+
+    torch.manual_seed(4504)
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    cfg = _tiny_model_config()
+    enc_cfg = cfg.to_encoding_config()
+    encoder = GroundedObservationEncoder(enc_cfg)
+    grounded = cfg.to_model_config()
+
+    # 1. Load v11 b32 & b16 TOMLs and verify durable_v7 wiring
+    exp_dir = Path(__file__).resolve().parents[1] / "config" / "experiments"
+    cfg_b32 = load_macro_training_config(exp_dir / "hybrid_macro_credit_v11_durable_afterstate_v45_b32_g4_turbo.toml")
+    cfg_b16 = load_macro_training_config(exp_dir / "hybrid_macro_credit_v11_durable_afterstate_v45_b16_g4_turbo.toml")
+    assert cfg_b32.learner.enable_monotone_deconfounded_durable_value is True
+    assert cfg_b32.learner.enable_manual_confirm_selection_afterstates is True
+    assert cfg_b32.learner.durable_stage_baseline_weight == pytest.approx(0.5)
+    assert cfg_b32.learner.revival_budget == 32
+    assert cfg_b16.learner.revival_budget == 16
+    assert _actor_critic_config(cfg_b32) == HybridActorCriticConfig.durable_v7(
+        cfg_b32.training.model.to_model_config()
+    )
+
+    # 2. Hot-start durable_v7 from BOTH durable_v5 (v4.3) and durable_v6 (v4.4)
+    v5_model = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v5(grounded))
+    v6_model = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v6(grounded))
+
+    v7_from_v5 = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v7(grounded))
+    sum_v5 = initialize_actor_critic_from_macro_publication(v7_from_v5, v5_model.state_dict())
+    assert any(k.startswith("durable_deck_size_") for k in sum_v5.get("retired", ()))
+    assert any(k.startswith("durable_stage_baseline_head.") for k in sum_v5["fresh"])
+    assert any(k.startswith("durable_hp_gate.") for k in sum_v5["fresh"])
+    assert any(k.startswith("durable_liquid_gate.") for k in sum_v5["fresh"])
+    assert any(k.startswith("durable_cycle_gate.") for k in sum_v5["fresh"])
+    assert any(k.startswith("durable_deck_tilted_out.") for k in sum_v5["fresh"])
+
+    v7_from_v6 = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v7(grounded))
+    sum_v6 = initialize_actor_critic_from_macro_publication(v7_from_v6, v6_model.state_dict())
+    assert any(k.startswith("durable_progress_vitals_head.") for k in sum_v6.get("retired", ()))
+    assert any(k.startswith("durable_stage_baseline_head.") for k in sum_v6["fresh"])
+
+    pub_v6 = tmp_path / "pub_v6.pt"
+    torch.save(
+        {
+            "format": HYBRID_MACRO_CREDIT_PUBLICATION,
+            "model_config": v6_model.actor_critic_config.as_mapping(),
+            "reward_identity": act_frontloaded_death_reward_identity(revival_budget=32),
+            "control_scores": "policy_logits",
+            "policy_version": 158,
+            "online": v6_model.state_dict(),
+        },
+        pub_v6,
+    )
+    tr_cfg = dataclasses.replace(cfg_b32.training, model=cfg)
+    loaded_v7 = FrozenMacroRootPolicy(
+        pub_v6,
+        tr_cfg,
+        "cpu",
+        initialize_from_macro_publication=True,
+        actor_critic_config=HybridActorCriticConfig.durable_v7(grounded),
+    )
+    assert loaded_v7.model.actor_critic_config.enable_monotone_deconfounded_durable_value is True
+
+    # 3. Exact learner batched-vs-sequential parity on durable_v7 including stage baseline loss
+    v7_init = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v7(grounded))
+    v7_init.eval()
+    with torch.no_grad():
+        for mod in (
+            v7_init.durable_stage_baseline_head,
+            v7_init.durable_hp_gate,
+            v7_init.durable_liquid_gate,
+            v7_init.durable_cycle_gate,
+            v7_init.durable_deck_tilted_out,
+        ):
+            assert mod is not None
+            for p in mod.parameters():
+                p.add_(0.1 * torch.randn_like(p))
+
+    deck = [
+        {
+            "id": "CARD.BASH",
+            "instance_id": "inst_bash",
+            "type": "Attack",
+            "rarity": "Basic",
+            "cost": 2,
+            "is_upgradable": True,
+            "is_removable": True,
+            "dynamic_vars": {"Damage": 8},
+            "upgrade_preview": {
+                "id": "CARD.BASH",
+                "type": "Attack",
+                "rarity": "Basic",
+                "cost": 2,
+                "upgraded": True,
+                "dynamic_vars": {"Damage": 10},
+            },
+        },
+        {
+            "id": "CARD.STRIKE_IRONCLAD",
+            "instance_id": "inst_strike",
+            "type": "Attack",
+            "rarity": "Basic",
+            "cost": 1,
+            "is_upgradable": True,
+            "is_removable": True,
+            "dynamic_vars": {"Damage": 6},
+            "upgrade_preview": {
+                "id": "CARD.STRIKE_IRONCLAD",
+                "type": "Attack",
+                "rarity": "Basic",
+                "cost": 1,
+                "upgraded": True,
+                "dynamic_vars": {"Damage": 9},
+            },
+        },
+    ]
+    sel_obs = {
+        "phase": "card_selection",
+        "decision_domain": "card_selection",
+        "run": {"active": True, "act": 1, "floor": 5, "ascension": 0},
+        "player": {
+            "character_id": "IRONCLAD",
+            "hp": 65,
+            "max_hp": 80,
+            "gold": 105,
+            "open_potion_slots": 2,
+            "deck": copy.deepcopy(deck),
+            "relics": [{"id": "RELIC.BURNING_BLOOD", "has_upon_pickup_effect": False}],
+            "potions": [],
+        },
+        "card_selection": {
+            "screen_type": "DeckUpgrade",
+            "prompt": "card_selection.TO_UPGRADE",
+            "requires_manual_confirmation": True,
+            "can_confirm": False,
+            "can_cancel": False,
+            "min_select": 1,
+            "max_select": 1,
+            "selected_count": 0,
+            "selectable_cards": copy.deepcopy(deck),
+            "selected_cards": [],
+        },
+    }
+    sel_actions = [
+        {
+            "action_id": f"sel:{idx}",
+            "kind": "select_card",
+            "model_action_kind": "card_selection",
+            "selection": "add",
+            "is_enabled": True,
+            "card": copy.deepcopy(c),
+        }
+        for idx, c in enumerate(deck)
+    ]
+    sel_dec = forward_decision(sel_obs, sel_actions, control_domain="macro")
+    assert sel_dec is not None
+    sel_snap = encoder.encode(sel_obs, [c.semantic_action for c in sel_dec.candidates]).snapshot
+    sel_part = synthesize_partial_deterministic_afterstates(
+        encoder=encoder,
+        observation=sel_obs,
+        decision=sel_dec,
+        allow_single_pick_manual_confirm=True,
+    )
+    assert sel_part is not None
+
+    combat_obs = {
+        "phase": "combat",
+        "decision_domain": "combat",
+        "run": {"active": True, "act": 1, "floor": 6},
+        "player": {"id": "ironclad", "side": "player", "hp": 65, "max_hp": 80, "energy": 3, "hand": [{"id": "strike", "cost": 1}]},
+        "combat": {"in_progress": True, "enemies": [{"id": "cultist", "side": "enemy", "hp": 40, "max_hp": 48}]},
+    }
+    combat_actions = [
+        {"action_handle": "c0", "kind": "play_card", "model_action_kind": "play_card", "is_enabled": True, "card": {"id": "strike", "cost": 1}},
+        {"action_handle": "c1", "kind": "end_turn", "model_action_kind": "end_turn", "is_enabled": True},
+    ]
+    combat_snap = encoder.encode(combat_obs, combat_actions).snapshot
+    rev0 = torch.zeros((1, 6), dtype=torch.float32)
+
+    trajs: list[MacroCreditTrajectory] = []
+    with torch.no_grad():
+        for ep_i in range(2):
+            b0 = collate_encoded_snapshots(
+                (sel_snap,),
+                expected_config=enc_cfg,
+                expected_fingerprint=sel_snap.encoding_fingerprint,
+                device="cpu",
+            )
+            out0 = v7_init(b0, None, critic_revival_context=rev0, validate=False)
+            m0 = torch.tensor(sel_snap.action_mask.tolist(), dtype=torch.bool)
+            tl0 = torch.log_softmax(out0.policy_logits[0, : m0.numel()].masked_fill(~m0, -torch.inf), dim=0)
+            pr0 = macro_mixture_log_probs(tl0, sel_snap, 0.04)
+
+            b1 = collate_encoded_snapshots(
+                (combat_snap,),
+                expected_config=enc_cfg,
+                expected_fingerprint=combat_snap.encoding_fingerprint,
+                device="cpu",
+            )
+            out1 = v7_init(b1, out0.recurrent_state, critic_revival_context=rev0, validate=False)
+            m1 = torch.tensor(combat_snap.action_mask.tolist(), dtype=torch.bool)
+            lp1 = torch.log_softmax(out1.policy_logits[0, : m1.numel()].masked_fill(~m1, -torch.inf), dim=0)
+
+            node0 = MacroAfterstateNode(
+                step_index=0,
+                surface="selection",
+                candidate_branches=tuple(c.branch for c in sel_dec.candidates),
+                post_worlds=sel_part[1],
+            )
+            s0 = HybridVTraceStep(sel_snap, ep_i, float(pr0[ep_i].item()), 0.0, 1.0, False, "selection", "selection_add", "macro", 0)
+            f0 = MacroRewardFacts(0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 5, 5, 1)
+            s1 = HybridVTraceStep(combat_snap, 0, float(lp1[0].item()), -0.4 + 0.9 * ep_i, 0.0, True, "combat", "play_card", "combat", 0)
+            f1 = MacroRewardFacts(-0.4 + 0.9 * ep_i, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 6, 6, 1)
+            trajs.append(
+                MacroCreditTrajectory(
+                    f"v45-{ep_i}",
+                    6_700_450 + 2 * ep_i,
+                    0,
+                    (),
+                    (s0, s1),
+                    None,
+                    None,
+                    "factual_terminal",
+                    (f0, f1),
+                    macro_branch_epsilon=0.04,
+                    afterstate_nodes=(node0,),
+                )
+            )
+
+    cohort = MacroCreditCohort("v45-cohort", 0, (), natural_only=tuple(trajs))
+    v7_lcfg = dict(
+        target_mode="durable_afterstate_v2",
+        enable_direct_vitals_context=True,
+        enable_macro_branch_prior=True,
+        enable_persistent_only_durable_value=True,
+        enable_asymmetric_revival_critic=True,
+        enable_draw_weighted_durable_value=True,
+        enable_role_conditioned_candidate_policy=True,
+        enable_deconfounded_durable_value=True,
+        enable_monotone_deconfounded_durable_value=True,
+        enable_partial_afterstates=True,
+        enable_manual_confirm_selection_afterstates=True,
+        durable_stage_baseline_weight=0.5,
+        enable_hierarchical_afterstate_mpo=True,
+        macro_mpo_min_temperature=0.008,
+        macro_within_branch_kl=0.04,
+        macro_within_branch_mpo_weight=0.50,
+        revival_budget=32,
+        zero_macro_pace_penalty=True,
+        clip_macro_pg_fallback=True,
+        macro_pg_within_branch_entropy_only=True,
+        separate_value_grad_clip=True,
+        durable_warmup_updates=0,
+        combat_actor_warmup_updates=0,
+    )
+    m7_b = MacroCreditLearner(
+        model=copy.deepcopy(v7_init),
+        config=MacroCreditLearnerConfig(**v7_lcfg, eval_batch_size=8, chunk_batch_size=8),  # type: ignore[arg-type]
+    ).learn(cohort)
+    m7_s = MacroCreditLearner(
+        model=copy.deepcopy(v7_init),
+        config=MacroCreditLearnerConfig(**v7_lcfg, eval_batch_size=1, chunk_batch_size=1),  # type: ignore[arg-type]
+    ).learn(cohort)
+
+    assert m7_b["afterstate_steps"] == 2
+    assert m7_b["durable_stage_baseline_loss"] > 0.0
+    for key in (
+        "durable_value_loss",
+        "durable_post_value_loss",
+        "durable_stage_baseline_loss",
+        "macro_policy_loss",
+        "macro_mpo_policy_loss",
+        "macro_mpo_within_policy_loss",
+        "macro_loss",
+        "gradient_norm",
+        "parameter_delta_norm",
+    ):
+        assert m7_b[key] == pytest.approx(m7_s[key], abs=1e-5), key
+
+
+
+

@@ -681,6 +681,107 @@ def probe_multiset_split_invariance(
     }
 
 
+@torch.no_grad()
+def probe_gold_monotonicity(
+    model: HybridDomainActorCriticModel,
+    encoder: GroundedObservationEncoder,
+    *,
+    decks: Sequence[Sequence[Mapping[str, Any]]] | None = None,
+    gold_grid: Sequence[int] = (0, 75, 150, 300),
+) -> dict[str, Any]:
+    """Verify V_durable(W) is non-decreasing in gold with all build/stage facts fixed."""
+    if not model.actor_critic_config.enable_durable_value_head:
+        return {
+            "durable_enabled": False,
+            "non_decreasing_fraction": 0.0,
+            "mean_delta_max_minus_min_gold": 0.0,
+        }
+    model.eval()
+    device = next(model.parameters()).device
+    active_decks = tuple(default_probe_decks() if decks is None else decks)
+    sorted_gold = sorted(int(g) for g in gold_grid)
+    if len(sorted_gold) < 2:
+        raise ValueError("gold_grid requires at least two gold levels")
+    step_checks = 0
+    step_passes = 0
+    span_deltas: list[float] = []
+    for deck in active_decks:
+        worlds = []
+        for g_val in sorted_gold:
+            obs, _ = _build_rest_probe_surface(deck, hp=56, max_hp=80, act=2, floor=22)
+            obs["player"]["gold"] = g_val
+            obs["phase"] = "map"
+            obs["decision_domain"] = "map"
+            obs.pop("rest_site", None)
+            worlds.append(encoder.encode_world_snapshot(obs))
+        w_batch, dom_ids = collate_encoded_worlds(
+            tuple(worlds),
+            expected_config=worlds[0].config,
+            expected_fingerprint=worlds[0].encoding_fingerprint,
+            device=device,
+        )
+        vals, _ = model.forward_durable_value(w_batch, dom_ids, None)
+        v_list = [float(x) for x in vals.detach().cpu().tolist()]
+        for idx in range(len(v_list) - 1):
+            step_checks += 1
+            if v_list[idx + 1] >= v_list[idx] - 1e-6:
+                step_passes += 1
+        span_deltas.append(v_list[-1] - v_list[0])
+    return {
+        "durable_enabled": True,
+        "non_decreasing_fraction": float(step_passes) / max(1, step_checks),
+        "mean_delta_max_minus_min_gold": float(np.mean(span_deltas)) if span_deltas else 0.0,
+    }
+
+
+@torch.no_grad()
+def probe_deck_bloat_resistance(
+    model: HybridDomainActorCriticModel,
+    encoder: GroundedObservationEncoder,
+    *,
+    filler_copies: int = 16,
+) -> dict[str, Any]:
+    """Compare V_durable of a focused 11-card deck vs adding mediocre filler bloat."""
+    if not model.actor_critic_config.enable_durable_value_head:
+        return {
+            "durable_enabled": False,
+            "clean_minus_bloated_adv": 0.0,
+        }
+    model.eval()
+    device = next(model.parameters()).device
+    focused_deck = list(default_probe_decks()[2])
+    filler_card = {
+        "id": "probe_card_filler_common",
+        "type": "Attack",
+        "rarity": "Common",
+        "cost": 1,
+        "is_upgradable": True,
+        "is_removable": True,
+        "dynamic_vars": {"Damage": 8},
+    }
+    bloated_deck = focused_deck + [copy.deepcopy(filler_card) for _ in range(max(1, int(filler_copies)))]
+    worlds = []
+    for deck_cards in (focused_deck, bloated_deck):
+        obs, _ = _build_rest_probe_surface(deck_cards, hp=60, max_hp=80, act=2, floor=24)
+        obs["phase"] = "map"
+        obs["decision_domain"] = "map"
+        obs.pop("rest_site", None)
+        worlds.append(encoder.encode_world_snapshot(obs))
+    w_batch, dom_ids = collate_encoded_worlds(
+        tuple(worlds),
+        expected_config=worlds[0].config,
+        expected_fingerprint=worlds[0].encoding_fingerprint,
+        device=device,
+    )
+    vals, _ = model.forward_durable_value(w_batch, dom_ids, None)
+    clean_val = float(vals[0].detach().cpu().item())
+    bloated_val = float(vals[1].detach().cpu().item())
+    return {
+        "durable_enabled": True,
+        "clean_minus_bloated_adv": clean_val - bloated_val,
+    }
+
+
 def run_all_competence_probes(
     model: HybridDomainActorCriticModel,
     encoder: GroundedObservationEncoder,
@@ -692,6 +793,8 @@ def run_all_competence_probes(
         "campfire_hp_sensitivity": probe_campfire_hp_sensitivity(model, encoder),
         "smith_vs_remove_divergence": probe_smith_vs_remove_divergence(model, encoder),
         "multiset_split_invariance": probe_multiset_split_invariance(model, encoder),
+        "gold_monotonicity": probe_gold_monotonicity(model, encoder),
+        "deck_bloat_resistance": probe_deck_bloat_resistance(model, encoder),
         "episode_macro_discipline": summarize_episode_macro_discipline(recent_episodes),
     }
     for key, value in report.items():
@@ -770,6 +873,8 @@ __all__ = [
     "MACRO_COMPETENCE_PROBE_VERSION",
     "default_probe_decks",
     "probe_campfire_hp_sensitivity",
+    "probe_deck_bloat_resistance",
+    "probe_gold_monotonicity",
     "probe_multiset_split_invariance",
     "probe_smith_vs_remove_divergence",
     "run_all_competence_probes",

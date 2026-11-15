@@ -83,7 +83,10 @@ class MacroCreditLearnerConfig:
     enable_draw_weighted_durable_value: bool = False
     enable_role_conditioned_candidate_policy: bool = False
     enable_deconfounded_durable_value: bool = False
+    enable_monotone_deconfounded_durable_value: bool = False
     enable_partial_afterstates: bool = False
+    enable_manual_confirm_selection_afterstates: bool = False
+    durable_stage_baseline_weight: float = 0.5
     enable_hierarchical_afterstate_mpo: bool = False
     macro_mpo_min_temperature: float = 0.0
     macro_within_branch_kl: float = 0.04
@@ -107,7 +110,9 @@ class MacroCreditLearnerConfig:
             "enable_draw_weighted_durable_value",
             "enable_role_conditioned_candidate_policy",
             "enable_deconfounded_durable_value",
+            "enable_monotone_deconfounded_durable_value",
             "enable_partial_afterstates",
+            "enable_manual_confirm_selection_afterstates",
             "enable_hierarchical_afterstate_mpo",
             "zero_macro_pace_penalty",
             "clip_macro_pg_fallback",
@@ -122,6 +127,13 @@ class MacroCreditLearnerConfig:
         if self.enable_deconfounded_durable_value and not self.enable_draw_weighted_durable_value:
             raise ValueError(
                 "macro credit enable_deconfounded_durable_value requires enable_draw_weighted_durable_value=True"
+            )
+        if (
+            self.enable_monotone_deconfounded_durable_value
+            and not self.enable_deconfounded_durable_value
+        ):
+            raise ValueError(
+                "macro credit enable_monotone_deconfounded_durable_value requires enable_deconfounded_durable_value=True"
             )
         if self.target_mode not in {"counterfactual_rollout", "combat_shadow_price", "durable_afterstate_v2"}:
             raise ValueError(
@@ -166,6 +178,7 @@ class MacroCreditLearnerConfig:
             "combat_entropy_weight",
             "macro_entropy_weight",
             "durable_post_value_weight",
+            "durable_stage_baseline_weight",
             "macro_pg_kl_weight",
         )
         for name in (*positive, *non_negative, "macro_trace_lambda"):
@@ -342,9 +355,13 @@ class MacroCreditLearner:
                 "branch_policy_head",
                 "branch_vitals_head",
                 "candidate_role_",
+                "durable_cycle_",
                 "durable_deck_",
+                "durable_hp_",
+                "durable_liquid_",
                 "durable_progress_vitals_",
                 "durable_revival_",
+                "durable_stage_",
                 "durable_value_head",
                 "durable_vitals_",
                 "persistent_build_",
@@ -364,8 +381,12 @@ class MacroCreditLearner:
         value_prefixes = (
             "state_value_head",
             "state_revival_",
+            "durable_cycle_",
             "durable_deck_",
+            "durable_hp_",
+            "durable_liquid_",
             "durable_progress_vitals_",
+            "durable_stage_",
             "durable_value_head",
             "durable_vitals_",
             "durable_revival_",
@@ -394,9 +415,13 @@ class MacroCreditLearner:
             "state_revival_",
             "branch_policy_head",
             "branch_vitals_",
+            "durable_cycle_",
             "durable_deck_",
+            "durable_hp_",
+            "durable_liquid_",
             "durable_progress_vitals_",
             "durable_revival_",
+            "durable_stage_",
             "durable_value_head",
             "durable_vitals_",
             "persistent_build_",
@@ -1381,6 +1406,7 @@ class MacroCreditLearner:
                 "macro_value_loss",
                 "durable_value_loss",
                 "durable_post_value_loss",
+                "durable_stage_baseline_loss",
                 "combat_policy_loss",
                 "combat_value_loss",
                 "combat_entropy",
@@ -1390,6 +1416,11 @@ class MacroCreditLearner:
         terms: list[Tensor] = []
         cfg = self.config
         is_durable_v2 = cfg.target_mode == "durable_afterstate_v2"
+        has_stage_base = (
+            is_durable_v2
+            and isinstance(self.model, HybridDomainActorCriticModel)
+            and self.model.actor_critic_config.enable_monotone_deconfounded_durable_value
+        )
         durable_actor_active = (not is_durable_v2) or (self.update >= cfg.durable_warmup_updates)
         combat_actor_active = (not is_durable_v2) or (self.update >= cfg.combat_actor_warmup_updates)
         for index in range(start, stop):
@@ -1420,6 +1451,26 @@ class MacroCreditLearner:
                     totals["durable_value_loss"] += float(durable_loss.detach().item())
                     if cfg.macro_value_weight:
                         terms.append(0.5 * cfg.macro_value_weight * durable_loss)
+                    if has_stage_base:
+                        step_w_batch, _ = collate_encoded_worlds(
+                            (step.snapshot,),
+                            expected_config=step.snapshot.config,
+                            expected_fingerprint=step.snapshot.encoding_fingerprint,
+                            device=self.device,
+                            validate=False,
+                        )
+                        stage_val = cast(
+                            HybridDomainActorCriticModel, self.model
+                        ).forward_durable_stage_baseline(
+                            step_w_batch,
+                            critic_revival_context=step_rev_gpu,
+                        )[0]
+                        stage_loss = F.smooth_l1_loss(stage_val, durable_target) / max(
+                            1, denominators["durable_value_steps"]
+                        )
+                        totals["durable_stage_baseline_loss"] += float(stage_loss.detach().item())
+                        if cfg.durable_stage_baseline_weight:
+                            terms.append(0.5 * cfg.durable_stage_baseline_weight * stage_loss)
             if step.control_domain == "macro":
                 target = prepared.macro_values[index].to(device=self.device, dtype=value.dtype)
                 value_loss = F.smooth_l1_loss(value, target) / denominators["macro_steps"]
@@ -1451,6 +1502,30 @@ class MacroCreditLearner:
                         totals["durable_post_value_loss"] += float(post_loss.detach().item())
                         if cfg.durable_post_value_weight:
                             terms.append(0.5 * cfg.durable_post_value_weight * post_loss)
+                        if has_stage_base:
+                            post_w_batch, _ = collate_encoded_worlds(
+                                (chosen_world,),
+                                expected_config=chosen_world.config,
+                                expected_fingerprint=chosen_world.encoding_fingerprint,
+                                device=self.device,
+                                validate=False,
+                            )
+                            post_stage_val = cast(
+                                HybridDomainActorCriticModel, self.model
+                            ).forward_durable_stage_baseline(
+                                post_w_batch,
+                                critic_revival_context=post_rev_gpu,
+                            )[0]
+                            post_stage_loss = F.smooth_l1_loss(post_stage_val, post_target) / max(
+                                1, denominators["afterstate_steps"]
+                            )
+                            totals["durable_stage_baseline_loss"] += float(
+                                post_stage_loss.detach().item()
+                            )
+                            if cfg.durable_stage_baseline_weight:
+                                terms.append(
+                                    0.5 * cfg.durable_stage_baseline_weight * post_stage_loss
+                                )
                         if durable_actor_active and as_target.projection.actor_enabled:
                             denom_m_pol = max(1, denominators["macro_policy_steps"])
                             mpo_step_terms: list[Tensor] = []
@@ -1584,6 +1659,7 @@ class MacroCreditLearner:
     ) -> tuple[dict[str, float], int]:
         ac_model = cast(HybridDomainActorCriticModel, self.model)
         cfg = self.config
+        has_stage_base = bool(ac_model.actor_critic_config.enable_monotone_deconfounded_durable_value)
         durable_actor_active = self.update >= cfg.durable_warmup_updates
         combat_actor_active = self.update >= cfg.combat_actor_warmup_updates
         totals = {
@@ -1597,6 +1673,7 @@ class MacroCreditLearner:
                 "macro_value_loss",
                 "durable_value_loss",
                 "durable_post_value_loss",
+                "durable_stage_baseline_loss",
                 "combat_policy_loss",
                 "combat_value_loss",
                 "combat_entropy",
@@ -1675,6 +1752,7 @@ class MacroCreditLearner:
                 )
             staged_afterstates.append(as_map)
             steps = item.reference.steps
+            has_stage_w = has_stage_base and bool(cfg.durable_stage_baseline_weight)
             for idx, s in enumerate(steps):
                 is_mac = s.control_domain == "macro"
                 is_c_entry = (not is_mac) and (idx == 0 or steps[idx - 1].control_domain == "macro")
@@ -1683,20 +1761,25 @@ class MacroCreditLearner:
                 as_entry = as_map.get(idx)
                 has_as = as_entry is not None
                 if is_mac:
-                    contrib = bool(cfg.macro_value_weight)
+                    contrib = bool(cfg.macro_value_weight) or has_stage_w
                     if as_entry is not None:
                         has_active_mpo = (as_entry[2] is not None) or bool(as_entry[3])
-                        contrib = contrib or bool(cfg.durable_post_value_weight) or (
-                            durable_actor_active
-                            and as_entry[0].projection.actor_enabled
-                            and has_active_mpo
-                            and bool(cfg.macro_policy_weight)
+                        contrib = (
+                            contrib
+                            or bool(cfg.durable_post_value_weight)
+                            or has_stage_w
+                            or (
+                                durable_actor_active
+                                and as_entry[0].projection.actor_enabled
+                                and has_active_mpo
+                                and bool(cfg.macro_policy_weight)
+                            )
                         )
                     elif is_ch and durable_actor_active:
                         contrib = contrib or bool(cfg.macro_policy_weight) or bool(cfg.macro_entropy_weight)
                 else:
                     contrib = (
-                        (is_c_entry and bool(cfg.macro_value_weight))
+                        (is_c_entry and (bool(cfg.macro_value_weight) or has_stage_w))
                         or bool(cfg.combat_value_weight)
                         or (
                             is_ch
@@ -1779,6 +1862,7 @@ class MacroCreditLearner:
             "macro_value_loss",
             "durable_value_loss",
             "durable_post_value_loss",
+            "durable_stage_baseline_loss",
             "combat_policy_loss",
             "combat_value_loss",
             "combat_entropy",
@@ -1926,6 +2010,24 @@ class MacroCreditLearner:
                     )
                     if cfg.macro_value_weight:
                         batch_terms.append(0.5 * cfg.macro_value_weight * durable_loss)
+                    if has_stage_base:
+                        stage_vals = ac_model.forward_durable_stage_baseline(
+                            dur_world_batch,
+                            critic_revival_context=dur_rev,
+                        )
+                        finite_ok = finite_ok & torch.isfinite(stage_vals).all()
+                        stage_loss = (
+                            F.smooth_l1_loss(
+                                stage_vals, flat_dur_target[dur_gids_gpu], reduction="sum"
+                            )
+                            / denom_dur_val
+                        )
+                        slice_totals_gpu["durable_stage_baseline_loss"] = (
+                            slice_totals_gpu["durable_stage_baseline_loss"]
+                            + stage_loss.detach().double()
+                        )
+                        if cfg.durable_stage_baseline_weight:
+                            batch_terms.append(0.5 * cfg.durable_stage_baseline_weight * stage_loss)
 
                 if any_macro:
                     macro_huber = F.smooth_l1_loss(
@@ -1976,17 +2078,19 @@ class MacroCreditLearner:
                             device=self.device,
                             validate=False,
                         )
+                        stacked_as_revs = torch.stack(as_revs, dim=0) if as_revs else None
+                        stacked_post_targets = torch.stack(as_post_targets, dim=0)
                         post_vals, _ = ac_model.forward_durable_value(
                             world_batch,
                             domain_ids,
                             torch.stack(as_hiddens, dim=0),
-                            critic_revival_context=(torch.stack(as_revs, dim=0) if as_revs else None),
+                            critic_revival_context=stacked_as_revs,
                             validate=False,
                         )
                         finite_ok = finite_ok & torch.isfinite(post_vals).all()
                         post_loss = (
                             F.smooth_l1_loss(
-                                post_vals, torch.stack(as_post_targets, dim=0), reduction="sum"
+                                post_vals, stacked_post_targets, reduction="sum"
                             )
                             / denom_afterstate
                         )
@@ -1995,6 +2099,26 @@ class MacroCreditLearner:
                         )
                         if cfg.durable_post_value_weight:
                             batch_terms.append(0.5 * cfg.durable_post_value_weight * post_loss)
+                        if has_stage_base:
+                            post_stage_vals = ac_model.forward_durable_stage_baseline(
+                                world_batch,
+                                critic_revival_context=stacked_as_revs,
+                            )
+                            finite_ok = finite_ok & torch.isfinite(post_stage_vals).all()
+                            post_stage_loss = (
+                                F.smooth_l1_loss(
+                                    post_stage_vals, stacked_post_targets, reduction="sum"
+                                )
+                                / denom_afterstate
+                            )
+                            slice_totals_gpu["durable_stage_baseline_loss"] = (
+                                slice_totals_gpu["durable_stage_baseline_loss"]
+                                + post_stage_loss.detach().double()
+                            )
+                            if cfg.durable_stage_baseline_weight:
+                                batch_terms.append(
+                                    0.5 * cfg.durable_stage_baseline_weight * post_stage_loss
+                                )
 
                         mpo_actor_terms: list[Tensor] = []
                         if as_act_k:
@@ -2295,6 +2419,7 @@ class MacroCreditLearner:
                 "macro_value_loss",
                 "durable_value_loss",
                 "durable_post_value_loss",
+                "durable_stage_baseline_loss",
                 "combat_policy_loss",
                 "combat_value_loss",
                 "combat_entropy",
@@ -2340,8 +2465,12 @@ class MacroCreditLearner:
                         (
                             "state_value_head",
                             "state_revival_",
+                            "durable_cycle_",
                             "durable_deck_",
+                            "durable_hp_",
+                            "durable_liquid_",
                             "durable_progress_vitals_",
+                            "durable_stage_",
                             "durable_value_head",
                             "durable_vitals_",
                             "durable_revival_",
@@ -2406,6 +2535,7 @@ class MacroCreditLearner:
             cfg.macro_policy_weight * totals["macro_policy_loss"]
             + cfg.macro_value_weight * (totals["macro_value_loss"] + totals["durable_value_loss"])
             + cfg.durable_post_value_weight * totals["durable_post_value_loss"]
+            + cfg.durable_stage_baseline_weight * totals["durable_stage_baseline_loss"]
             - (cfg.macro_entropy_weight * totals["macro_entropy"] if is_durable_v2 else 0.0)
         )
         combat_loss = (

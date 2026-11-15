@@ -398,6 +398,9 @@ def _rollout_worker_entry(
                 output_dir=Path(task["output_dir"]),
                 macro_branch_epsilon=float(task["macro_branch_epsilon"]),
                 allow_partial_afterstates=bool(task.get("allow_partial_afterstates", False)),
+                allow_single_pick_manual_confirm=bool(
+                    task.get("allow_single_pick_manual_confirm", False)
+                ),
                 maximum_snapshot_bytes=int(task["maximum_snapshot_bytes"]),
                 maximum_group_seconds=float(task["maximum_group_seconds"]),
                 artifact_root=root_path,
@@ -502,6 +505,7 @@ class PersistentRolloutWorkerPool:
         cohort_id: str,
         macro_branch_epsilon: float,
         allow_partial_afterstates: bool = False,
+        allow_single_pick_manual_confirm: bool = False,
         replacement_seed_fn: Callable[[int], int] | None,
         max_recoverable_incidents: int,
         maximum_episode_snapshot_bytes: int,
@@ -542,6 +546,9 @@ class PersistentRolloutWorkerPool:
                     "output_dir": str(cohort_dir / f"episode-{attempt_offset:03d}"),
                     "macro_branch_epsilon": macro_branch_epsilon,
                     "allow_partial_afterstates": bool(allow_partial_afterstates),
+                    "allow_single_pick_manual_confirm": bool(
+                        allow_single_pick_manual_confirm
+                    ),
                     "maximum_snapshot_bytes": min(
                         maximum_episode_snapshot_bytes, maximum_cohort_snapshot_bytes
                     ),

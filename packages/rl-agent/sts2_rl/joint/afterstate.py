@@ -681,6 +681,8 @@ def _synthesize_selection_candidate(
     base_canonical: Mapping[str, Any],
     observation: Mapping[str, Any],
     candidate: SemanticCandidate,
+    *,
+    allow_single_pick_manual_confirm: bool = False,
 ) -> dict[str, Any] | None:
     if candidate.branch != "selection_add":
         return None
@@ -699,19 +701,24 @@ def _synthesize_selection_candidate(
                 raw_sel.update(dict(top_val))
 
     if (
+        raw_sel.get("confirm_enabled") is True
+        or raw_sel.get("can_confirm") is True
+        or sel.get("confirm_ready") is True
+    ):
+        return None
+    is_manual_confirm = (
         sel.get("confirmation_mode") == "manual"
         or raw_sel.get("requires_manual_confirmation") is True
         or raw_sel.get("requires_confirm") is True
-        or raw_sel.get("confirm_enabled") is True
-        or sel.get("confirm_ready") is True
-    ):
+    )
+    if is_manual_confirm and not allow_single_pick_manual_confirm:
         return None
     is_auto_confirm = (
         sel.get("confirmation_mode") == "automatic"
         or raw_sel.get("requires_manual_confirmation") is False
         or raw_sel.get("requires_confirm") is False
     )
-    if not is_auto_confirm:
+    if not is_auto_confirm and not (is_manual_confirm and allow_single_pick_manual_confirm):
         return None
     if _exact_int(sel.get("selected_count")) not in (None, 0) or sel.get("selected_cards"):
         return None
@@ -727,6 +734,8 @@ def _synthesize_selection_candidate(
     min_s = _exact_int(sel.get("min_select") if sel.get("min_select") is not None else raw_sel.get("min_select"))
     max_s = _exact_int(sel.get("max_select") if sel.get("max_select") is not None else raw_sel.get("max_select"))
     if max_s not in (None, 1) or min_s not in (None, 1):
+        return None
+    if is_manual_confirm and not (min_s == 1 and max_s == 1):
         return None
     if rem is not None:
         if rem != 1:
@@ -751,7 +760,13 @@ def _synthesize_selection_candidate(
         or raw_sel.get("screen_subtype")
         or ""
     ).strip().lower()
-    prompt = str(sel.get("prompt_id") or raw_sel.get("prompt_id") or "").strip().lower()
+    prompt = str(
+        sel.get("prompt_id")
+        or raw_sel.get("prompt_id")
+        or sel.get("prompt")
+        or raw_sel.get("prompt")
+        or ""
+    ).strip().lower()
     is_upgrade = (
         op == "upgrade"
         or mode in {"deckupgrade", "upgrade"}
@@ -813,6 +828,7 @@ def synthesize_deterministic_afterstates(
     observation: Mapping[str, Any],
     decision: ForwardDecision,
     candidates: Sequence[SemanticCandidate] | None = None,
+    allow_single_pick_manual_confirm: bool = False,
 ) -> tuple[EncodedWorldSnapshot, ...] | None:
     """Synthesize encoded post-state world snapshots for every legal candidate.
 
@@ -873,6 +889,7 @@ def synthesize_deterministic_afterstates(
                 base_canonical,
                 observation,
                 candidate,
+                allow_single_pick_manual_confirm=allow_single_pick_manual_confirm,
             )
         else:
             return None
@@ -894,6 +911,7 @@ def synthesize_partial_deterministic_afterstates(
     observation: Mapping[str, Any],
     decision: ForwardDecision,
     candidates: Sequence[SemanticCandidate] | None = None,
+    allow_single_pick_manual_confirm: bool = False,
 ) -> tuple[tuple[int, ...], tuple[EncodedWorldSnapshot, ...]] | None:
     """Synthesize verified deterministic afterstate subset when >= 2 candidates qualify.
 
@@ -914,6 +932,7 @@ def synthesize_partial_deterministic_afterstates(
         observation=observation,
         decision=decision,
         candidates=active_candidates,
+        allow_single_pick_manual_confirm=allow_single_pick_manual_confirm,
     )
     if full is not None:
         return tuple(range(len(active_candidates))), full

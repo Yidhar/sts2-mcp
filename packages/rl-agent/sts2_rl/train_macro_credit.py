@@ -257,6 +257,9 @@ def _actor_critic_config(config: MacroTrainingConfig) -> HybridActorCriticConfig
                 config.learner.enable_role_conditioned_candidate_policy
             ),
             enable_deconfounded_durable_value=config.learner.enable_deconfounded_durable_value,
+            enable_monotone_deconfounded_durable_value=(
+                config.learner.enable_monotone_deconfounded_durable_value
+            ),
         )
     return HybridActorCriticConfig(grounded)
 
@@ -449,6 +452,9 @@ def run_cohorts(
                     cohort_id=cohort_dir.name,
                     macro_branch_epsilon=config.course.macro_branch_epsilon,
                     allow_partial_afterstates=config.learner.enable_partial_afterstates,
+                    allow_single_pick_manual_confirm=(
+                        config.learner.enable_manual_confirm_selection_afterstates
+                    ),
                     parallel_collectors=config.course.parallel_collectors,
                     replacement_seed_fn=replacement_seed,
                     max_recoverable_incidents=max(2, config.course.roots_per_cohort // 2),

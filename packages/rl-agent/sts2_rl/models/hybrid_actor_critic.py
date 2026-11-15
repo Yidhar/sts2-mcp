@@ -53,9 +53,15 @@ PLAYER_HP_OFFSET: Final = 62 - NUMERIC_FACT_SLOT_START
 PLAYER_MAX_HP_OFFSET: Final = 111 - NUMERIC_FACT_SLOT_START
 PLAYER_OPEN_POTION_SLOTS_OFFSET: Final = 119 - NUMERIC_FACT_SLOT_START
 RUN_ACT_OFFSET: Final = 6 - NUMERIC_FACT_SLOT_START
+RUN_ACT_SLOT: Final = 6
 RUN_FLOOR_OFFSET: Final = 51 - NUMERIC_FACT_SLOT_START
 SALIENT_VITALS_DIM: Final = 4
 DURABLE_PROGRESS_VITALS_DIM: Final = 10
+DURABLE_STAGE_DIM: Final = 5
+DURABLE_HP_BASIS_DIM: Final = 5
+DURABLE_LIQUID_BASIS_DIM: Final = 4
+DURABLE_CYCLE_BASIS_DIM: Final = 3
+DURABLE_TILT_BETAS: Final[tuple[float, ...]] = (1.5, 3.0, 6.0)
 CRITIC_REVIVAL_CONTEXT_DIM: Final = 6
 PERSISTENT_BUILD_ZONE_IDS: Final[tuple[int, ...]] = (2, 13, 15, 16, 20, 22)
 IDENTITY_BLIND_CARD_COUNT_ZONE_IDS: Final[frozenset[int]] = frozenset({2, 20})
@@ -63,9 +69,13 @@ V2_FRESH_TENSOR_PREFIXES: Final[tuple[str, ...]] = (
     "branch_policy_head.",
     "branch_vitals_",
     "candidate_role_",
+    "durable_cycle_",
     "durable_deck_",
+    "durable_hp_",
+    "durable_liquid_",
     "durable_progress_vitals_",
     "durable_revival_",
+    "durable_stage_",
     "durable_value_head.",
     "durable_vitals_",
     "persistent_build_",
@@ -77,6 +87,10 @@ RETIRED_DECONFOUNDED_SOURCE_PREFIXES: Final[tuple[str, ...]] = (
     "durable_deck_size_linear.",
     "durable_vitals_head.",
     "durable_vitals_linear.",
+)
+RETIRED_MONOTONE_DECONFOUNDED_SOURCE_PREFIXES: Final[tuple[str, ...]] = (
+    *RETIRED_DECONFOUNDED_SOURCE_PREFIXES,
+    "durable_progress_vitals_head.",
 )
 
 
@@ -95,6 +109,7 @@ class HybridActorCriticConfig:
     enable_draw_weighted_durable_value: bool = False
     enable_role_conditioned_candidate_policy: bool = False
     enable_deconfounded_durable_value: bool = False
+    enable_monotone_deconfounded_durable_value: bool = False
 
     def __post_init__(self) -> None:
         HybridCandidateQConfig(
@@ -113,6 +128,7 @@ class HybridActorCriticConfig:
             "enable_draw_weighted_durable_value",
             "enable_role_conditioned_candidate_policy",
             "enable_deconfounded_durable_value",
+            "enable_monotone_deconfounded_durable_value",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"hybrid actor-critic {name} must be boolean")
@@ -123,6 +139,13 @@ class HybridActorCriticConfig:
         if self.enable_deconfounded_durable_value and not self.enable_draw_weighted_durable_value:
             raise ValueError(
                 "enable_deconfounded_durable_value requires enable_draw_weighted_durable_value=True"
+            )
+        if (
+            self.enable_monotone_deconfounded_durable_value
+            and not self.enable_deconfounded_durable_value
+        ):
+            raise ValueError(
+                "enable_monotone_deconfounded_durable_value requires enable_deconfounded_durable_value=True"
             )
 
     @property
@@ -138,6 +161,7 @@ class HybridActorCriticConfig:
             or self.enable_draw_weighted_durable_value
             or self.enable_role_conditioned_candidate_policy
             or self.enable_deconfounded_durable_value
+            or self.enable_monotone_deconfounded_durable_value
         )
 
     @classmethod
@@ -245,6 +269,31 @@ class HybridActorCriticConfig:
         )
 
     @classmethod
+    def durable_v7(
+        cls,
+        grounded: GroundedCandidateConfig | None = None,
+        *,
+        domain_layers: int = 1,
+        joint_layers: int = 2,
+    ) -> HybridActorCriticConfig:
+        return cls(
+            grounded=grounded or GroundedCandidateConfig(),
+            domain_layers=domain_layers,
+            joint_layers=joint_layers,
+            enable_hierarchical_branch_policy=True,
+            enable_durable_value_head=True,
+            enable_persistent_build_context=True,
+            enable_direct_vitals_context=True,
+            enable_macro_branch_prior=True,
+            enable_persistent_only_durable_value=True,
+            enable_asymmetric_revival_critic=True,
+            enable_draw_weighted_durable_value=True,
+            enable_role_conditioned_candidate_policy=True,
+            enable_deconfounded_durable_value=True,
+            enable_monotone_deconfounded_durable_value=True,
+        )
+
+    @classmethod
     def from_mapping(
         cls,
         mapping: dict[str, Any],
@@ -292,6 +341,9 @@ class HybridActorCriticConfig:
                 ),
                 enable_deconfounded_durable_value=bool(
                     mapping.get("enable_deconfounded_durable_value", False)
+                ),
+                enable_monotone_deconfounded_durable_value=bool(
+                    mapping.get("enable_monotone_deconfounded_durable_value", False)
                 ),
             )
         raise ValueError(f"unsupported hybrid actor-critic model_config version: {version!r}")
@@ -345,6 +397,12 @@ class HybridActorCriticConfig:
             if self.enable_deconfounded_durable_value:
                 base.update(
                     enable_deconfounded_durable_value=self.enable_deconfounded_durable_value,
+                )
+            if self.enable_monotone_deconfounded_durable_value:
+                base.update(
+                    enable_monotone_deconfounded_durable_value=(
+                        self.enable_monotone_deconfounded_durable_value
+                    ),
                 )
         return base
 
@@ -585,7 +643,61 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             nn.init.zeros_(self.persistent_vitals_to_state.weight)
             nn.init.zeros_(self.persistent_vitals_to_state.bias)
             if actor_critic.enable_durable_value_head:
-                if actor_critic.enable_deconfounded_durable_value:
+                if actor_critic.enable_monotone_deconfounded_durable_value:
+                    stage_in_dim = DURABLE_STAGE_DIM + rev_dim
+                    stage_mid_dim = max(16, cfg.ffn_dim // 2)
+                    stage_fc1 = nn.Linear(stage_in_dim, stage_mid_dim)
+                    nn.init.normal_(stage_fc1.weight, mean=0.0, std=0.15)
+                    nn.init.zeros_(stage_fc1.bias)
+                    stage_out = nn.Linear(stage_mid_dim, 1)
+                    nn.init.zeros_(stage_out.weight)
+                    nn.init.zeros_(stage_out.bias)
+                    self.durable_stage_baseline_head = nn.Sequential(
+                        nn.LayerNorm(stage_in_dim),
+                        stage_fc1,
+                        nn.SiLU(),
+                        stage_out,
+                    )
+
+                    hp_fc1 = nn.Linear(stage_in_dim, stage_mid_dim)
+                    nn.init.normal_(hp_fc1.weight, mean=0.0, std=0.10)
+                    nn.init.zeros_(hp_fc1.bias)
+                    hp_out = nn.Linear(stage_mid_dim, DURABLE_HP_BASIS_DIM)
+                    nn.init.zeros_(hp_out.weight)
+                    nn.init.constant_(hp_out.bias, -2.8)
+                    self.durable_hp_gate = nn.Sequential(
+                        nn.LayerNorm(stage_in_dim),
+                        hp_fc1,
+                        nn.SiLU(),
+                        hp_out,
+                    )
+
+                    liq_fc1 = nn.Linear(stage_in_dim, stage_mid_dim)
+                    nn.init.normal_(liq_fc1.weight, mean=0.0, std=0.10)
+                    nn.init.zeros_(liq_fc1.bias)
+                    liq_out = nn.Linear(stage_mid_dim, DURABLE_LIQUID_BASIS_DIM)
+                    nn.init.zeros_(liq_out.weight)
+                    nn.init.constant_(liq_out.bias, -3.2)
+                    self.durable_liquid_gate = nn.Sequential(
+                        nn.LayerNorm(stage_in_dim),
+                        liq_fc1,
+                        nn.SiLU(),
+                        liq_out,
+                    )
+
+                    cyc_fc1 = nn.Linear(stage_in_dim, stage_mid_dim)
+                    nn.init.normal_(cyc_fc1.weight, mean=0.0, std=0.10)
+                    nn.init.zeros_(cyc_fc1.bias)
+                    cyc_out = nn.Linear(stage_mid_dim, DURABLE_CYCLE_BASIS_DIM)
+                    nn.init.zeros_(cyc_out.weight)
+                    nn.init.constant_(cyc_out.bias, -3.8)
+                    self.durable_cycle_gate = nn.Sequential(
+                        nn.LayerNorm(stage_in_dim),
+                        cyc_fc1,
+                        nn.SiLU(),
+                        cyc_out,
+                    )
+                elif actor_critic.enable_deconfounded_durable_value:
                     prog_in_dim = DURABLE_PROGRESS_VITALS_DIM + rev_dim
                     prog_mid_dim = max(16, cfg.ffn_dim // 2)
                     prog_fc1 = nn.Linear(prog_in_dim, cfg.ffn_dim)
@@ -668,6 +780,17 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 self.durable_deck_out = nn.Linear(cfg.ffn_dim * 3, 1)
                 nn.init.zeros_(self.durable_deck_out.weight)
                 nn.init.zeros_(self.durable_deck_out.bias)
+                if actor_critic.enable_monotone_deconfounded_durable_value:
+                    self.durable_deck_tilted_out = nn.Linear(
+                        cfg.ffn_dim * 3,
+                        len(DURABLE_TILT_BETAS),
+                    )
+                    nn.init.zeros_(self.durable_deck_tilted_out.weight)
+                    nn.init.zeros_(self.durable_deck_tilted_out.bias)
+                    self.durable_deck_linear_logit = nn.Parameter(torch.zeros(()))
+                    self.durable_deck_tilt_logits = nn.Parameter(
+                        torch.tensor([-1.8, -1.5, -1.8])
+                    )
                 if not actor_critic.enable_deconfounded_durable_value:
                     deck_size_fc1 = nn.Linear(DURABLE_DECK_SIZE_DIM + rev_dim, cfg.ffn_dim)
                     nn.init.normal_(deck_size_fc1.weight, mean=0.0, std=0.25)
@@ -975,20 +1098,50 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         features[:, :, 2] = torch.where(label_rows | mod_item_rows, 0.0, features[:, :, 2])
 
         canon_order_ids = torch.where(card_rows | label_rows | mod_item_rows, 0, world.order_ids)
+        canon_role_ids = world.role_ids
+        canon_entity_ids = world.entity_ids
         canon_aux_ids = torch.where(card_rows, world.entity_ids, world.entity_aux_ids)
         canon_aux_ids = torch.where(
             active_deck_row & has_mod_parent,
             mod_parent_entity_id,
             canon_aux_ids,
         )
+        if self.actor_critic_config.enable_monotone_deconfounded_durable_value:
+            player_pers_rows = eff_mask & world.zone_ids.eq(PLAYER_ZONE_ID)
+            p_slot_end = min(int(features.shape[-1]), NUMERIC_FACT_SLOT_END)
+            if p_slot_end > 3:
+                features[:, :, 3:p_slot_end] = torch.where(
+                    player_pers_rows.unsqueeze(-1),
+                    0.0,
+                    features[:, :, 3:p_slot_end],
+                )
+            run_pers_rows = eff_mask & world.zone_ids.eq(RUN_ZONE_ID)
+            r_slot_end = min(int(features.shape[-1]), 198)
+            saved_act = features[:, :, RUN_ACT_SLOT].clone() if RUN_ACT_SLOT < r_slot_end else None
+            if r_slot_end > 3:
+                features[:, :, 3:r_slot_end] = torch.where(
+                    run_pers_rows.unsqueeze(-1),
+                    0.0,
+                    features[:, :, 3:r_slot_end],
+                )
+            if saved_act is not None:
+                features[:, :, RUN_ACT_SLOT] = torch.where(
+                    run_pers_rows,
+                    saved_act,
+                    features[:, :, RUN_ACT_SLOT],
+                )
+            canon_role_ids = torch.where(run_pers_rows, 1, canon_role_ids)
+            canon_entity_ids = torch.where(run_pers_rows, 1, canon_entity_ids)
+            canon_aux_ids = torch.where(run_pers_rows, 1, canon_aux_ids)
+            canon_order_ids = torch.where(run_pers_rows, 0, canon_order_ids)
 
         child_uv = (match_mod & mod_item_mask.unsqueeze(2)) | match_label
         prepared_world = WorldTokenBatch(
             features=features,
             type_ids=world.type_ids,
-            role_ids=world.role_ids,
+            role_ids=canon_role_ids,
             owner_ids=world.owner_ids,
-            entity_ids=world.entity_ids,
+            entity_ids=canon_entity_ids,
             entity_aux_ids=canon_aux_ids,
             definition_binding_ids=world.definition_binding_ids,
             relation_binding_ids=world.relation_binding_ids,
@@ -1317,6 +1470,102 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             dim=-1,
         ).to(dtype=dtype)
 
+    def _extract_monotone_stage_and_vitals(
+        self,
+        world: WorldTokenBatch,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        pers_valid = self._persistent_token_mask(world.zone_ids, world.owner_ids, world.mask)
+        slot_end = min(int(world.features.shape[-1]), NUMERIC_FACT_SLOT_END)
+        feats = world.features[:, :, NUMERIC_FACT_SLOT_START:slot_end]
+        dtype = feats.dtype
+        player_valid = (world.zone_ids.eq(PLAYER_ZONE_ID) & pers_valid).unsqueeze(-1)
+        run_valid = (world.zone_ids.eq(RUN_ZONE_ID) & pers_valid).unsqueeze(-1)
+        player_max = torch.where(player_valid, feats, 0.0).amax(dim=1)
+        run_max = torch.where(run_valid, feats, 0.0).amax(dim=1)
+
+        hp_log = torch.maximum(
+            player_max[:, PLAYER_HP_OFFSET],
+            player_max[:, PLAYER_CURRENT_HP_OFFSET],
+        )
+        hp_val = torch.expm1((10.0 * hp_log).clamp(0.0, 8.0)).clamp_min(0.0)
+        max_hp_val = torch.expm1(
+            (10.0 * player_max[:, PLAYER_MAX_HP_OFFSET]).clamp(0.0, 8.0)
+        ).clamp_min(1.0)
+        hp_ratio = (hp_val / max_hp_val).clamp(0.0, 2.0)
+        r_c = hp_ratio.clamp(0.0, 1.0)
+        hp_basis = torch.stack(
+            [
+                1.0 - (1.0 - r_c).pow(3),
+                1.0 - (1.0 - r_c).pow(2),
+                torch.tanh(hp_val / 35.0),
+                torch.tanh(hp_val / 75.0),
+                torch.tanh(max_hp_val / 100.0),
+            ],
+            dim=-1,
+        ).to(dtype=dtype)
+
+        gold_per_100 = (
+            torch.expm1((10.0 * player_max[:, PLAYER_GOLD_OFFSET]).clamp(0.0, 9.0)) / 100.0
+        ).clamp(0.0, 10.0)
+        liquid_basis = torch.stack(
+            [
+                torch.tanh(gold_per_100 / 0.75),
+                torch.tanh(gold_per_100 / 1.50),
+                torch.tanh(gold_per_100 / 3.00),
+                0.5 * torch.log1p(gold_per_100),
+            ],
+            dim=-1,
+        ).to(dtype=dtype)
+
+        floor_val = torch.expm1((10.0 * run_max[:, RUN_FLOOR_OFFSET]).clamp(0.0, 5.0))
+        floor_norm = (floor_val / 50.0).clamp(0.0, 1.5)
+        act_val = torch.expm1((10.0 * run_max[:, RUN_ACT_OFFSET]).clamp(0.0, 3.0))
+        act_norm = (act_val / 3.0).clamp(0.0, 1.5)
+        is_act1 = (1.0 - (act_val - 1.0).abs()).clamp(0.0, 1.0)
+        is_act2 = (1.0 - (act_val - 2.0).abs()).clamp(0.0, 1.0)
+        is_act3 = (1.0 - (act_val - 3.0).abs()).clamp(0.0, 1.0)
+        stage_feats = torch.stack(
+            [
+                floor_norm,
+                act_norm,
+                is_act1,
+                is_act2,
+                is_act3,
+            ],
+            dim=-1,
+        ).to(dtype=dtype)
+        return stage_feats, hp_basis, liquid_basis
+
+    def forward_durable_stage_baseline(
+        self,
+        world: WorldTokenBatch,
+        *,
+        critic_revival_context: Tensor | None = None,
+        validate: bool = False,
+    ) -> Tensor:
+        if not self.actor_critic_config.enable_monotone_deconfounded_durable_value:
+            raise RuntimeError(
+                "forward_durable_stage_baseline requires enable_monotone_deconfounded_durable_value=True"
+            )
+        if validate:
+            batch_size, _ = world.validate(self.config)
+        else:
+            batch_size = int(world.features.shape[0])
+        rev_ctx = self._normalize_critic_revival_context(
+            critic_revival_context,
+            batch_size=batch_size,
+            device=world.features.device,
+            dtype=world.features.dtype,
+        )
+        stage_feats, _, _ = self._extract_monotone_stage_and_vitals(world)
+        stage_in = (
+            torch.cat([stage_feats, rev_ctx * 4.0], dim=-1)
+            if rev_ctx is not None
+            else stage_feats
+        )
+        stage_val: Tensor = self.durable_stage_baseline_head(stage_in).squeeze(-1)
+        return stage_val
+
     @staticmethod
     def _scale_card_and_modifier_features(features: Tensor) -> Tensor:
         scaled = features.clone()
@@ -1345,10 +1594,12 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         vitals_embedding: Tensor | None = None,
         raw_vitals: Tensor | None = None,
         progress_vitals: Tensor | None = None,
+        monotone_parts: tuple[Tensor, Tensor, Tensor] | None = None,
         run_memory: Tensor,
         revival_context: Tensor | None = None,
         card_repr: Tensor | None = None,
         card_raw_feats: Tensor | None = None,
+        deck_card_mask: Tensor | None = None,
         draw_prob: Tensor | None = None,
         deck_size: Tensor | None = None,
         has_deck: Tensor | None = None,
@@ -1363,7 +1614,25 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         if rev_scaled is not None:
             parts.append(rev_scaled)
         out: Tensor = self.durable_value_head(torch.cat(parts, dim=-1)).squeeze(-1)
-        if self.actor_critic_config.enable_deconfounded_durable_value:
+        stage_in: Tensor | None = None
+        if self.actor_critic_config.enable_monotone_deconfounded_durable_value:
+            if monotone_parts is not None:
+                stage_feats, hp_basis, liquid_basis = monotone_parts
+                stage_in = (
+                    torch.cat([stage_feats, rev_scaled], dim=-1)
+                    if rev_scaled is not None
+                    else stage_feats
+                )
+                v_stage = self.durable_stage_baseline_head(stage_in).squeeze(-1)
+                w_hp = nn.functional.softplus(self.durable_hp_gate(stage_in))
+                w_liq = nn.functional.softplus(self.durable_liquid_gate(stage_in))
+                out = (
+                    out
+                    + v_stage.detach()
+                    + (w_hp * hp_basis).sum(dim=-1)
+                    + (w_liq * liquid_basis).sum(dim=-1)
+                )
+        elif self.actor_critic_config.enable_deconfounded_durable_value:
             if progress_vitals is not None:
                 prog_in = (
                     torch.cat([progress_vitals, rev_scaled], dim=-1)
@@ -1412,7 +1681,60 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             )
             card_utilities = self.durable_deck_out(bilinear_card).squeeze(-1)
             expected_card_utility = torch.einsum("bw,bw->b", draw_prob, card_utilities)
-            if self.actor_critic_config.enable_deconfounded_durable_value:
+            if self.actor_critic_config.enable_monotone_deconfounded_durable_value:
+                has_deck_f = has_deck.to(dtype=out.dtype)
+                eff_card_mask = (
+                    deck_card_mask
+                    if deck_card_mask is not None
+                    else (draw_prob > 0.0)
+                )
+                u_tilt_all = 2.5 * torch.tanh(
+                    (card_utilities.unsqueeze(-1) + self.durable_deck_tilted_out(bilinear_card))
+                    / 2.5
+                )
+                u_beta_cols: list[Tensor] = []
+                for m_idx, beta_m in enumerate(DURABLE_TILT_BETAS):
+                    u_m = u_tilt_all[:, :, m_idx]
+                    u_masked = u_m.masked_fill(~eff_card_mask, -1e9)
+                    u_max = torch.where(
+                        has_deck,
+                        u_masked.amax(dim=1),
+                        torch.zeros_like(expected_card_utility),
+                    )
+                    shifted_exp = torch.where(
+                        eff_card_mask,
+                        torch.exp((beta_m * (u_m - u_max.unsqueeze(1))).clamp(-60.0, 0.0)),
+                        torch.zeros_like(u_m),
+                    )
+                    log_mean_exp = u_max + (
+                        torch.log(
+                            torch.einsum("bw,bw->b", draw_prob, shifted_exp).clamp_min(1e-12)
+                        )
+                        / beta_m
+                    )
+                    u_beta_cols.append(log_mean_exp * has_deck_f)
+                u_betas = torch.stack(u_beta_cols, dim=-1)
+                alpha_lin = torch.sigmoid(self.durable_deck_linear_logit)
+                w_tilt = nn.functional.softplus(self.durable_deck_tilt_logits)
+                deck_utility = alpha_lin * expected_card_utility + (w_tilt * u_betas).sum(dim=-1)
+                if stage_in is not None:
+                    safe_n = deck_size.clamp_min(1.0)
+                    bloat_basis = (
+                        torch.stack(
+                            [
+                                nn.functional.softplus((safe_n - 16.0) / 6.0),
+                                nn.functional.softplus((safe_n - 24.0) / 6.0),
+                                nn.functional.softplus((safe_n - 32.0) / 6.0),
+                            ],
+                            dim=-1,
+                        )
+                        * has_deck_f.unsqueeze(-1)
+                    )
+                    w_cycle = nn.functional.softplus(self.durable_cycle_gate(stage_in))
+                    v_cycle = -(w_cycle * bloat_basis).sum(dim=-1)
+                    deck_utility = deck_utility + v_cycle
+                out = out + deck_utility
+            elif self.actor_critic_config.enable_deconfounded_durable_value:
                 out = out + expected_card_utility
             else:
                 has_deck_f = has_deck.to(dtype=out.dtype)
@@ -1497,8 +1819,12 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             dtype=torch.long,
             device=world.features.device,
         )
+        monotone_parts: tuple[Tensor, Tensor, Tensor] | None = None
+        if self.actor_critic_config.enable_monotone_deconfounded_durable_value:
+            monotone_parts = self._extract_monotone_stage_and_vitals(world)
         card_repr: Tensor | None = None
         card_raw_feats: Tensor | None = None
+        deck_card_mask: Tensor | None = None
         draw_prob: Tensor | None = None
         deck_size: Tensor | None = None
         has_deck: Tensor | None = None
@@ -1507,6 +1833,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             prep = self._prepare_draw_weighted_persistent_world(world)
             pers_world = prep.world
             token_weights = prep.token_weights
+            deck_card_mask = prep.deck_card_mask
             draw_prob = prep.draw_prob
             deck_size = prep.deck_size
             has_deck = prep.has_deck
@@ -1535,8 +1862,13 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         else:
             pers_world = self._mask_world_to_persistent(world)
             pers_enc = self.encode_world(pers_world, zero_domains, _validated=not validate)
+        run_prev_for_durable = (
+            torch.zeros_like(previous_run)
+            if self.actor_critic_config.enable_monotone_deconfounded_durable_value
+            else previous_run
+        )
         pers_run = self.run_recurrent_norm(
-            self.run_recurrent_cell(pers_enc.state_embedding, previous_run)
+            self.run_recurrent_cell(pers_enc.state_embedding, run_prev_for_durable)
         )
         build_emb = (
             self._pool_persistent_build(
@@ -1564,7 +1896,10 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         progress_vitals: Tensor | None = None
         if self.actor_critic_config.enable_direct_vitals_context:
             vitals_emb, raw_vitals = self._encode_direct_vitals(pers_world)
-            if self.actor_critic_config.enable_deconfounded_durable_value:
+            if (
+                self.actor_critic_config.enable_deconfounded_durable_value
+                and not self.actor_critic_config.enable_monotone_deconfounded_durable_value
+            ):
                 progress_vitals = self._extract_progress_vitals(pers_world)
         durable_val = self._durable_readout(
             world_state_embedding=pers_enc.state_embedding,
@@ -1572,10 +1907,12 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             vitals_embedding=vitals_emb,
             raw_vitals=raw_vitals,
             progress_vitals=progress_vitals,
+            monotone_parts=monotone_parts,
             run_memory=pers_run,
             revival_context=rev_ctx,
             card_repr=card_repr,
             card_raw_feats=card_raw_feats,
+            deck_card_mask=deck_card_mask,
             draw_prob=draw_prob,
             deck_size=deck_size,
             has_deck=has_deck,
@@ -2051,12 +2388,17 @@ def initialize_actor_critic_from_macro_publication(
     retired_source: list[str] = []
     unmatched_source: list[str] = []
     allow_retired = bool(model.actor_critic_config.enable_deconfounded_durable_value)
+    retired_prefixes = (
+        RETIRED_MONOTONE_DECONFOUNDED_SOURCE_PREFIXES
+        if model.actor_critic_config.enable_monotone_deconfounded_durable_value
+        else RETIRED_DECONFOUNDED_SOURCE_PREFIXES
+    )
     for key, value in source_state.items():
         if value.is_floating_point() and not bool(torch.isfinite(value).all().item()):
             raise ValueError(f"hybrid macro publication tensor is non-finite: {key}")
         target = destination.get(key)
         if target is None or tuple(target.shape) != tuple(value.shape):
-            if allow_retired and target is None and key.startswith(RETIRED_DECONFOUNDED_SOURCE_PREFIXES):
+            if allow_retired and target is None and key.startswith(retired_prefixes):
                 retired_source.append(key)
                 continue
             unmatched_source.append(key)
