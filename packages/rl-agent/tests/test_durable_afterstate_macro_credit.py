@@ -4157,5 +4157,518 @@ def test_v4_5_hotstart_from_v5_and_v6_toml_and_learner_batch_parity(tmp_path: Pa
         assert m7_b[key] == pytest.approx(m7_s[key], abs=1e-5), key
 
 
+def test_v4_6_durable_v8_neutral_vitals_continuity_and_td_lambda_stability() -> None:
+    from sts2_rl.models.hybrid_actor_critic import initialize_actor_critic_from_macro_publication
+    from sts2_rl.train_macro_credit import _actor_critic_config
+
+    torch.manual_seed(4601)
+    cfg = _tiny_model_config()
+    enc_cfg = cfg.to_encoding_config()
+    encoder = GroundedObservationEncoder(enc_cfg)
+    grounded = cfg.to_model_config()
+
+    # 1. Config validation, round-trip ABI, and v12 b32/b16 TOML wiring
+    with pytest.raises(ValueError, match="enable_balanced_deconfounded_durable_value"):
+        HybridActorCriticConfig(
+            grounded=grounded,
+            enable_durable_value_head=True,
+            enable_persistent_only_durable_value=True,
+            enable_draw_weighted_durable_value=True,
+            enable_deconfounded_durable_value=True,
+            enable_monotone_deconfounded_durable_value=False,
+            enable_balanced_deconfounded_durable_value=True,
+        )
+    with pytest.raises(ValueError, match="enable_partial_afterstate_conditional_mpo"):
+        MacroCreditLearnerConfig(
+            enable_partial_afterstates=False,
+            enable_partial_afterstate_conditional_mpo=True,
+        )
+
+    v8_cfg = HybridActorCriticConfig.durable_v8(grounded)
+    assert v8_cfg.as_mapping()["enable_balanced_deconfounded_durable_value"] is True
+    assert HybridActorCriticConfig.from_mapping(v8_cfg.as_mapping(), fallback_grounded=grounded) == v8_cfg
+
+    exp_dir = Path(__file__).resolve().parents[1] / "config" / "experiments"
+    cfg_b32 = load_macro_training_config(
+        exp_dir / "hybrid_macro_credit_v12_durable_afterstate_v46_b32_g4_turbo.toml"
+    )
+    cfg_b16 = load_macro_training_config(
+        exp_dir / "hybrid_macro_credit_v12_durable_afterstate_v46_b16_g4_turbo.toml"
+    )
+    assert cfg_b32.learner.enable_balanced_deconfounded_durable_value is True
+    assert cfg_b32.learner.enable_partial_afterstate_conditional_mpo is True
+    assert cfg_b32.learner.durable_stage_baseline_weight == pytest.approx(0.0)
+    assert cfg_b32.learner.revival_budget == 32
+    assert cfg_b16.learner.revival_budget == 16
+    assert _actor_critic_config(cfg_b32) == HybridActorCriticConfig.durable_v8(
+        cfg_b32.training.model.to_model_config()
+    )
+
+    # 2. Canonical neutral vitals: in-distribution [3.0, 1.0, 0.0, 2.0] salient, zero vitals/floor leak
+    v8_model = HybridDomainActorCriticModel(v8_cfg).eval()
+    assert float(torch.nn.functional.softplus(v8_model.durable_deck_linear_logit).item()) == pytest.approx(
+        1.0, abs=1e-6
+    )
+
+    obs_a, _ = _rest_surface()
+    obs_a["player"]["hp"] = 12
+    obs_a["player"]["max_hp"] = 70
+    obs_a["player"]["gold"] = 5
+    obs_a["run"] = {"active": True, "act": 1, "floor": 3}
+
+    obs_b, _ = _rest_surface()
+    obs_b["player"]["hp"] = 78
+    obs_b["player"]["max_hp"] = 95
+    obs_b["player"]["gold"] = 420
+    obs_b["run"] = {"active": True, "act": 1, "floor": 15}
+
+    obs_act2 = copy.deepcopy(obs_b)
+    obs_act2["run"]["act"] = 2
+
+    wb_ab, _ = collate_encoded_worlds(
+        (
+            encoder.encode_world_snapshot(obs_a),
+            encoder.encode_world_snapshot(obs_b),
+            encoder.encode_world_snapshot(obs_act2),
+        ),
+        expected_config=enc_cfg,
+        expected_fingerprint=encoder.encode_world_snapshot(obs_a).encoding_fingerprint,
+        device="cpu",
+    )
+    with torch.no_grad():
+        prep_ab = v8_model._prepare_draw_weighted_persistent_world(wb_ab)
+        v_emb, raw_v = v8_model._encode_canonical_neutral_vitals(prep_ab.world)
+        torch.testing.assert_close(
+            raw_v[0, -4:],
+            torch.tensor([3.0, 1.0, 0.0, 2.0]),
+            rtol=0.0,
+            atol=1e-6,
+        )
+        assert float((raw_v[0] - raw_v[1]).abs().max().item()) == 0.0
+        assert float((v_emb[0] - v_emb[1]).abs().max().item()) == 0.0
+        assert float((raw_v[0] - raw_v[2]).abs().max().item()) > 0.1
+
+    # 3. Hot-start card-utility continuity from durable_v6 (w_lin == 1.0, near-zero High-HP Rest shock)
+    v6_parent = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v6(grounded)).eval()
+    with torch.no_grad():
+        assert v6_parent.durable_deck_out is not None
+        torch.nn.init.normal_(v6_parent.durable_deck_out.weight, mean=0.0, std=1.5)
+
+    v8_hot = HybridDomainActorCriticModel(v8_cfg).eval()
+    initialize_actor_critic_from_macro_publication(v8_hot, v6_parent.state_dict())
+
+    rest_obs, rest_legal = _rest_surface()
+    rest_obs["player"]["hp"] = 74
+    rest_obs["player"]["max_hp"] = 80
+    rest_dec = forward_decision(rest_obs, rest_legal, control_domain="macro")
+    assert rest_dec is not None
+    rest_worlds = synthesize_deterministic_afterstates(
+        encoder=encoder,
+        observation=rest_obs,
+        decision=rest_dec,
+    )
+    assert rest_worlds is not None
+    wb_rest, dom_rest = collate_encoded_worlds(
+        rest_worlds,
+        expected_config=enc_cfg,
+        expected_fingerprint=rest_worlds[0].encoding_fingerprint,
+        device="cpu",
+    )
+    rest_idx = next(i for i, c in enumerate(rest_dec.candidates) if c.branch == "rest")
+    smith_indices = [i for i, c in enumerate(rest_dec.candidates) if c.branch == "smith"]
+    with torch.no_grad():
+        q_v6, _ = v6_parent.forward_durable_value(wb_rest, dom_rest)
+        q_v8, _ = v8_hot.forward_durable_value(wb_rest, dom_rest)
+        smith_spread_v6 = float((q_v6[smith_indices].max() - q_v6[smith_indices].min()).item())
+        smith_spread_v8 = float((q_v8[smith_indices].max() - q_v8[smith_indices].min()).item())
+        assert smith_spread_v6 > 0.02
+        # durable_v8 preserves ~100% of parent card-upgrade spread (vs 50% halving under sigmoid(0))
+        assert abs(smith_spread_v8 - smith_spread_v6) / smith_spread_v6 < 0.08
+        # High-HP Rest receives near-zero unlearned HP gate bonus at Update 0
+        w_hp_init = torch.nn.functional.softplus(
+            v8_hot.durable_hp_gate(torch.zeros((1, 11)))
+        ).sum()
+        assert float(w_hp_init.item()) < 0.04
+
+    # 4. Closed-loop TD(lambda=0.95) stability: no second-order integrator drift when R_0 == -3.0
+    v8_td = HybridDomainActorCriticModel(v8_cfg).eval()
+    with torch.no_grad():
+        # Simulate hot-start where durable_value_head already predicts the true return -3.0!
+        v8_td.durable_value_head[-1].bias.fill_(-3.0)
+    rest_enc = encoder.encode(rest_obs, [c.semantic_action for c in rest_dec.candidates])
+    wb_single, dom_single = collate_encoded_worlds(
+        (encoder.encode_world_snapshot(rest_obs),),
+        expected_config=enc_cfg,
+        expected_fingerprint=rest_enc.snapshot.encoding_fingerprint,
+        device="cpu",
+    )
+    opt_td = torch.optim.AdamW(v8_td.parameters(), lr=1e-3)
+    for _ in range(12):
+        with torch.no_grad():
+            v_cur, _ = v8_td.forward_durable_value(wb_single, dom_single)
+            # Bootstrapped TD(lambda=0.95) target on a 2-step trajectory with terminal G = -3.0:
+            # y = 0.05 * (-3.0) + 0.95 * v_cur
+            y_td = 0.05 * (-3.0) + 0.95 * v_cur
+        opt_td.zero_grad(set_to_none=True)
+        v_pred, _ = v8_td.forward_durable_value(wb_single, dom_single)
+        loss_td = torch.nn.functional.smooth_l1_loss(v_pred, y_td)
+        loss_td.backward()
+        opt_td.step()
+    with torch.no_grad():
+        v_final, _ = v8_td.forward_durable_value(wb_single, dom_single)
+    assert abs(float(v_final.item()) - (-3.0)) < 0.05
+
+
+def test_v4_6_partial_afterstate_conditional_mpo_orthogonality_and_batch_parity() -> None:
+    from sts2_rl.joint.afterstate import synthesize_partial_deterministic_afterstates
+
+    torch.manual_seed(4602)
+    cfg = _tiny_model_config()
+    enc_cfg = cfg.to_encoding_config()
+    encoder = GroundedObservationEncoder(enc_cfg)
+    grounded = cfg.to_model_config()
+
+    shop_obs: dict[str, Any] = {
+        "phase": "shop",
+        "decision_domain": "shop",
+        "run": {"active": True, "act": 1, "floor": 7, "ascension": 0},
+        "player": {
+            "character_id": "IRONCLAD",
+            "hp": 62,
+            "max_hp": 80,
+            "gold": 400,
+            "open_potion_slots": 2,
+            "deck": _sample_deck(),
+            "relics": [{"id": "RELIC.BURNING_BLOOD", "has_upon_pickup_effect": False}],
+            "potions": [],
+        },
+        "shop": {
+            "visible": True,
+            "is_open": True,
+            "gold": 400,
+            "items": [
+                {
+                    "index": 0,
+                    "slot_index": 0,
+                    "category": "relic",
+                    "type": "relic",
+                    "cost": 150,
+                    "relic": {"id": "OLD_COIN", "has_upon_pickup_effect": True},
+                },
+                {
+                    "index": 1,
+                    "slot_index": 1,
+                    "category": "relic",
+                    "type": "relic",
+                    "cost": 140,
+                    "relic": {"id": "VAJRA", "has_upon_pickup_effect": False},
+                },
+                {
+                    "index": 2,
+                    "slot_index": 2,
+                    "category": "card_removal",
+                    "type": "card_removal",
+                    "cost": 75,
+                },
+            ],
+        },
+    }
+    shop_actions = [
+        {
+            "action_id": "buy0",
+            "kind": "shop_purchase",
+            "model_action_kind": "shop",
+            "is_enabled": True,
+            "item": shop_obs["shop"]["items"][0],
+        },
+        {
+            "action_id": "buy1",
+            "kind": "shop_purchase",
+            "model_action_kind": "shop",
+            "is_enabled": True,
+            "item": shop_obs["shop"]["items"][1],
+        },
+        {
+            "action_id": "rem2",
+            "kind": "shop_purchase",
+            "model_action_kind": "shop",
+            "is_enabled": True,
+            "item": shop_obs["shop"]["items"][2],
+        },
+        {
+            "action_id": "leave",
+            "kind": "shop_leave",
+            "model_action_kind": "shop",
+            "is_enabled": True,
+        },
+    ]
+    shop_dec = forward_decision(shop_obs, shop_actions, control_domain="macro")
+    assert shop_dec is not None and shop_dec.surface == "shop"
+    shop_enc = encoder.encode(shop_obs, [c.semantic_action for c in shop_dec.candidates])
+    grouped_cands = tuple(shop_dec.candidates[ref.representative_position] for ref in shop_enc.actions)
+    shop_part = synthesize_partial_deterministic_afterstates(
+        encoder=encoder,
+        observation=shop_obs,
+        decision=shop_dec,
+        candidates=grouped_cands,
+    )
+    assert shop_part is not None
+    det_idx, shop_post_worlds = shop_part
+    # OLD_COIN (has_upon_pickup_effect=True) is NOT in det_idx, while VAJRA + removes + leave ARE!
+    assert len(det_idx) == len(grouped_cands) - 1 and len(det_idx) >= 3
+    non_det_idx = next(i for i in range(len(grouped_cands)) if i not in det_idx)
+
+    # 1. Exact logit-gradient orthogonality of conditional MPO inside D:
+    #    d/dz_{j not in D} == 0 AND sum_{i in D} d/dz_i == 0
+    raw_z = torch.linspace(-0.3, 0.5, steps=len(grouped_cands), dtype=torch.float64, requires_grad=True)
+    t_lp = torch.log_softmax(raw_z.detach(), dim=0)
+    branch_ids = torch.tensor(
+        shop_enc.snapshot.candidates.ids[: len(grouped_cands), 13], dtype=torch.long
+    )
+    q_det = torch.linspace(1.20, -0.40, steps=len(det_idx), dtype=torch.float64)
+    from sts2_rl.joint.macro_targets import project_hierarchical_macro_policy
+
+    proj = project_hierarchical_macro_policy(
+        det_action_values=q_det,
+        teacher_log_probs=t_lp,
+        policy_branch_ids=branch_ids,
+        deterministic_indices=det_idx,
+        branch_max_kl=0.03,
+        within_max_kl=0.04,
+        min_temperature=0.008,
+    )
+    assert proj.actor_enabled is True
+    det_t = torch.tensor(det_idx, dtype=torch.long)
+    logs_full = torch.log_softmax(raw_z, dim=0)
+    cond_logs = torch.log_softmax(logs_full[det_t], dim=0)
+    loss_orth = -(proj.target_probabilities[det_t] * cond_logs).sum()
+    for c_tuple, w_star in proj.within_branch_targets:
+        c_t = torch.tensor(c_tuple, dtype=torch.long)
+        loss_orth = loss_orth - 0.5 * (w_star * torch.log_softmax(logs_full[c_t], dim=0)).sum()
+    loss_orth.backward()
+    assert raw_z.grad is not None
+    assert abs(float(raw_z.grad[non_det_idx].item())) < 1e-12
+    assert abs(float(raw_z.grad[det_t].sum().item())) < 1e-12
+
+    # 2. Full learner batched vs sequential parity on durable_v8 when chosen_action == non_det_idx!
+    v8_init = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v8(grounded)).eval()
+    with torch.no_grad():
+        for mod in (
+            v8_init.durable_value_head,
+            v8_init.durable_deck_out,
+            v8_init.durable_stage_baseline_head,
+            v8_init.durable_hp_gate,
+            v8_init.durable_liquid_gate,
+            v8_init.durable_cycle_gate,
+            v8_init.durable_deck_tilted_out,
+        ):
+            assert mod is not None
+            for p in mod.parameters():
+                p.add_(0.12 * torch.randn_like(p))
+
+    combat_obs = {
+        "phase": "combat",
+        "decision_domain": "combat",
+        "run": {"active": True, "act": 1, "floor": 8},
+        "player": {"id": "ironclad", "side": "player", "hp": 62, "max_hp": 80, "energy": 3, "hand": [{"id": "strike", "cost": 1}]},
+        "combat": {"in_progress": True, "enemies": [{"id": "cultist", "side": "enemy", "hp": 40, "max_hp": 48}]},
+    }
+    combat_actions = [
+        {"action_handle": "c0", "kind": "play_card", "model_action_kind": "play_card", "is_enabled": True, "card": {"id": "strike", "cost": 1}},
+        {"action_handle": "c1", "kind": "end_turn", "model_action_kind": "end_turn", "is_enabled": True},
+    ]
+    combat_snap = encoder.encode(combat_obs, combat_actions).snapshot
+    rev0 = torch.zeros((1, 6), dtype=torch.float32)
+
+    shop_node = MacroAfterstateNode(
+        step_index=0,
+        surface="shop",
+        candidate_branches=tuple(grouped_cands[i].branch for i in det_idx),
+        post_worlds=shop_post_worlds,
+        candidate_indices=det_idx,
+        is_partial=True,
+    )
+    trajs: list[MacroCreditTrajectory] = []
+    chosen_actions = [non_det_idx, det_idx[0]]
+    with torch.no_grad():
+        for ep_i, chosen_act in enumerate(chosen_actions):
+            b0 = collate_encoded_snapshots(
+                (shop_enc.snapshot,),
+                expected_config=enc_cfg,
+                expected_fingerprint=shop_enc.snapshot.encoding_fingerprint,
+                device="cpu",
+            )
+            out0 = v8_init(b0, None, critic_revival_context=rev0, validate=False)
+            m0 = torch.tensor(shop_enc.snapshot.action_mask.tolist(), dtype=torch.bool)
+            tl0 = torch.log_softmax(out0.policy_logits[0, : m0.numel()].masked_fill(~m0, -torch.inf), dim=0)
+            pr0 = macro_mixture_log_probs(tl0, shop_enc.snapshot, 0.04)
+
+            b1 = collate_encoded_snapshots(
+                (combat_snap,),
+                expected_config=enc_cfg,
+                expected_fingerprint=combat_snap.encoding_fingerprint,
+                device="cpu",
+            )
+            out1 = v8_init(b1, out0.recurrent_state, critic_revival_context=rev0, validate=False)
+            m1 = torch.tensor(combat_snap.action_mask.tolist(), dtype=torch.bool)
+            lp1 = torch.log_softmax(out1.policy_logits[0, : m1.numel()].masked_fill(~m1, -torch.inf), dim=0)
+
+            s0 = HybridVTraceStep(
+                shop_enc.snapshot,
+                chosen_act,
+                float(pr0[chosen_act].item()),
+                0.0,
+                1.0,
+                False,
+                "shop",
+                grouped_cands[chosen_act].branch,
+                "macro",
+                0,
+            )
+            f0 = MacroRewardFacts(0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 7, 7, 1)
+            s1 = HybridVTraceStep(
+                combat_snap,
+                0,
+                float(lp1[0].item()),
+                -0.3 + 0.8 * ep_i,
+                0.0,
+                True,
+                "combat",
+                "play_card",
+                "combat",
+                0,
+            )
+            f1 = MacroRewardFacts(-0.3 + 0.8 * ep_i, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 8, 8, 1)
+            trajs.append(
+                MacroCreditTrajectory(
+                    f"v46-{ep_i}",
+                    6_700_460 + 2 * ep_i,
+                    0,
+                    (),
+                    (s0, s1),
+                    None,
+                    None,
+                    "factual_terminal",
+                    (f0, f1),
+                    macro_branch_epsilon=0.04,
+                    afterstate_nodes=(shop_node,),
+                )
+            )
+
+    # First verify that on a pure unvisited-partial cohort (ep 0 only: chosen_act == non_det_idx),
+    # enable_partial_afterstate_conditional_mpo=True activates MPO (> 0) whereas False leaves MPO == 0!
+    unvisited_only_cohort = MacroCreditCohort("v46-unvisited", 0, (), natural_only=(trajs[0],))
+    base_v8_lcfg = dict(
+        target_mode="durable_afterstate_v2",
+        enable_direct_vitals_context=True,
+        enable_macro_branch_prior=True,
+        enable_persistent_only_durable_value=True,
+        enable_asymmetric_revival_critic=True,
+        enable_draw_weighted_durable_value=True,
+        enable_role_conditioned_candidate_policy=True,
+        enable_deconfounded_durable_value=True,
+        enable_monotone_deconfounded_durable_value=True,
+        enable_balanced_deconfounded_durable_value=True,
+        enable_partial_afterstates=True,
+        enable_manual_confirm_selection_afterstates=True,
+        durable_stage_baseline_weight=0.0,
+        enable_hierarchical_afterstate_mpo=True,
+        macro_mpo_min_temperature=0.008,
+        macro_within_branch_kl=0.04,
+        macro_within_branch_mpo_weight=0.50,
+        revival_budget=32,
+        zero_macro_pace_penalty=True,
+        clip_macro_pg_fallback=True,
+        macro_pg_within_branch_entropy_only=True,
+        separate_value_grad_clip=True,
+        durable_warmup_updates=0,
+        combat_actor_warmup_updates=0,
+    )
+    m_off = MacroCreditLearner(
+        model=copy.deepcopy(v8_init),
+        config=MacroCreditLearnerConfig(
+            **base_v8_lcfg,  # type: ignore[arg-type]
+            enable_partial_afterstate_conditional_mpo=False,
+            eval_batch_size=8,
+            chunk_batch_size=8,
+        ),
+    ).learn(unvisited_only_cohort)
+    m_on_batch = MacroCreditLearner(
+        model=copy.deepcopy(v8_init),
+        config=MacroCreditLearnerConfig(
+            **base_v8_lcfg,  # type: ignore[arg-type]
+            enable_partial_afterstate_conditional_mpo=True,
+            eval_batch_size=8,
+            chunk_batch_size=8,
+        ),
+    ).learn(unvisited_only_cohort)
+    m_on_seq = MacroCreditLearner(
+        model=copy.deepcopy(v8_init),
+        config=MacroCreditLearnerConfig(
+            **base_v8_lcfg,  # type: ignore[arg-type]
+            enable_partial_afterstate_conditional_mpo=True,
+            eval_batch_size=1,
+            chunk_batch_size=1,
+        ),
+    ).learn(unvisited_only_cohort)
+    assert m_off["macro_mpo_policy_loss"] == 0.0
+    assert m_off["partial_afterstate_cond_mpo_steps"] == 0
+    assert m_on_batch["macro_mpo_policy_loss"] > 0.0
+    assert m_on_batch["partial_afterstate_cond_mpo_steps"] == 1
+    assert m_on_batch["afterstate_steps"] == 0
+    assert m_on_batch["durable_post_value_loss"] == 0.0
+    for key in (
+        "durable_value_loss",
+        "durable_post_value_loss",
+        "durable_stage_baseline_loss",
+        "macro_policy_loss",
+        "macro_mpo_policy_loss",
+        "macro_mpo_within_policy_loss",
+        "macro_pg_policy_loss",
+        "macro_loss",
+        "gradient_norm",
+        "parameter_delta_norm",
+    ):
+        assert m_on_batch[key] == pytest.approx(m_on_seq[key], abs=1e-5), key
+
+    # Mixed cohort (both unvisited-D and visited-D partial afterstates): exact batch-vs-sequential parity
+    mixed_cohort = MacroCreditCohort("v46-mixed", 0, (), natural_only=tuple(trajs))
+    m8_b = MacroCreditLearner(
+        model=copy.deepcopy(v8_init),
+        config=MacroCreditLearnerConfig(
+            **base_v8_lcfg,  # type: ignore[arg-type]
+            enable_partial_afterstate_conditional_mpo=True,
+            eval_batch_size=8,
+            chunk_batch_size=8,
+        ),
+    ).learn(mixed_cohort)
+    m8_s = MacroCreditLearner(
+        model=copy.deepcopy(v8_init),
+        config=MacroCreditLearnerConfig(
+            **base_v8_lcfg,  # type: ignore[arg-type]
+            enable_partial_afterstate_conditional_mpo=True,
+            eval_batch_size=1,
+            chunk_batch_size=1,
+        ),
+    ).learn(mixed_cohort)
+    assert m8_b["afterstate_steps"] == 1
+    assert m8_b["partial_afterstate_cond_mpo_steps"] == 1
+    assert m8_b["enabled_afterstate_projections"] == 2
+    for key in (
+        "durable_value_loss",
+        "durable_post_value_loss",
+        "durable_stage_baseline_loss",
+        "macro_policy_loss",
+        "macro_mpo_policy_loss",
+        "macro_mpo_within_policy_loss",
+        "macro_pg_policy_loss",
+        "macro_loss",
+        "gradient_norm",
+        "parameter_delta_norm",
+    ):
+        assert m8_b[key] == pytest.approx(m8_s[key], abs=1e-5), key
+
+
+
 
 

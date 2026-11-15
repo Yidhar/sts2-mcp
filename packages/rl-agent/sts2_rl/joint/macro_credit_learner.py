@@ -84,7 +84,9 @@ class MacroCreditLearnerConfig:
     enable_role_conditioned_candidate_policy: bool = False
     enable_deconfounded_durable_value: bool = False
     enable_monotone_deconfounded_durable_value: bool = False
+    enable_balanced_deconfounded_durable_value: bool = False
     enable_partial_afterstates: bool = False
+    enable_partial_afterstate_conditional_mpo: bool = False
     enable_manual_confirm_selection_afterstates: bool = False
     durable_stage_baseline_weight: float = 0.5
     enable_hierarchical_afterstate_mpo: bool = False
@@ -111,7 +113,9 @@ class MacroCreditLearnerConfig:
             "enable_role_conditioned_candidate_policy",
             "enable_deconfounded_durable_value",
             "enable_monotone_deconfounded_durable_value",
+            "enable_balanced_deconfounded_durable_value",
             "enable_partial_afterstates",
+            "enable_partial_afterstate_conditional_mpo",
             "enable_manual_confirm_selection_afterstates",
             "enable_hierarchical_afterstate_mpo",
             "zero_macro_pace_penalty",
@@ -134,6 +138,20 @@ class MacroCreditLearnerConfig:
         ):
             raise ValueError(
                 "macro credit enable_monotone_deconfounded_durable_value requires enable_deconfounded_durable_value=True"
+            )
+        if (
+            self.enable_balanced_deconfounded_durable_value
+            and not self.enable_monotone_deconfounded_durable_value
+        ):
+            raise ValueError(
+                "macro credit enable_balanced_deconfounded_durable_value requires enable_monotone_deconfounded_durable_value=True"
+            )
+        if (
+            self.enable_partial_afterstate_conditional_mpo
+            and not self.enable_partial_afterstates
+        ):
+            raise ValueError(
+                "macro credit enable_partial_afterstate_conditional_mpo requires enable_partial_afterstates=True"
             )
         if self.target_mode not in {"counterfactual_rollout", "combat_shadow_price", "durable_afterstate_v2"}:
             raise ValueError(
@@ -195,6 +213,7 @@ class _AfterstateStepTarget:
     action_values: Tensor
     projection: MacroPolicyProjection
     post_target: Tensor
+    has_chosen_post: bool = True
 
 
 @dataclass(slots=True)
@@ -378,7 +397,17 @@ class MacroCreditLearner:
         self._parameters = [p for p in model.parameters() if p.requires_grad]
         if not self._parameters:
             raise ValueError("macro learner requires a non-empty, trainable actor-critic model")
-        value_prefixes = (
+        isolate_stage_clip = bool(
+            (
+                self.config.enable_balanced_deconfounded_durable_value
+                or (
+                    isinstance(model, HybridDomainActorCriticModel)
+                    and model.actor_critic_config.enable_balanced_deconfounded_durable_value
+                )
+            )
+            and self.config.durable_stage_baseline_weight > 0.0
+        )
+        base_value_prefixes = (
             "state_value_head",
             "state_revival_",
             "durable_cycle_",
@@ -386,16 +415,32 @@ class MacroCreditLearner:
             "durable_hp_",
             "durable_liquid_",
             "durable_progress_vitals_",
-            "durable_stage_",
             "durable_value_head",
             "durable_vitals_",
             "durable_revival_",
+        )
+        value_prefixes = (
+            base_value_prefixes
+            if isolate_stage_clip
+            else (*base_value_prefixes, "durable_stage_")
+        )
+        all_value_or_stage_prefixes = (*base_value_prefixes, "durable_stage_")
+        self._stage_baseline_parameters = (
+            [
+                p
+                for name, p in model.named_parameters()
+                if p.requires_grad and name.startswith("durable_stage_")
+            ]
+            if isolate_stage_clip
+            else []
         )
         self._value_head_parameters = [
             p for name, p in model.named_parameters() if p.requires_grad and name.startswith(value_prefixes)
         ]
         self._non_value_parameters = [
-            p for name, p in model.named_parameters() if p.requires_grad and not name.startswith(value_prefixes)
+            p
+            for name, p in model.named_parameters()
+            if p.requires_grad and not name.startswith(all_value_or_stage_prefixes)
         ]
         if any("candidate_q_head" in name or "target_q" in name for name, _ in model.named_parameters()):
             raise ValueError("macro learner must not own a learned Q head")
@@ -607,11 +652,13 @@ class MacroCreditLearner:
         hidden: Tensor | None = None
         calls = 0
         is_durable_v2 = self.config.target_mode == "durable_afterstate_v2"
+        include_unvisited_partial = bool(self.config.enable_partial_afterstate_conditional_mpo)
         afterstate_indices = (
             {
                 node.step_index
                 for node in trajectory.afterstate_nodes
-                if node.post_world_for_action(trajectory.steps[node.step_index].action_index) is not None
+                if include_unvisited_partial
+                or node.post_world_for_action(trajectory.steps[node.step_index].action_index) is not None
             }
             if is_durable_v2
             else set()
@@ -783,11 +830,13 @@ class MacroCreditLearner:
                     hidden[i] = next_h[0].detach()
                     has_hidden[i] = True
                     calls[i] += 1
+            include_unvisited_partial = bool(self.config.enable_partial_afterstate_conditional_mpo)
             afterstate_sets = [
                 {
                     node.step_index
                     for node in traj.afterstate_nodes
-                    if node.post_world_for_action(traj.steps[node.step_index].action_index) is not None
+                    if include_unvisited_partial
+                    or node.post_world_for_action(traj.steps[node.step_index].action_index) is not None
                 }
                 for traj in group
             ]
@@ -1053,10 +1102,15 @@ class MacroCreditLearner:
         node_slices: list[tuple[int, MacroAfterstateNode, int, int]] = []
         total_calls = sum(ev.forward_calls for ev in evaluations)
         max_error = max((ev.maximum_likelihood_error for ev in evaluations), default=0.0)
+        include_unvisited_partial = bool(self.config.enable_partial_afterstate_conditional_mpo)
         for ref_idx, (reference, evaluation) in enumerate(zip(references, evaluations, strict=True)):
             assert evaluation.post_step_hidden is not None
             for node in reference.afterstate_nodes:
-                if node.post_world_for_action(reference.steps[node.step_index].action_index) is None:
+                has_chosen_post = (
+                    node.post_world_for_action(reference.steps[node.step_index].action_index)
+                    is not None
+                )
+                if not has_chosen_post and not include_unvisited_partial:
                     continue
                 start_w = len(flat_worlds)
                 w_count = len(node.post_worlds)
@@ -1151,7 +1205,8 @@ class MacroCreditLearner:
                     teacher_logs=teacher_logs,
                     effective_macro_kl=effective_macro_kl,
                 )
-                if step.terminal:
+                has_chosen_post = node.post_world_for_action(step.action_index) is not None
+                if not has_chosen_post or step.terminal:
                     post_target = durable_action_targets.new_zeros(())
                 else:
                     eff_r = self._effective_step_reward(reference, node.step_index)
@@ -1163,6 +1218,7 @@ class MacroCreditLearner:
                     action_values=q_after.detach(),
                     projection=projection,
                     post_target=post_target,
+                    has_chosen_post=has_chosen_post,
                 )
             prepared_out.append(
                 _PreparedReference(
@@ -1221,9 +1277,11 @@ class MacroCreditLearner:
         )
         afterstate_targets: dict[int, _AfterstateStepTarget] = {}
         calls = evaluation.forward_calls
+        include_unvisited_partial = bool(self.config.enable_partial_afterstate_conditional_mpo)
         for node in reference.afterstate_nodes:
             step = reference.steps[node.step_index]
-            if node.post_world_for_action(step.action_index) is None:
+            has_chosen_post = node.post_world_for_action(step.action_index) is not None
+            if not has_chosen_post and not include_unvisited_partial:
                 continue
             saved_hidden = evaluation.post_step_hidden[node.step_index].to(device=self.device, dtype=self.dtype)
             post_rev_gpu = (
@@ -1251,7 +1309,7 @@ class MacroCreditLearner:
                 teacher_logs=teacher_logs,
                 effective_macro_kl=effective_macro_kl,
             )
-            if step.terminal:
+            if not has_chosen_post or step.terminal:
                 post_target = durable_action_targets.new_zeros(())
             else:
                 eff_r = self._effective_step_reward(reference, node.step_index)
@@ -1261,6 +1319,7 @@ class MacroCreditLearner:
                 action_values=q_after.detach(),
                 projection=projection,
                 post_target=post_target,
+                has_chosen_post=has_chosen_post,
             )
         return (
             _PreparedReference(
@@ -1453,18 +1512,27 @@ class MacroCreditLearner:
                         terms.append(0.5 * cfg.macro_value_weight * durable_loss)
                     if has_stage_base:
                         step_w_batch, _ = collate_encoded_worlds(
-                            (step.snapshot,),
+                            (cast(EncodedWorldSnapshot, step.snapshot),),
                             expected_config=step.snapshot.config,
                             expected_fingerprint=step.snapshot.encoding_fingerprint,
                             device=self.device,
                             validate=False,
                         )
-                        stage_val = cast(
-                            HybridDomainActorCriticModel, self.model
-                        ).forward_durable_stage_baseline(
-                            step_w_batch,
-                            critic_revival_context=step_rev_gpu,
-                        )[0]
+                        if cfg.durable_stage_baseline_weight:
+                            stage_val = cast(
+                                HybridDomainActorCriticModel, self.model
+                            ).forward_durable_stage_baseline(
+                                step_w_batch,
+                                critic_revival_context=step_rev_gpu,
+                            )[0]
+                        else:
+                            with torch.no_grad():
+                                stage_val = cast(
+                                    HybridDomainActorCriticModel, self.model
+                                ).forward_durable_stage_baseline(
+                                    step_w_batch,
+                                    critic_revival_context=step_rev_gpu,
+                                )[0]
                         stage_loss = F.smooth_l1_loss(stage_val, durable_target) / max(
                             1, denominators["durable_value_steps"]
                         )
@@ -1480,7 +1548,7 @@ class MacroCreditLearner:
                 if is_durable_v2:
                     assert prepared.afterstate_targets is not None
                     as_target = prepared.afterstate_targets.get(index)
-                    if as_target is not None:
+                    if as_target is not None and as_target.has_chosen_post:
                         chosen_world = as_target.node.post_world_for_action(step.action_index)
                         assert chosen_world is not None
                         post_rev_gpu = (
@@ -1510,12 +1578,21 @@ class MacroCreditLearner:
                                 device=self.device,
                                 validate=False,
                             )
-                            post_stage_val = cast(
-                                HybridDomainActorCriticModel, self.model
-                            ).forward_durable_stage_baseline(
-                                post_w_batch,
-                                critic_revival_context=post_rev_gpu,
-                            )[0]
+                            if cfg.durable_stage_baseline_weight:
+                                post_stage_val = cast(
+                                    HybridDomainActorCriticModel, self.model
+                                ).forward_durable_stage_baseline(
+                                    post_w_batch,
+                                    critic_revival_context=post_rev_gpu,
+                                )[0]
+                            else:
+                                with torch.no_grad():
+                                    post_stage_val = cast(
+                                        HybridDomainActorCriticModel, self.model
+                                    ).forward_durable_stage_baseline(
+                                        post_w_batch,
+                                        critic_revival_context=post_rev_gpu,
+                                    )[0]
                             post_stage_loss = F.smooth_l1_loss(post_stage_val, post_target) / max(
                                 1, denominators["afterstate_steps"]
                             )
@@ -1563,62 +1640,108 @@ class MacroCreditLearner:
                                 totals["macro_mpo_policy_loss"] += float(actor.detach().item())
                                 if cfg.macro_policy_weight:
                                     terms.append(0.5 * cfg.macro_policy_weight * actor)
-                    elif choice and durable_actor_active:
-                        assert prepared.durable_macro_advantages is not None
-                        macro_adv = prepared.durable_macro_advantages[index].to(
-                            device=self.device, dtype=logs.dtype
-                        )
-                        if cfg.clip_macro_pg_fallback:
-                            assert prepared.evaluation.step_log_probs is not None
-                            t_logs = prepared.evaluation.step_log_probs[index].to(
+                    else:
+                        if as_target is not None and durable_actor_active and as_target.projection.actor_enabled:
+                            denom_m_pol = max(1, denominators["macro_policy_steps"])
+                            cond_mpo_terms: list[Tensor] = []
+                            if not torch.equal(
+                                as_target.projection.target_probabilities,
+                                as_target.projection.teacher_probabilities,
+                            ):
+                                det_idx_gpu = torch.tensor(
+                                    as_target.node.resolved_candidate_indices,
+                                    device=self.device,
+                                    dtype=torch.long,
+                                )
+                                target_det = as_target.projection.target_probabilities.to(
+                                    device=self.device, dtype=logs.dtype
+                                )[det_idx_gpu]
+                                cond_det_logs = torch.log_softmax(logs[det_idx_gpu], dim=0)
+                                safe_cond_det_logs = cond_det_logs.masked_fill(
+                                    ~torch.isfinite(cond_det_logs), 0.0
+                                )
+                                cond_joint_ce = -(target_det * safe_cond_det_logs).sum() / denom_m_pol
+                                cond_mpo_terms.append(cond_joint_ce)
+                            if (
+                                cfg.macro_within_branch_mpo_weight > 0.0
+                                and as_target.projection.within_branch_targets
+                            ):
+                                within_terms = []
+                                for cand_idx_tuple, w_star_cpu in as_target.projection.within_branch_targets:
+                                    idx_gpu = torch.tensor(cand_idx_tuple, device=self.device, dtype=torch.long)
+                                    cond_logs = torch.log_softmax(logs[idx_gpu], dim=0)
+                                    safe_cond_logs = cond_logs.masked_fill(~torch.isfinite(cond_logs), 0.0)
+                                    w_star_gpu = w_star_cpu.to(device=self.device, dtype=logs.dtype)
+                                    within_terms.append(-(w_star_gpu * safe_cond_logs).sum())
+                                within_ce = (
+                                    cfg.macro_within_branch_mpo_weight
+                                    * torch.stack(within_terms).mean()
+                                    / denom_m_pol
+                                )
+                                totals["macro_mpo_within_policy_loss"] += float(within_ce.detach().item())
+                                cond_mpo_terms.append(within_ce)
+                            if cond_mpo_terms:
+                                cond_actor = torch.stack(cond_mpo_terms).sum()
+                                totals["macro_policy_loss"] += float(cond_actor.detach().item())
+                                totals["macro_mpo_policy_loss"] += float(cond_actor.detach().item())
+                                if cfg.macro_policy_weight:
+                                    terms.append(0.5 * cfg.macro_policy_weight * cond_actor)
+                        if choice and durable_actor_active:
+                            assert prepared.durable_macro_advantages is not None
+                            macro_adv = prepared.durable_macro_advantages[index].to(
                                 device=self.device, dtype=logs.dtype
                             )
-                            valid_t = torch.isfinite(t_logs)
-                            safe_t_logs = t_logs.masked_fill(~valid_t, 0.0)
-                            safe_cur_logs = logs[: t_logs.numel()].masked_fill(~valid_t, 0.0)
-                            t_probs = t_logs.exp().masked_fill(~valid_t, 0.0)
-                            ratio = torch.exp(
-                                (logs[step.action_index] - t_logs[step.action_index]).clamp(-10.0, 10.0)
-                            )
-                            clipped_ratio = ratio.clamp(
-                                1.0 - cfg.macro_pg_clip_eps, 1.0 + cfg.macro_pg_clip_eps
-                            )
-                            surr = torch.minimum(ratio * macro_adv, clipped_ratio * macro_adv)
-                            kl_pen = (t_probs * (safe_t_logs - safe_cur_logs)).sum()
-                            actor = (-surr + cfg.macro_pg_kl_weight * kl_pen) / max(
-                                1, denominators["macro_policy_steps"]
-                            )
-                        else:
-                            actor = -logs[step.action_index] * macro_adv / max(
-                                1, denominators["macro_policy_steps"]
-                            )
-                        if cfg.enable_macro_branch_prior:
-                            step_mask = torch.tensor(
-                                step.snapshot.action_mask,
-                                device=logs.device,
-                                dtype=torch.bool,
-                            )
-                            step_branches = torch.tensor(
-                                step.snapshot.candidates.ids[: step_mask.numel(), 13],
-                                device=logs.device,
-                                dtype=torch.long,
-                            )
-                            macro_step_entropy = hierarchical_macro_entropy(
-                                logs[: step_mask.numel()].masked_fill(~step_mask, 0.0).unsqueeze(0),
-                                step_mask.unsqueeze(0),
-                                step_branches.unsqueeze(0),
-                                include_branch_entropy=not cfg.macro_pg_within_branch_entropy_only,
-                            )[0]
-                        else:
-                            macro_step_entropy = entropy
-                        norm_macro_entropy = macro_step_entropy / max(1, denominators["macro_policy_steps"])
-                        totals["macro_policy_loss"] += float(actor.detach().item())
-                        totals["macro_pg_policy_loss"] += float(actor.detach().item())
-                        totals["macro_entropy"] += float(norm_macro_entropy.detach().item())
-                        if cfg.macro_policy_weight:
-                            terms.append(0.5 * cfg.macro_policy_weight * actor)
-                        if cfg.macro_entropy_weight:
-                            terms.append(-0.5 * cfg.macro_entropy_weight * norm_macro_entropy)
+                            if cfg.clip_macro_pg_fallback:
+                                assert prepared.evaluation.step_log_probs is not None
+                                t_logs = prepared.evaluation.step_log_probs[index].to(
+                                    device=self.device, dtype=logs.dtype
+                                )
+                                valid_t = torch.isfinite(t_logs)
+                                safe_t_logs = t_logs.masked_fill(~valid_t, 0.0)
+                                safe_cur_logs = logs[: t_logs.numel()].masked_fill(~valid_t, 0.0)
+                                t_probs = t_logs.exp().masked_fill(~valid_t, 0.0)
+                                ratio = torch.exp(
+                                    (logs[step.action_index] - t_logs[step.action_index]).clamp(-10.0, 10.0)
+                                )
+                                clipped_ratio = ratio.clamp(
+                                    1.0 - cfg.macro_pg_clip_eps, 1.0 + cfg.macro_pg_clip_eps
+                                )
+                                surr = torch.minimum(ratio * macro_adv, clipped_ratio * macro_adv)
+                                kl_pen = (t_probs * (safe_t_logs - safe_cur_logs)).sum()
+                                actor = (-surr + cfg.macro_pg_kl_weight * kl_pen) / max(
+                                    1, denominators["macro_policy_steps"]
+                                )
+                            else:
+                                actor = -logs[step.action_index] * macro_adv / max(
+                                    1, denominators["macro_policy_steps"]
+                                )
+                            if cfg.enable_macro_branch_prior:
+                                step_mask = torch.tensor(
+                                    step.snapshot.action_mask,
+                                    device=logs.device,
+                                    dtype=torch.bool,
+                                )
+                                step_branches = torch.tensor(
+                                    step.snapshot.candidates.ids[: step_mask.numel(), 13],
+                                    device=logs.device,
+                                    dtype=torch.long,
+                                )
+                                macro_step_entropy = hierarchical_macro_entropy(
+                                    logs[: step_mask.numel()].masked_fill(~step_mask, 0.0).unsqueeze(0),
+                                    step_mask.unsqueeze(0),
+                                    step_branches.unsqueeze(0),
+                                    include_branch_entropy=not cfg.macro_pg_within_branch_entropy_only,
+                                )[0]
+                            else:
+                                macro_step_entropy = entropy
+                            norm_macro_entropy = macro_step_entropy / max(1, denominators["macro_policy_steps"])
+                            totals["macro_policy_loss"] += float(actor.detach().item())
+                            totals["macro_pg_policy_loss"] += float(actor.detach().item())
+                            totals["macro_entropy"] += float(norm_macro_entropy.detach().item())
+                            if cfg.macro_policy_weight:
+                                terms.append(0.5 * cfg.macro_policy_weight * actor)
+                            if cfg.macro_entropy_weight:
+                                terms.append(-0.5 * cfg.macro_entropy_weight * norm_macro_entropy)
                 elif (prepared.root is not None and prepared.projection is not None
                         and index == prepared.root.root_step_index and prepared.projection.actor_enabled):
                     target_policy = prepared.projection.target_probabilities.to(device=self.device, dtype=logs.dtype)
@@ -1698,6 +1821,7 @@ class MacroCreditLearner:
                     _AfterstateStepTarget,
                     Tensor,
                     Tensor | None,
+                    tuple[Tensor, Tensor] | None,
                     tuple[tuple[Tensor, Tensor], ...],
                     Tensor | None,
                 ],
@@ -1713,6 +1837,7 @@ class MacroCreditLearner:
                     _AfterstateStepTarget,
                     Tensor,
                     Tensor | None,
+                    tuple[Tensor, Tensor] | None,
                     tuple[tuple[Tensor, Tensor], ...],
                     Tensor | None,
                 ],
@@ -1724,14 +1849,29 @@ class MacroCreditLearner:
                     if item.post_revival_ctx is None
                     else item.post_revival_ctx[step_idx].to(device=self.device, dtype=self.dtype)
                 )
-                joint_prob_item = (
-                    None
-                    if torch.equal(
-                        as_t.projection.target_probabilities,
-                        as_t.projection.teacher_probabilities,
-                    )
-                    else as_t.projection.target_probabilities.to(device=self.device, dtype=self.dtype)
+                probs_differ = not torch.equal(
+                    as_t.projection.target_probabilities,
+                    as_t.projection.teacher_probabilities,
                 )
+                joint_prob_item = (
+                    as_t.projection.target_probabilities.to(device=self.device, dtype=self.dtype)
+                    if (as_t.has_chosen_post and probs_differ)
+                    else None
+                )
+                if (not as_t.has_chosen_post) and probs_differ:
+                    det_idx_item = torch.tensor(
+                        as_t.node.resolved_candidate_indices,
+                        device=self.device,
+                        dtype=torch.long,
+                    )
+                    cond_det_item: tuple[Tensor, Tensor] | None = (
+                        det_idx_item,
+                        as_t.projection.target_probabilities.to(
+                            device=self.device, dtype=self.dtype
+                        )[det_idx_item],
+                    )
+                else:
+                    cond_det_item = None
                 within_items = (
                     tuple(
                         (
@@ -1747,6 +1887,7 @@ class MacroCreditLearner:
                     as_t,
                     as_t.post_target.to(device=self.device, dtype=self.dtype),
                     joint_prob_item,
+                    cond_det_item,
                     within_items,
                     post_rev_item,
                 )
@@ -1759,11 +1900,12 @@ class MacroCreditLearner:
                 has_dur = is_mac or is_c_entry
                 is_ch = bool(int(s.snapshot.action_mask.sum()) > 1)
                 as_entry = as_map.get(idx)
-                has_as = as_entry is not None
+                has_as = as_entry is not None and as_entry[0].has_chosen_post
                 if is_mac:
                     contrib = bool(cfg.macro_value_weight) or has_stage_w
-                    if as_entry is not None:
-                        has_active_mpo = (as_entry[2] is not None) or bool(as_entry[3])
+                    if has_as:
+                        assert as_entry is not None
+                        has_active_mpo = (as_entry[2] is not None) or bool(as_entry[4])
                         contrib = (
                             contrib
                             or bool(cfg.durable_post_value_weight)
@@ -1775,8 +1917,17 @@ class MacroCreditLearner:
                                 and bool(cfg.macro_policy_weight)
                             )
                         )
-                    elif is_ch and durable_actor_active:
-                        contrib = contrib or bool(cfg.macro_policy_weight) or bool(cfg.macro_entropy_weight)
+                    else:
+                        if as_entry is not None:
+                            has_active_cond_mpo = (as_entry[3] is not None) or bool(as_entry[4])
+                            contrib = contrib or (
+                                durable_actor_active
+                                and as_entry[0].projection.actor_enabled
+                                and has_active_cond_mpo
+                                and bool(cfg.macro_policy_weight)
+                            )
+                        if is_ch and durable_actor_active:
+                            contrib = contrib or bool(cfg.macro_policy_weight) or bool(cfg.macro_entropy_weight)
                 else:
                     contrib = (
                         (is_c_entry and (bool(cfg.macro_value_weight) or has_stage_w))
@@ -2011,10 +2162,17 @@ class MacroCreditLearner:
                     if cfg.macro_value_weight:
                         batch_terms.append(0.5 * cfg.macro_value_weight * durable_loss)
                     if has_stage_base:
-                        stage_vals = ac_model.forward_durable_stage_baseline(
-                            dur_world_batch,
-                            critic_revival_context=dur_rev,
-                        )
+                        if cfg.durable_stage_baseline_weight:
+                            stage_vals = ac_model.forward_durable_stage_baseline(
+                                dur_world_batch,
+                                critic_revival_context=dur_rev,
+                            )
+                        else:
+                            with torch.no_grad():
+                                stage_vals = ac_model.forward_durable_stage_baseline(
+                                    dur_world_batch,
+                                    critic_revival_context=dur_rev,
+                                )
                         finite_ok = finite_ok & torch.isfinite(stage_vals).all()
                         stage_loss = (
                             F.smooth_l1_loss(
@@ -2046,25 +2204,36 @@ class MacroCreditLearner:
                     as_post_targets: list[Tensor] = []
                     as_act_k: list[int] = []
                     as_act_probs: list[Tensor] = []
+                    as_cond_items: list[tuple[int, Tensor, Tensor]] = []
                     as_within_items: list[tuple[int, tuple[tuple[Tensor, Tensor], ...]]] = []
                     for k, c in enumerate(active_c):
                         ref_idx, item, start, _ = chunk_slice[c]
                         index = start + offset
                         staged = staged_afterstates[ref_idx].get(index)
                         if staged is not None:
-                            as_t, post_target_gpu, target_prob_gpu, staged_within, post_rev_gpu = staged
-                            step = item.reference.steps[index]
-                            chosen_w = as_t.node.post_world_for_action(step.action_index)
-                            assert chosen_w is not None
-                            as_worlds.append(chosen_w)
-                            as_hiddens.append(output.recurrent_state[k])
-                            if post_rev_gpu is not None:
-                                as_revs.append(post_rev_gpu)
-                            as_post_targets.append(post_target_gpu)
+                            (
+                                as_t,
+                                post_target_gpu,
+                                target_prob_gpu,
+                                cond_det_item,
+                                staged_within,
+                                post_rev_gpu,
+                            ) = staged
+                            if as_t.has_chosen_post:
+                                step = item.reference.steps[index]
+                                chosen_w = as_t.node.post_world_for_action(step.action_index)
+                                assert chosen_w is not None
+                                as_worlds.append(chosen_w)
+                                as_hiddens.append(output.recurrent_state[k])
+                                if post_rev_gpu is not None:
+                                    as_revs.append(post_rev_gpu)
+                                as_post_targets.append(post_target_gpu)
                             if durable_actor_active and as_t.projection.actor_enabled:
                                 if target_prob_gpu is not None:
                                     as_act_k.append(k)
                                     as_act_probs.append(target_prob_gpu)
+                                if cond_det_item is not None:
+                                    as_cond_items.append((k, cond_det_item[0], cond_det_item[1]))
                                 if staged_within:
                                     as_within_items.append((k, staged_within))
 
@@ -2100,10 +2269,17 @@ class MacroCreditLearner:
                         if cfg.durable_post_value_weight:
                             batch_terms.append(0.5 * cfg.durable_post_value_weight * post_loss)
                         if has_stage_base:
-                            post_stage_vals = ac_model.forward_durable_stage_baseline(
-                                world_batch,
-                                critic_revival_context=stacked_as_revs,
-                            )
+                            if cfg.durable_stage_baseline_weight:
+                                post_stage_vals = ac_model.forward_durable_stage_baseline(
+                                    world_batch,
+                                    critic_revival_context=stacked_as_revs,
+                                )
+                            else:
+                                with torch.no_grad():
+                                    post_stage_vals = ac_model.forward_durable_stage_baseline(
+                                        world_batch,
+                                        critic_revival_context=stacked_as_revs,
+                                    )
                             finite_ok = finite_ok & torch.isfinite(post_stage_vals).all()
                             post_stage_loss = (
                                 F.smooth_l1_loss(
@@ -2120,48 +2296,60 @@ class MacroCreditLearner:
                                     0.5 * cfg.durable_stage_baseline_weight * post_stage_loss
                                 )
 
-                        mpo_actor_terms: list[Tensor] = []
-                        if as_act_k:
-                            c_cap_step = int(safe_logs.shape[1])
-                            padded_probs = torch.zeros(
-                                (len(as_act_k), c_cap_step), device=self.device, dtype=safe_logs.dtype
+                    mpo_actor_terms: list[Tensor] = []
+                    if as_act_k:
+                        c_cap_step = int(safe_logs.shape[1])
+                        padded_probs = torch.zeros(
+                            (len(as_act_k), c_cap_step), device=self.device, dtype=safe_logs.dtype
+                        )
+                        for m_i, tp in enumerate(as_act_probs):
+                            padded_probs[m_i, : tp.numel()] = tp.to(dtype=safe_logs.dtype)
+                        k_idx_gpu = torch.tensor(as_act_k, device=self.device, dtype=torch.long)
+                        joint_mpo_actor = -(padded_probs * safe_logs[k_idx_gpu]).sum() / denom_macro_pol
+                        mpo_actor_terms.append(joint_mpo_actor)
+                    if as_cond_items:
+                        cond_step_losses: list[Tensor] = []
+                        for k_c, det_idx_gpu, target_det_gpu in as_cond_items:
+                            cond_det_logs = torch.log_softmax(all_logs[k_c][det_idx_gpu], dim=0)
+                            safe_cond_det_logs = cond_det_logs.masked_fill(
+                                ~torch.isfinite(cond_det_logs), 0.0
                             )
-                            for m_i, tp in enumerate(as_act_probs):
-                                padded_probs[m_i, : tp.numel()] = tp.to(dtype=safe_logs.dtype)
-                            k_idx_gpu = torch.tensor(as_act_k, device=self.device, dtype=torch.long)
-                            joint_mpo_actor = -(padded_probs * safe_logs[k_idx_gpu]).sum() / denom_macro_pol
-                            mpo_actor_terms.append(joint_mpo_actor)
-                        if as_within_items:
-                            within_step_losses: list[Tensor] = []
-                            for k_w, staged_within in as_within_items:
-                                row_logs = all_logs[k_w]
-                                b_losses: list[Tensor] = []
-                                for idx_gpu, w_star_gpu in staged_within:
-                                    cond_logs = torch.log_softmax(row_logs[idx_gpu], dim=0)
-                                    safe_cond_logs = cond_logs.masked_fill(~torch.isfinite(cond_logs), 0.0)
-                                    b_losses.append(-(w_star_gpu.to(dtype=safe_logs.dtype) * safe_cond_logs).sum())
-                                within_step_losses.append(torch.stack(b_losses).mean())
-                            within_mpo_actor = (
-                                cfg.macro_within_branch_mpo_weight
-                                * torch.stack(within_step_losses).sum()
-                                / denom_macro_pol
+                            cond_step_losses.append(
+                                -(target_det_gpu.to(dtype=safe_logs.dtype) * safe_cond_det_logs).sum()
                             )
-                            slice_totals_gpu["macro_mpo_within_policy_loss"] = (
-                                slice_totals_gpu["macro_mpo_within_policy_loss"]
-                                + within_mpo_actor.detach().double()
-                            )
-                            mpo_actor_terms.append(within_mpo_actor)
-                        if mpo_actor_terms:
-                            mpo_actor = torch.stack(mpo_actor_terms).sum()
-                            mpo_det = mpo_actor.detach().double()
-                            slice_totals_gpu["macro_policy_loss"] = (
-                                slice_totals_gpu["macro_policy_loss"] + mpo_det
-                            )
-                            slice_totals_gpu["macro_mpo_policy_loss"] = (
-                                slice_totals_gpu["macro_mpo_policy_loss"] + mpo_det
-                            )
-                            if cfg.macro_policy_weight:
-                                batch_terms.append(0.5 * cfg.macro_policy_weight * mpo_actor)
+                        cond_joint_mpo_actor = torch.stack(cond_step_losses).sum() / denom_macro_pol
+                        mpo_actor_terms.append(cond_joint_mpo_actor)
+                    if as_within_items:
+                        within_step_losses: list[Tensor] = []
+                        for k_w, staged_within in as_within_items:
+                            row_logs = all_logs[k_w]
+                            b_losses: list[Tensor] = []
+                            for idx_gpu, w_star_gpu in staged_within:
+                                cond_logs = torch.log_softmax(row_logs[idx_gpu], dim=0)
+                                safe_cond_logs = cond_logs.masked_fill(~torch.isfinite(cond_logs), 0.0)
+                                b_losses.append(-(w_star_gpu.to(dtype=safe_logs.dtype) * safe_cond_logs).sum())
+                            within_step_losses.append(torch.stack(b_losses).mean())
+                        within_mpo_actor = (
+                            cfg.macro_within_branch_mpo_weight
+                            * torch.stack(within_step_losses).sum()
+                            / denom_macro_pol
+                        )
+                        slice_totals_gpu["macro_mpo_within_policy_loss"] = (
+                            slice_totals_gpu["macro_mpo_within_policy_loss"]
+                            + within_mpo_actor.detach().double()
+                        )
+                        mpo_actor_terms.append(within_mpo_actor)
+                    if mpo_actor_terms:
+                        mpo_actor = torch.stack(mpo_actor_terms).sum()
+                        mpo_det = mpo_actor.detach().double()
+                        slice_totals_gpu["macro_policy_loss"] = (
+                            slice_totals_gpu["macro_policy_loss"] + mpo_det
+                        )
+                        slice_totals_gpu["macro_mpo_policy_loss"] = (
+                            slice_totals_gpu["macro_mpo_policy_loss"] + mpo_det
+                        )
+                        if cfg.macro_policy_weight:
+                            batch_terms.append(0.5 * cfg.macro_policy_weight * mpo_actor)
 
                     if any_macro_pg and durable_actor_active:
                         pg_mask = is_macro_k & (~has_as_k) & is_choice_k
@@ -2347,6 +2535,7 @@ class MacroCreditLearner:
             "afterstate_steps": 0,
             "partial_afterstate_steps": 0,
             "partial_afterstate_pg_fallback_steps": 0,
+            "partial_afterstate_cond_mpo_steps": 0,
             "macro_pg_fallback_steps": 0,
             "combat_steps": 0,
             "combat_policy_steps": 0,
@@ -2365,11 +2554,14 @@ class MacroCreditLearner:
                 if node.is_partial
                 and node.post_world_for_action(reference.steps[node.step_index].action_index) is not None
             )
-            denominators["partial_afterstate_pg_fallback_steps"] += sum(
+            unvisited_partial = sum(
                 1
                 for node in raw_nodes
                 if node.post_world_for_action(reference.steps[node.step_index].action_index) is None
             )
+            denominators["partial_afterstate_pg_fallback_steps"] += unvisited_partial
+            if self.config.enable_partial_afterstate_conditional_mpo:
+                denominators["partial_afterstate_cond_mpo_steps"] += unvisited_partial
             for idx, step in enumerate(reference.steps):
                 denominators[f"{step.control_domain}_steps"] += 1
                 is_choice = int(step.snapshot.action_mask.sum()) > 1
@@ -2494,6 +2686,17 @@ class MacroCreditLearner:
                     if self._value_head_parameters
                     else 0.0
                 )
+                stage_gn = (
+                    float(
+                        torch.nn.utils.clip_grad_norm_(
+                            self._stage_baseline_parameters,
+                            self.config.gradient_clip_norm,
+                            error_if_nonfinite=True,
+                        ).item()
+                    )
+                    if self._stage_baseline_parameters
+                    else 0.0
+                )
                 non_val_gn = (
                     float(
                         torch.nn.utils.clip_grad_norm_(
@@ -2505,7 +2708,7 @@ class MacroCreditLearner:
                     if self._non_value_parameters
                     else 0.0
                 )
-                gradient_norm_val = math.hypot(val_gn, non_val_gn)
+                gradient_norm_val = math.hypot(val_gn, stage_gn, non_val_gn)
             else:
                 gradient_norm_val = float(
                     torch.nn.utils.clip_grad_norm_(

@@ -110,6 +110,7 @@ class HybridActorCriticConfig:
     enable_role_conditioned_candidate_policy: bool = False
     enable_deconfounded_durable_value: bool = False
     enable_monotone_deconfounded_durable_value: bool = False
+    enable_balanced_deconfounded_durable_value: bool = False
 
     def __post_init__(self) -> None:
         HybridCandidateQConfig(
@@ -129,6 +130,7 @@ class HybridActorCriticConfig:
             "enable_role_conditioned_candidate_policy",
             "enable_deconfounded_durable_value",
             "enable_monotone_deconfounded_durable_value",
+            "enable_balanced_deconfounded_durable_value",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"hybrid actor-critic {name} must be boolean")
@@ -147,6 +149,13 @@ class HybridActorCriticConfig:
             raise ValueError(
                 "enable_monotone_deconfounded_durable_value requires enable_deconfounded_durable_value=True"
             )
+        if (
+            self.enable_balanced_deconfounded_durable_value
+            and not self.enable_monotone_deconfounded_durable_value
+        ):
+            raise ValueError(
+                "enable_balanced_deconfounded_durable_value requires enable_monotone_deconfounded_durable_value=True"
+            )
 
     @property
     def has_v2_extensions(self) -> bool:
@@ -162,6 +171,7 @@ class HybridActorCriticConfig:
             or self.enable_role_conditioned_candidate_policy
             or self.enable_deconfounded_durable_value
             or self.enable_monotone_deconfounded_durable_value
+            or self.enable_balanced_deconfounded_durable_value
         )
 
     @classmethod
@@ -294,6 +304,32 @@ class HybridActorCriticConfig:
         )
 
     @classmethod
+    def durable_v8(
+        cls,
+        grounded: GroundedCandidateConfig | None = None,
+        *,
+        domain_layers: int = 1,
+        joint_layers: int = 2,
+    ) -> HybridActorCriticConfig:
+        return cls(
+            grounded=grounded or GroundedCandidateConfig(),
+            domain_layers=domain_layers,
+            joint_layers=joint_layers,
+            enable_hierarchical_branch_policy=True,
+            enable_durable_value_head=True,
+            enable_persistent_build_context=True,
+            enable_direct_vitals_context=True,
+            enable_macro_branch_prior=True,
+            enable_persistent_only_durable_value=True,
+            enable_asymmetric_revival_critic=True,
+            enable_draw_weighted_durable_value=True,
+            enable_role_conditioned_candidate_policy=True,
+            enable_deconfounded_durable_value=True,
+            enable_monotone_deconfounded_durable_value=True,
+            enable_balanced_deconfounded_durable_value=True,
+        )
+
+    @classmethod
     def from_mapping(
         cls,
         mapping: dict[str, Any],
@@ -344,6 +380,9 @@ class HybridActorCriticConfig:
                 ),
                 enable_monotone_deconfounded_durable_value=bool(
                     mapping.get("enable_monotone_deconfounded_durable_value", False)
+                ),
+                enable_balanced_deconfounded_durable_value=bool(
+                    mapping.get("enable_balanced_deconfounded_durable_value", False)
                 ),
             )
         raise ValueError(f"unsupported hybrid actor-critic model_config version: {version!r}")
@@ -402,6 +441,12 @@ class HybridActorCriticConfig:
                 base.update(
                     enable_monotone_deconfounded_durable_value=(
                         self.enable_monotone_deconfounded_durable_value
+                    ),
+                )
+            if self.enable_balanced_deconfounded_durable_value:
+                base.update(
+                    enable_balanced_deconfounded_durable_value=(
+                        self.enable_balanced_deconfounded_durable_value
                     ),
                 )
         return base
@@ -659,12 +704,13 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                         stage_out,
                     )
 
+                    balanced_init = actor_critic.enable_balanced_deconfounded_durable_value
                     hp_fc1 = nn.Linear(stage_in_dim, stage_mid_dim)
                     nn.init.normal_(hp_fc1.weight, mean=0.0, std=0.10)
                     nn.init.zeros_(hp_fc1.bias)
                     hp_out = nn.Linear(stage_mid_dim, DURABLE_HP_BASIS_DIM)
                     nn.init.zeros_(hp_out.weight)
-                    nn.init.constant_(hp_out.bias, -2.8)
+                    nn.init.constant_(hp_out.bias, -5.2 if balanced_init else -2.8)
                     self.durable_hp_gate = nn.Sequential(
                         nn.LayerNorm(stage_in_dim),
                         hp_fc1,
@@ -677,7 +723,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                     nn.init.zeros_(liq_fc1.bias)
                     liq_out = nn.Linear(stage_mid_dim, DURABLE_LIQUID_BASIS_DIM)
                     nn.init.zeros_(liq_out.weight)
-                    nn.init.constant_(liq_out.bias, -3.2)
+                    nn.init.constant_(liq_out.bias, -5.2 if balanced_init else -3.2)
                     self.durable_liquid_gate = nn.Sequential(
                         nn.LayerNorm(stage_in_dim),
                         liq_fc1,
@@ -690,7 +736,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                     nn.init.zeros_(cyc_fc1.bias)
                     cyc_out = nn.Linear(stage_mid_dim, DURABLE_CYCLE_BASIS_DIM)
                     nn.init.zeros_(cyc_out.weight)
-                    nn.init.constant_(cyc_out.bias, -3.8)
+                    nn.init.constant_(cyc_out.bias, -5.5 if balanced_init else -3.8)
                     self.durable_cycle_gate = nn.Sequential(
                         nn.LayerNorm(stage_in_dim),
                         cyc_fc1,
@@ -787,10 +833,18 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                     )
                     nn.init.zeros_(self.durable_deck_tilted_out.weight)
                     nn.init.zeros_(self.durable_deck_tilted_out.bias)
-                    self.durable_deck_linear_logit = nn.Parameter(torch.zeros(()))
-                    self.durable_deck_tilt_logits = nn.Parameter(
-                        torch.tensor([-1.8, -1.5, -1.8])
-                    )
+                    if actor_critic.enable_balanced_deconfounded_durable_value:
+                        self.durable_deck_linear_logit = nn.Parameter(
+                            torch.tensor(math.log(math.e - 1.0))
+                        )
+                        self.durable_deck_tilt_logits = nn.Parameter(
+                            torch.tensor([-4.2, -4.0, -4.2])
+                        )
+                    else:
+                        self.durable_deck_linear_logit = nn.Parameter(torch.zeros(()))
+                        self.durable_deck_tilt_logits = nn.Parameter(
+                            torch.tensor([-1.8, -1.5, -1.8])
+                        )
                 if not actor_critic.enable_deconfounded_durable_value:
                     deck_size_fc1 = nn.Linear(DURABLE_DECK_SIZE_DIM + rev_dim, cfg.ffn_dim)
                     nn.init.normal_(deck_size_fc1.weight, mean=0.0, std=0.25)
@@ -1417,6 +1471,65 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         vitals_emb: Tensor = self.persistent_vitals_encoder(raw_vitals)
         return vitals_emb, raw_vitals
 
+    def _encode_canonical_neutral_vitals(
+        self,
+        world: WorldTokenBatch,
+    ) -> tuple[Tensor, Tensor]:
+        pers_valid = self._persistent_token_mask(world.zone_ids, world.owner_ids, world.mask)
+        slot_end = min(int(world.features.shape[-1]), NUMERIC_FACT_SLOT_END)
+        feats = world.features[:, :, NUMERIC_FACT_SLOT_START:slot_end]
+        dtype = feats.dtype
+        device = feats.device
+        batch_size, _, num_width = feats.shape
+
+        scaled_player = torch.zeros((batch_size, num_width), dtype=dtype, device=device)
+        for offset, canon_val in (
+            (PLAYER_CURRENT_HP_OFFSET, 60.0),
+            (PLAYER_HP_OFFSET, 60.0),
+            (PLAYER_MAX_HP_OFFSET, 80.0),
+            (PLAYER_GOLD_OFFSET, 100.0),
+            (PLAYER_OPEN_POTION_SLOTS_OFFSET, 2.0),
+        ):
+            if 0 <= offset < num_width:
+                scaled_player[:, offset] = 0.8 * math.log1p(canon_val)
+
+        run_mask = (world.zone_ids.eq(RUN_ZONE_ID) & pers_valid).to(dtype=dtype)
+        run_feats = torch.einsum("bw,bwf->bf", run_mask, feats) / run_mask.sum(
+            dim=1, keepdim=True
+        ).clamp_min(1.0)
+        scaled_run = torch.zeros((batch_size, num_width), dtype=dtype, device=device)
+        if 0 <= RUN_ACT_OFFSET < num_width:
+            act_feat = run_feats[:, RUN_ACT_OFFSET]
+            scaled_run[:, RUN_ACT_OFFSET] = torch.where(
+                act_feat.abs() >= 0.99, act_feat * 0.5, act_feat * 8.0
+            )
+
+        pers_only = self.actor_critic_config.enable_persistent_only_durable_value
+        zero_col = torch.zeros((batch_size,), dtype=dtype, device=device)
+        zone_counts = torch.stack(
+            [
+                zero_col
+                if (pers_only and zid in IDENTITY_BLIND_CARD_COUNT_ZONE_IDS)
+                else 0.8
+                * torch.log1p(
+                    (world.zone_ids.eq(zid) & pers_valid).to(dtype=dtype).sum(dim=1)
+                )
+                for zid in PERSISTENT_BUILD_ZONE_IDS
+            ],
+            dim=-1,
+        )
+        if not pers_only:
+            raw_vitals = torch.cat([scaled_player, scaled_run, zone_counts], dim=-1)
+        else:
+            salient = torch.tensor(
+                [3.0, 1.0, 0.0, 2.0],
+                dtype=dtype,
+                device=device,
+            ).unsqueeze(0).expand(batch_size, -1)
+            raw_vitals = torch.cat([scaled_player, scaled_run, zone_counts, salient], dim=-1)
+        vitals_emb: Tensor = self.persistent_vitals_encoder(raw_vitals)
+        return vitals_emb, raw_vitals
+
     def _extract_progress_vitals(
         self,
         world: WorldTokenBatch,
@@ -1626,9 +1739,14 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 v_stage = self.durable_stage_baseline_head(stage_in).squeeze(-1)
                 w_hp = nn.functional.softplus(self.durable_hp_gate(stage_in))
                 w_liq = nn.functional.softplus(self.durable_liquid_gate(stage_in))
+                stage_term = (
+                    v_stage
+                    if self.actor_critic_config.enable_balanced_deconfounded_durable_value
+                    else v_stage.detach()
+                )
                 out = (
                     out
-                    + v_stage.detach()
+                    + stage_term
                     + (w_hp * hp_basis).sum(dim=-1)
                     + (w_liq * liquid_basis).sum(dim=-1)
                 )
@@ -1714,7 +1832,11 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                     )
                     u_beta_cols.append(log_mean_exp * has_deck_f)
                 u_betas = torch.stack(u_beta_cols, dim=-1)
-                alpha_lin = torch.sigmoid(self.durable_deck_linear_logit)
+                alpha_lin = (
+                    nn.functional.softplus(self.durable_deck_linear_logit)
+                    if self.actor_critic_config.enable_balanced_deconfounded_durable_value
+                    else torch.sigmoid(self.durable_deck_linear_logit)
+                )
                 w_tilt = nn.functional.softplus(self.durable_deck_tilt_logits)
                 deck_utility = alpha_lin * expected_card_utility + (w_tilt * u_betas).sum(dim=-1)
                 if stage_in is not None:
@@ -1895,7 +2017,10 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         raw_vitals: Tensor | None = None
         progress_vitals: Tensor | None = None
         if self.actor_critic_config.enable_direct_vitals_context:
-            vitals_emb, raw_vitals = self._encode_direct_vitals(pers_world)
+            if self.actor_critic_config.enable_balanced_deconfounded_durable_value:
+                vitals_emb, raw_vitals = self._encode_canonical_neutral_vitals(pers_world)
+            else:
+                vitals_emb, raw_vitals = self._encode_direct_vitals(pers_world)
             if (
                 self.actor_critic_config.enable_deconfounded_durable_value
                 and not self.actor_critic_config.enable_monotone_deconfounded_durable_value

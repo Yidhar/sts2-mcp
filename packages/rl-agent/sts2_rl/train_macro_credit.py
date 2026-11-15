@@ -260,6 +260,9 @@ def _actor_critic_config(config: MacroTrainingConfig) -> HybridActorCriticConfig
             enable_monotone_deconfounded_durable_value=(
                 config.learner.enable_monotone_deconfounded_durable_value
             ),
+            enable_balanced_deconfounded_durable_value=(
+                config.learner.enable_balanced_deconfounded_durable_value
+            ),
         )
     return HybridActorCriticConfig(grounded)
 
