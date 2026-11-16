@@ -5449,3 +5449,198 @@ def test_durable_v9_stateless_distill_and_card_compaction_parity() -> None:
         assert float(m_bat_c[key]) == pytest.approx(float(m_seq_c[key]), abs=1e-5, rel=1e-4), (
             f"Stage C mismatch on {key}: {m_bat_c[key]} vs {m_seq_c[key]}"
         )
+
+
+def test_durable_v10_debloated_synergy_clipped_combat_and_kl_floor() -> None:
+    import copy
+    from dataclasses import replace
+    from typing import cast
+    from sts2_rl.encoding import EncodedWorldSnapshot
+    from sts2_rl.models.hybrid_actor_critic import initialize_actor_critic_from_macro_publication
+
+    base_cfg = _tiny_model_config()
+    enc_cfg = base_cfg.to_encoding_config()
+    encoder = GroundedObservationEncoder(enc_cfg)
+    student_mcfg = replace(base_cfg, d_model=64, n_heads=4, ffn_dim=256, latent_slots=12, recurrent_hidden_dim=64)
+    teacher_mcfg = replace(base_cfg, d_model=32, n_heads=2, ffn_dim=64, latent_slots=8, recurrent_hidden_dim=32)
+    wide_grounded = student_mcfg.to_model_config()
+    v9_cfg = HybridActorCriticConfig.durable_v9(wide_grounded, domain_layers=1, joint_layers=2)
+    v10_cfg = HybridActorCriticConfig.durable_v10(wide_grounded, domain_layers=1, joint_layers=2)
+    assert v10_cfg.enable_debloated_synergy_durable_value is True
+    assert HybridActorCriticConfig.from_mapping(v10_cfg.as_mapping(), fallback_grounded=wide_grounded) == v10_cfg
+
+    torch.manual_seed(71)
+    model_v9 = HybridDomainActorCriticModel(v9_cfg)
+    model_v10 = HybridDomainActorCriticModel(v10_cfg)
+    hot = initialize_actor_critic_from_macro_publication(model_v10, model_v9.state_dict())
+    assert hot["fresh"] == ()
+    assert len(hot["inherited"]) == len(model_v9.state_dict())
+
+    # Verify non-deck base state & run memory in V_durable are 100% invariant to deck card additions
+    relics = [{"id": f"relic_{i}", "has_upon_pickup_effect": False} for i in range(4)]
+    map_actions = [
+        {"action_id": "m0", "kind": "choose_map_node", "model_action_kind": "map", "is_enabled": True, "node": {"x": 0, "y": 1, "type": "Monster"}},
+        {"action_id": "m1", "kind": "choose_map_node", "model_action_kind": "map", "is_enabled": True, "node": {"x": 1, "y": 1, "type": "Rest"}},
+    ]
+    obs_lean = {
+        "phase": "map",
+        "decision_domain": "map",
+        "run": {"active": True, "act": 2, "floor": 25},
+        "player": {"character_id": "IRONCLAD", "hp": 60, "max_hp": 80, "gold": 120, "deck": _sample_deck()[:2], "relics": relics, "potions": []},
+        "map": {"nodes": [{"x": 0, "y": 1, "type": "Monster"}, {"x": 1, "y": 1, "type": "Rest"}]},
+    }
+    bloated_cards = _sample_deck() + [{"id": f"filler_card_{k}", "type": "Attack", "rarity": "Common", "cost": 1} for k in range(12)]
+    obs_bloated = copy.deepcopy(obs_lean)
+    obs_bloated["player"]["deck"] = bloated_cards  # type: ignore[index]
+    w_lean = encoder.encode(obs_lean, map_actions).snapshot
+    w_bloat = encoder.encode(obs_bloated, map_actions).snapshot
+    with torch.no_grad():
+        wb_pair, dom_pair = collate_encoded_worlds(
+            (cast(EncodedWorldSnapshot, w_lean), cast(EncodedWorldSnapshot, w_bloat)),
+            expected_config=enc_cfg,
+            expected_fingerprint=w_lean.encoding_fingerprint,
+            device="cpu",
+        )
+        _, pers_run_pair = model_v10.forward_durable_value(wb_pair, dom_pair, None, validate=False)
+        assert torch.allclose(pers_run_pair[0], pers_run_pair[1], atol=1e-6)
+
+    # Verify clipped combat PG + kickstart_kl_floor parity (sequential vs batched) and synergy optimizer routing
+    teacher_cfg = HybridActorCriticConfig.durable_v8(teacher_mcfg.to_model_config())
+    teacher_mod = HybridDomainActorCriticModel(teacher_cfg)
+    stu_seq = copy.deepcopy(model_v10)
+    stu_bat = copy.deepcopy(model_v10)
+
+    lcfg_base = MacroCreditLearnerConfig(
+        target_mode="durable_afterstate_v2",
+        revival_budget=32,
+        domain_layers=1,
+        joint_layers=2,
+        enable_direct_vitals_context=True,
+        enable_macro_branch_prior=True,
+        enable_persistent_only_durable_value=True,
+        enable_asymmetric_revival_critic=True,
+        enable_draw_weighted_durable_value=True,
+        enable_role_conditioned_candidate_policy=True,
+        enable_deconfounded_durable_value=True,
+        enable_monotone_deconfounded_durable_value=True,
+        enable_balanced_deconfounded_durable_value=True,
+        enable_expressive_synergy_backbone=True,
+        enable_debloated_synergy_durable_value=True,
+        durable_stage_baseline_weight=0.0,
+        enable_hierarchical_afterstate_mpo=True,
+        macro_mpo_min_temperature=0.015,
+        clip_macro_pg_fallback=True,
+        clip_combat_pg=True,
+        combat_pg_clip_eps=0.15,
+        combat_pg_adv_clip=0.25,
+        combat_pg_kl_weight=0.05,
+        separate_value_grad_clip=True,
+        learning_rate=8e-5,
+        shared_learning_rate_scale=0.25,
+        distill_teacher_rollout_updates=0,
+        distill_total_updates=2,
+        kickstart_kl_weight=0.08,
+        kickstart_kl_floor=0.02,
+        chunk_steps=2,
+        combat_unroll_steps=2,
+        likelihood_tolerance=0.02,
+    )
+    learner_seq = MacroCreditLearner(
+        model=stu_seq,
+        config=replace(lcfg_base, eval_batch_size=1, chunk_batch_size=1),
+        update=2,
+        teacher_model=teacher_mod,
+    )
+    learner_bat = MacroCreditLearner(
+        model=stu_bat,
+        config=replace(lcfg_base, eval_batch_size=8, chunk_batch_size=8),
+        update=2,
+        teacher_model=teacher_mod,
+    )
+    # Verify durable_deck_synergy_* is routed into shared LR group (8e-5 * 0.25 = 2e-5)
+    syn_param = stu_bat.durable_deck_synergy_ffn[1].weight
+    shared_group = next(g for g in learner_bat.optimizer.param_groups if abs(g["lr"] - 2e-5) < 1e-10)
+    assert any(p is syn_param for p in shared_group["params"])
+
+    obs_rest, rest_legal = _rest_surface(include_preview=True)
+    rest_dec = forward_decision(obs_rest, rest_legal, control_domain="macro")
+    assert rest_dec is not None
+    rest_enc = encoder.encode(obs_rest, [c.semantic_action for c in rest_dec.candidates])
+    grouped_cands = tuple(rest_dec.candidates[ref.representative_position] for ref in rest_enc.actions)
+    post_worlds = synthesize_deterministic_afterstates(
+        encoder=encoder, observation=obs_rest, decision=rest_dec, candidates=grouped_cands
+    )
+    assert post_worlds is not None
+    combat_obs = {
+        "phase": "combat",
+        "decision_domain": "combat",
+        "run": {"active": True, "act": 2, "floor": 26},
+        "player": {"id": "ironclad", "side": "player", "hp": 54, "max_hp": 80, "energy": 3, "hand": [{"id": "strike", "cost": 1}]},
+        "combat": {"in_progress": True, "enemies": [{"id": "cultist", "side": "enemy", "hp": 38, "max_hp": 48}]},
+    }
+    combat_actions = [
+        {"action_handle": "c0", "kind": "play_card", "model_action_kind": "play_card", "is_enabled": True, "card": {"id": "strike", "cost": 1}},
+        {"action_handle": "c1", "kind": "end_turn", "model_action_kind": "end_turn", "is_enabled": True},
+    ]
+    combat_snap = encoder.encode(combat_obs, combat_actions).snapshot
+
+    trajs: list[MacroCreditTrajectory] = []
+    for t_i in range(2):
+        seq_specs = [
+            (rest_enc.snapshot, "macro", "rest_site", grouped_cands[t_i % len(grouped_cands)].branch, t_i % len(grouped_cands), 0.0, False, 25, 25),
+            (w_lean, "macro", "map", "Monster", t_i % 2, 0.05, False, 25, 26),
+            (combat_snap, "combat", "combat", "play_card", 0, -0.02, False, 26, 26),
+            (combat_snap, "combat", "combat", "end_turn", 1, 0.65, True, 26, 26),
+        ]
+        temp_steps: list[HybridVTraceStep] = []
+        facts: list[MacroRewardFacts] = []
+        for snap, dom, surf, br, a_idx, rew, term, fb, fa in seq_specs:
+            disc = 0.0 if term else (0.997 ** (fa - fb))
+            temp_steps.append(HybridVTraceStep(snap, a_idx, -0.5, rew, disc, term, surf, br, dom, 2))  # type: ignore[arg-type]
+            facts.append(MacroRewardFacts(rew if term else 0.0, 0.0 if term else rew, 0.0, 0.0, 0.0, 0, 0.0, fb, fa, 1))
+        dummy = MacroCreditTrajectory(f"d-{t_i}", 8_810_000 + 2 * t_i, 2, (), tuple(temp_steps), None, None, "factual_terminal", tuple(facts), macro_branch_epsilon=0.05)
+        s_rev, _, _ = learner_bat._trajectory_critic_revival_contexts(dummy)
+        real_steps: list[HybridVTraceStep] = []
+        h_c = None
+        with torch.no_grad():
+            for idx_s, st in enumerate(temp_steps):
+                b_s = collate_encoded_snapshots((st.snapshot,), expected_config=enc_cfg, expected_fingerprint=st.snapshot.encoding_fingerprint, device="cpu")
+                out_s = stu_bat(b_s, h_c, critic_revival_context=s_rev[idx_s : idx_s + 1], validate=False)
+                h_c = out_s.recurrent_state
+                m_s = torch.tensor(st.snapshot.action_mask.tolist(), dtype=torch.bool)
+                lp_s = torch.log_softmax(out_s.policy_logits[0, : m_s.numel()].masked_fill(~m_s, -torch.inf), dim=0)
+                beh_lp = macro_mixture_log_probs(lp_s, st.snapshot, 0.05) if st.control_domain == "macro" else lp_s
+                real_steps.append(replace(st, behavior_log_probability=float(beh_lp[st.action_index].item())))
+        nodes = (MacroAfterstateNode(0, "rest_site", tuple(c.branch for c in grouped_cands), post_worlds, tuple(range(len(grouped_cands))), False),)
+        trajs.append(
+            MacroCreditTrajectory(
+                f"v10-{t_i}",
+                8_810_000 + 2 * t_i,
+                2,
+                (),
+                tuple(real_steps),
+                None,
+                None,
+                "factual_terminal",
+                tuple(facts),
+                afterstate_nodes=nodes,
+                macro_branch_epsilon=0.05,
+            )
+        )
+    cohort = MacroCreditCohort("v10-floor-test", 2, (), natural_only=tuple(trajs))
+    m_seq = learner_seq.learn(cohort)
+    m_bat = learner_bat.learn(cohort)
+    assert float(m_bat["effective_kickstart_kl_weight"]) == pytest.approx(0.02)
+    assert float(m_bat["distill_combat_kl"]) > 0.0
+    assert float(m_bat["distill_macro_kl"]) > 0.0
+    for key in (
+        "combat_policy_loss",
+        "combat_value_loss",
+        "macro_policy_loss",
+        "durable_value_loss",
+        "distill_macro_kl",
+        "distill_combat_kl",
+        "gradient_norm",
+        "parameter_delta_norm",
+    ):
+        assert float(m_bat[key]) == pytest.approx(float(m_seq[key]), abs=1e-5, rel=1e-4), key

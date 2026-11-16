@@ -275,6 +275,9 @@ def _actor_critic_config(config: MacroTrainingConfig) -> HybridActorCriticConfig
             enable_expressive_synergy_backbone=(
                 config.learner.enable_expressive_synergy_backbone
             ),
+            enable_debloated_synergy_durable_value=(
+                config.learner.enable_debloated_synergy_durable_value
+            ),
         )
     return HybridActorCriticConfig(
         grounded,
@@ -291,6 +294,13 @@ def _extract_distillation_teacher_info(
     visited = 0
     while isinstance(current, Mapping) and visited < 8:
         visited += 1
+        t_path = current.get("distillation_teacher_path")
+        t_sha = current.get("distillation_teacher_sha256")
+        if isinstance(t_sha, str) and t_sha:
+            return (
+                t_path if isinstance(t_path, str) and t_path else None,
+                t_sha,
+            )
         if current.get("mode") == "teacher_distillation_new_macro_lineage":
             raw_path = current.get("source_path")
             raw_sha = current.get("source_sha256")
@@ -469,6 +479,7 @@ def run_cohorts(
             if (
                 teacher_model is not None
                 and learner.update >= config.learner.distill_total_updates
+                and config.learner.kickstart_kl_floor <= 0.0
             ):
                 learner.release_teacher()
                 if getattr(learner, "device", torch.device("cpu")).type == "cuda":
@@ -596,6 +607,7 @@ def run_cohorts(
             if (
                 getattr(learner, "teacher_model", None) is not None
                 and learner.update >= config.learner.distill_total_updates
+                and config.learner.kickstart_kl_floor <= 0.0
             ):
                 learner.release_teacher()
                 if getattr(learner, "device", torch.device("cpu")).type == "cuda":
@@ -677,9 +689,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError(
                 "--distill-from-macro-publication requires learner.distill_total_updates > 0"
             )
-        if args.teacher_publication and not (args.resume or args.migrate_runtime_from_checkpoint):
+        if args.teacher_publication and not (
+            args.resume
+            or args.migrate_runtime_from_checkpoint
+            or args.initialize_from_macro_publication
+        ):
             raise ValueError(
-                "--teacher-publication is only valid with --resume or --migrate-runtime-from-checkpoint"
+                "--teacher-publication is only valid with --resume, "
+                "--migrate-runtime-from-checkpoint, or --initialize-from-macro-publication"
+            )
+        if (
+            args.initialize_from_macro_publication
+            and config.learner.distill_total_updates > 0
+            and not args.teacher_publication
+        ):
+            raise ValueError(
+                "--initialize-from-macro-publication with learner.distill_total_updates > 0 "
+                "requires --teacher-publication"
             )
         root = artifact_root()
         output = resolve_artifact_path(args.output_dir, root=root)
@@ -768,6 +794,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                                   "source_sha256": source_hash, "optimizer_reset": True,
                                   "rng_reset": True, "destination_update": 0,
                                   "destination_encoding": grounding_encoding_identity()}
+                if args.initialize_from_macro_publication and args.teacher_publication is not None:
+                    init_teacher_path = resolve_external_input_path(args.teacher_publication, root=root)
+                    if not init_teacher_path.exists():
+                        raise FileNotFoundError(
+                            f"distillation teacher publication not found: {init_teacher_path}"
+                        )
+                    init_teacher_hash = hashlib.sha256(init_teacher_path.read_bytes()).hexdigest()
+                    loaded_init_teacher = load_frozen_macro_teacher(
+                        init_teacher_path,
+                        expected_encoding=training.model.to_encoding_config(),
+                        device=device,
+                        rocm_sdpa_backend=training.runtime.rocm_sdpa_backend,
+                        expected_sha256=init_teacher_hash,
+                    )
+                    if hashlib.sha256(init_teacher_path.read_bytes()).hexdigest() != init_teacher_hash:
+                        raise ValueError("distillation teacher publication changed while loading")
+                    initial_loaded_teacher_model = loaded_init_teacher.model
+                    extra_source_paths.append(init_teacher_path)
+                    initialization["distillation_teacher_path"] = str(init_teacher_path)
+                    initialization["distillation_teacher_sha256"] = init_teacher_hash
+                    initialization["teacher_provenance"] = canonical_facts(
+                        loaded_init_teacher.provenance
+                    )
             elif args.distill_from_macro_publication:
                 source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
                 loaded_teacher = load_frozen_macro_teacher(
@@ -840,7 +889,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             if (
                 (args.resume or args.migrate_runtime_from_checkpoint)
                 and config.learner.distill_total_updates > 0
-                and learner.update < config.learner.distill_total_updates
+                and (
+                    learner.update < config.learner.distill_total_updates
+                    or config.learner.kickstart_kl_floor > 0.0
+                )
             ):
                 recorded_teacher_path, expected_teacher_sha = _extract_distillation_teacher_info(initialization)
                 if expected_teacher_sha is None:

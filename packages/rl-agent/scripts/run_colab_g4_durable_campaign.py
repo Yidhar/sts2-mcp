@@ -403,6 +403,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--initialize-from-iql", type=Path)
     parser.add_argument("--initialize-from-macro-publication", type=Path)
     parser.add_argument("--distill-from-macro-publication", type=Path)
+    parser.add_argument("--teacher-publication", type=Path)
     parser.add_argument("--migrate-runtime-from-checkpoint", type=Path)
     parser.add_argument("--resume-from-drive", action="store_true")
     parser.add_argument("--device", default="cuda")
@@ -448,6 +449,11 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
         if args.distill_from_macro_publication is not None
         else None
     )
+    teacher_pub_source = (
+        resolve_external_input_path(args.teacher_publication, root=root)
+        if args.teacher_publication is not None
+        else None
+    )
     migrate_source = (
         resolve_external_input_path(args.migrate_runtime_from_checkpoint, root=root)
         if args.migrate_runtime_from_checkpoint is not None
@@ -458,6 +464,8 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
     )
     if init_count > 1:
         raise ValueError("specify at most one initialization/migration source")
+    if teacher_pub_source is not None and distill_source is not None:
+        raise ValueError("do not specify both --distill-from-macro-publication and --teacher-publication")
 
     local_ckpt = output_dir / "checkpoint.pt"
     drive_ckpt = drive_dir / "checkpoint.pt"
@@ -479,11 +487,12 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
             "or --migrate-runtime-from-checkpoint"
         )
 
-    if distill_source is not None:
-        if not distill_source.is_file():
-            raise FileNotFoundError(f"distillation teacher publication not found: {distill_source}")
-        if not local_teacher_cache.is_file() or local_teacher_cache.resolve() != distill_source.resolve():
-            _atomic_copy_file(distill_source, local_teacher_cache, verify_sha256=True)
+    explicit_teacher = distill_source if distill_source is not None else teacher_pub_source
+    if explicit_teacher is not None:
+        if not explicit_teacher.is_file():
+            raise FileNotFoundError(f"distillation teacher publication not found: {explicit_teacher}")
+        if not local_teacher_cache.is_file() or local_teacher_cache.resolve() != explicit_teacher.resolve():
+            _atomic_copy_file(explicit_teacher, local_teacher_cache, verify_sha256=True)
         if not drive_teacher_backup.is_file():
             _atomic_copy_file(local_teacher_cache, drive_teacher_backup, verify_sha256=True)
     elif drive_teacher_backup.is_file() and not local_teacher_cache.is_file():
@@ -607,6 +616,8 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
         else:
             assert macro_source is not None
             cmd.extend(["--initialize-from-macro-publication", str(macro_source)])
+            if local_teacher_cache.is_file():
+                cmd.extend(["--teacher-publication", str(local_teacher_cache)])
 
         print(
             json.dumps(

@@ -172,6 +172,7 @@ class FrozenMacroRootPolicy:
                 "enable_monotone_deconfounded_durable_value",
                 "enable_balanced_deconfounded_durable_value",
                 "enable_expressive_synergy_backbone",
+                "enable_debloated_synergy_durable_value",
             ):
                 if getattr(parsed_macro_source_cfg, flag_name) and not getattr(model_config, flag_name):
                     raise ValueError(

@@ -114,6 +114,7 @@ class HybridActorCriticConfig:
     enable_monotone_deconfounded_durable_value: bool = False
     enable_balanced_deconfounded_durable_value: bool = False
     enable_expressive_synergy_backbone: bool = False
+    enable_debloated_synergy_durable_value: bool = False
 
     def __post_init__(self) -> None:
         HybridCandidateQConfig(
@@ -135,6 +136,7 @@ class HybridActorCriticConfig:
             "enable_monotone_deconfounded_durable_value",
             "enable_balanced_deconfounded_durable_value",
             "enable_expressive_synergy_backbone",
+            "enable_debloated_synergy_durable_value",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"hybrid actor-critic {name} must be boolean")
@@ -167,6 +169,13 @@ class HybridActorCriticConfig:
             raise ValueError(
                 "enable_expressive_synergy_backbone requires enable_balanced_deconfounded_durable_value=True"
             )
+        if (
+            self.enable_debloated_synergy_durable_value
+            and not self.enable_expressive_synergy_backbone
+        ):
+            raise ValueError(
+                "enable_debloated_synergy_durable_value requires enable_expressive_synergy_backbone=True"
+            )
 
     @property
     def has_v2_extensions(self) -> bool:
@@ -184,6 +193,7 @@ class HybridActorCriticConfig:
             or self.enable_monotone_deconfounded_durable_value
             or self.enable_balanced_deconfounded_durable_value
             or self.enable_expressive_synergy_backbone
+            or self.enable_debloated_synergy_durable_value
         )
 
     @classmethod
@@ -369,6 +379,34 @@ class HybridActorCriticConfig:
         )
 
     @classmethod
+    def durable_v10(
+        cls,
+        grounded: GroundedCandidateConfig | None = None,
+        *,
+        domain_layers: int = 1,
+        joint_layers: int = 2,
+    ) -> HybridActorCriticConfig:
+        return cls(
+            grounded=grounded or GroundedCandidateConfig(),
+            domain_layers=domain_layers,
+            joint_layers=joint_layers,
+            enable_hierarchical_branch_policy=True,
+            enable_durable_value_head=True,
+            enable_persistent_build_context=True,
+            enable_direct_vitals_context=True,
+            enable_macro_branch_prior=True,
+            enable_persistent_only_durable_value=True,
+            enable_asymmetric_revival_critic=True,
+            enable_draw_weighted_durable_value=True,
+            enable_role_conditioned_candidate_policy=True,
+            enable_deconfounded_durable_value=True,
+            enable_monotone_deconfounded_durable_value=True,
+            enable_balanced_deconfounded_durable_value=True,
+            enable_expressive_synergy_backbone=True,
+            enable_debloated_synergy_durable_value=True,
+        )
+
+    @classmethod
     def from_mapping(
         cls,
         mapping: dict[str, Any],
@@ -431,6 +469,9 @@ class HybridActorCriticConfig:
                 ),
                 enable_expressive_synergy_backbone=bool(
                     mapping.get("enable_expressive_synergy_backbone", False)
+                ),
+                enable_debloated_synergy_durable_value=bool(
+                    mapping.get("enable_debloated_synergy_durable_value", False)
                 ),
             )
         raise ValueError(f"unsupported hybrid actor-critic model_config version: {version!r}")
@@ -501,6 +542,12 @@ class HybridActorCriticConfig:
                 base.update(
                     enable_expressive_synergy_backbone=(
                         self.enable_expressive_synergy_backbone
+                    ),
+                )
+            if self.enable_debloated_synergy_durable_value:
+                base.update(
+                    enable_debloated_synergy_durable_value=(
+                        self.enable_debloated_synergy_durable_value
                     ),
                 )
         return base
@@ -1303,6 +1350,12 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             canon_order_ids = torch.where(run_pers_rows, 0, canon_order_ids)
 
         child_uv = (match_mod & mod_item_mask.unsqueeze(2)) | match_label
+        if self.actor_critic_config.enable_debloated_synergy_durable_value:
+            canon_def_ids = world.definition_binding_ids.clamp(0, 1)
+            canon_rel_ids = world.relation_binding_ids.clamp(0, 1)
+        else:
+            canon_def_ids = world.definition_binding_ids
+            canon_rel_ids = world.relation_binding_ids
         prepared_world = WorldTokenBatch(
             features=features,
             type_ids=world.type_ids,
@@ -1310,8 +1363,8 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             owner_ids=world.owner_ids,
             entity_ids=canon_entity_ids,
             entity_aux_ids=canon_aux_ids,
-            definition_binding_ids=world.definition_binding_ids,
-            relation_binding_ids=world.relation_binding_ids,
+            definition_binding_ids=canon_def_ids,
+            relation_binding_ids=canon_rel_ids,
             zone_ids=world.zone_ids,
             order_ids=canon_order_ids,
             mask=eff_mask,
@@ -1974,8 +2027,12 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                     normed_seq,
                     syn_key_log_bias,
                 )
+                if self.actor_critic_config.enable_debloated_synergy_durable_value:
+                    syn_delta = 0.5 * torch.tanh(2.0 * syn_delta)
                 card_hidden = card_hidden + syn_delta * syn_mask_f
                 syn_ffn_delta: Tensor = self.durable_deck_synergy_ffn(card_hidden)
+                if self.actor_critic_config.enable_debloated_synergy_durable_value:
+                    syn_ffn_delta = 0.5 * torch.tanh(2.0 * syn_ffn_delta)
                 card_hidden = card_hidden + syn_ffn_delta * syn_mask_f
             raw_hidden = nn.functional.silu(self.durable_deck_raw_fc(card_raw_feats))
             bilinear_card = torch.cat(
@@ -2037,7 +2094,10 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                         )
                         * has_deck_f.unsqueeze(-1)
                     )
-                    w_cycle = nn.functional.softplus(self.durable_cycle_gate(stage_in))
+                    cyc_logits = self.durable_cycle_gate(stage_in)
+                    if self.actor_critic_config.enable_debloated_synergy_durable_value:
+                        cyc_logits = cyc_logits + 1.5
+                    w_cycle = nn.functional.softplus(cyc_logits)
                     v_cycle = -(w_cycle * bloat_basis).sum(dim=-1)
                     deck_utility = deck_utility + v_cycle
                 out = out + deck_utility
@@ -2136,6 +2196,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         deck_size: Tensor | None = None
         has_deck: Tensor | None = None
         token_weights: Tensor | None = None
+        prep: _PreparedPersistentWorld | None = None
         if self.actor_critic_config.enable_draw_weighted_durable_value:
             prep = self._prepare_draw_weighted_persistent_world(world)
             pers_world = prep.world
@@ -2191,30 +2252,61 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             if self.actor_critic_config.enable_monotone_deconfounded_durable_value
             else previous_run
         )
-        pers_run = self.run_recurrent_norm(
-            self.run_recurrent_cell(pers_enc.state_embedding, run_prev_for_durable)
-        )
-        build_emb = (
-            self._pool_persistent_build(
-                pers_enc,
-                pers_world.zone_ids,
-                pers_world.owner_ids,
-                token_weights=token_weights,
-            )
-            if self.actor_critic_config.enable_persistent_build_context
-            else None
-        )
         if (
-            build_emb is not None
-            and card_repr is not None
-            and draw_prob is not None
-            and self.actor_critic_config.enable_draw_weighted_durable_value
+            self.actor_critic_config.enable_debloated_synergy_durable_value
+            and prep is not None
         ):
-            build_emb = build_emb + torch.einsum(
-                "bw,bwd->bd",
-                draw_prob.to(dtype=build_emb.dtype),
-                self.persistent_build_deck_proj(card_repr),
+            non_deck_mask = (
+                pers_world.mask.bool()
+                & (~pers_world.zone_ids.eq(DECK_ZONE_ID))
+                & (~pers_world.zone_ids.eq(MODIFIER_ZONE_ID))
+                & (~prep.child_uv.any(dim=2))
             )
+            non_deck_world, _ = self._compact_world_by_mask(pers_world, non_deck_mask)
+            base_enc = self.encode_world(
+                non_deck_world,
+                zero_domains,
+                _validated=not validate,
+            )
+            base_state_emb = base_enc.state_embedding
+            pers_run = self.run_recurrent_norm(
+                self.run_recurrent_cell(base_state_emb, run_prev_for_durable)
+            )
+            build_emb = (
+                self._pool_persistent_build(
+                    base_enc,
+                    non_deck_world.zone_ids,
+                    non_deck_world.owner_ids,
+                )
+                if self.actor_critic_config.enable_persistent_build_context
+                else None
+            )
+        else:
+            base_state_emb = pers_enc.state_embedding
+            pers_run = self.run_recurrent_norm(
+                self.run_recurrent_cell(base_state_emb, run_prev_for_durable)
+            )
+            build_emb = (
+                self._pool_persistent_build(
+                    pers_enc,
+                    pers_world.zone_ids,
+                    pers_world.owner_ids,
+                    token_weights=token_weights,
+                )
+                if self.actor_critic_config.enable_persistent_build_context
+                else None
+            )
+            if (
+                build_emb is not None
+                and card_repr is not None
+                and draw_prob is not None
+                and self.actor_critic_config.enable_draw_weighted_durable_value
+            ):
+                build_emb = build_emb + torch.einsum(
+                    "bw,bwd->bd",
+                    draw_prob.to(dtype=build_emb.dtype),
+                    self.persistent_build_deck_proj(card_repr),
+                )
         vitals_emb: Tensor | None = None
         raw_vitals: Tensor | None = None
         progress_vitals: Tensor | None = None
@@ -2229,7 +2321,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             ):
                 progress_vitals = self._extract_progress_vitals(pers_world)
         durable_val = self._durable_readout(
-            world_state_embedding=pers_enc.state_embedding,
+            world_state_embedding=base_state_emb,
             build_embedding=build_emb,
             vitals_embedding=vitals_emb,
             raw_vitals=raw_vitals,
