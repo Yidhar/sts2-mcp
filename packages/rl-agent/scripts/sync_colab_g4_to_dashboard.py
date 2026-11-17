@@ -20,11 +20,11 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import base64
 import json
 import math
 import os
 import queue
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -272,13 +272,14 @@ class _PersistentWslColabBridge:
             return self._proc
         self.close()
         self._out_queue = queue.Queue()
+        b64_script = base64.b64encode(_WSL_BRIDGE_SERVER_SCRIPT.encode("utf-8")).decode("ascii")
         proc = subprocess.Popen(
             [
                 "wsl",
                 "-e",
                 "bash",
                 "-lc",
-                f"exec python3 -u -c {shlex.quote(_WSL_BRIDGE_SERVER_SCRIPT)}",
+                f"exec python3 -u -c 'import base64; exec(base64.b64decode(\"{b64_script}\").decode(\"utf-8\"))'",
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
