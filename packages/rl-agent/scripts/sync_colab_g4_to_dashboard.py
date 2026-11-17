@@ -1107,8 +1107,7 @@ def sync_once(
             "completed",
             "campaign_complete",
             "archived_complete",
-            "bounded_training_complete",
-        }:
+        } or (st_state == "bounded_training_complete" and latest_ver >= target_updates):
             events_to_append.append(
                 {
                     "event": "run_complete",

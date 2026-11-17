@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final, Literal
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -169,7 +170,7 @@ def _run_one_heldout_seed(
             raise TimeoutError(f"held-out seed {seed} exceeded {timeout_seconds}s")
         return max(1, min(cap_ms, int(rem * 1000)))
 
-    backend = HeadlessBackend(sim_exe_path=str(sim_exe))
+    backend = HeadlessBackend(exe_path=str(sim_exe))
     try:
         authority = _HeldOutGreedyAuthority(policy, seed)
         encoder = GroundedObservationEncoder(training_config.model.to_encoding_config())
@@ -183,7 +184,7 @@ def _run_one_heldout_seed(
         revision = backend.get_state()["state_version"]
         state = backend.reset(
             ResetRequest(
-                request_id=f"heldout-reset-{seed}",
+                request_id=str(uuid4()),
                 session_id=backend.session_id,
                 scenario="full-run",
                 expected_state_version=revision,
