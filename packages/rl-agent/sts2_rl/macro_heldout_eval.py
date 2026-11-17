@@ -11,10 +11,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import time
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any, Final, Literal
 from uuid import uuid4
@@ -29,7 +30,10 @@ from sts2_rl.backends import HeadlessBackend
 from sts2_rl.contracts import EnvironmentResult, ResetRequest
 from sts2_rl.encoding import EncodedDecisionSnapshot, GroundedObservationEncoder
 from sts2_rl.joint.authority import HybridCollectionAuthority
-from sts2_rl.joint.parallel_collection import BatchedPolicyInferenceServer
+from sts2_rl.joint.parallel_collection import (
+    BatchedPolicyInferenceServer,
+    RemoteBatchedFrozenPolicy,
+)
 from sts2_rl.macro_root_diagnostic import (
     FrozenPolicy,
     dispatch_request,
@@ -158,6 +162,7 @@ def _run_one_heldout_seed(
     sim_exe: Path,
     max_native_steps: int,
     timeout_seconds: float,
+    shared_backend: HeadlessBackend | None = None,
 ) -> dict[str, Any]:
     if seed % 2 != EVALUATION_SEED_PARITY:
         raise ValueError(f"held-out evaluation refuses even training seed {seed}")
@@ -170,7 +175,8 @@ def _run_one_heldout_seed(
             raise TimeoutError(f"held-out seed {seed} exceeded {timeout_seconds}s")
         return max(1, min(cap_ms, int(rem * 1000)))
 
-    backend = HeadlessBackend(exe_path=str(sim_exe))
+    owns_backend = shared_backend is None
+    backend = shared_backend if shared_backend is not None else HeadlessBackend(exe_path=str(sim_exe))
     try:
         authority = _HeldOutGreedyAuthority(policy, seed)
         encoder = GroundedObservationEncoder(training_config.model.to_encoding_config())
@@ -283,7 +289,72 @@ def _run_one_heldout_seed(
             "shop_removes": authority.shop_removes,
         }
     finally:
-        backend.close()
+        if owns_backend:
+            backend.close()
+
+
+def _heldout_worker_entry(
+    worker_id: int,
+    task_queue: Any,
+    result_queue: Any,
+    infer_request_queue: Any,
+    infer_response_conn: Any,
+    sim_exe_str: str,
+    artifact_root_str: str,
+    training_config: TrainingConfig,
+    max_native_steps: int,
+    timeout_seconds: float,
+    recurrent_hidden_dim: int,
+    hierarchical_branch_greedy: bool,
+) -> None:
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["STS2_ARTIFACT_ROOT"] = artifact_root_str
+    if "tcmalloc" in os.environ.get("LD_PRELOAD", ""):
+        os.environ.pop("LD_PRELOAD", None)
+    torch.set_num_threads(1)
+
+    policy = RemoteBatchedFrozenPolicy(
+        worker_id=worker_id,
+        request_queue=infer_request_queue,
+        response_conn=infer_response_conn,
+        recurrent_hidden_dim=recurrent_hidden_dim,
+        hierarchical_branch_greedy=hierarchical_branch_greedy,
+    )
+    sim_path = Path(sim_exe_str)
+    backend: HeadlessBackend | None = None
+    try:
+        while True:
+            seed = task_queue.get()
+            if seed is None:
+                break
+            if backend is None:
+                backend = HeadlessBackend(exe_path=str(sim_path))
+            try:
+                row = _run_one_heldout_seed(
+                    seed=int(seed),
+                    policy=policy,
+                    training_config=training_config,
+                    sim_exe=sim_path,
+                    max_native_steps=max_native_steps,
+                    timeout_seconds=timeout_seconds,
+                    shared_backend=backend,
+                )
+                result_queue.put(("ok", row))
+            except BaseException as exc:
+                try:
+                    backend.close()
+                except BaseException:
+                    pass
+                backend = None
+                result_queue.put(("err", f"{type(exc).__name__}: {exc}"))
+    finally:
+        if backend is not None:
+            try:
+                backend.close()
+            except BaseException:
+                pass
 
 
 def evaluate_heldout_publication(
@@ -292,7 +363,7 @@ def evaluate_heldout_publication(
     config_path: Path,
     policy_version: int,
     episodes: int = 48,
-    workers: int = 24,
+    workers: int = 32,
     device_spec: str = "cuda",
     sim_exe_override: Path | None = None,
     overrides: Sequence[str] = (),
@@ -322,28 +393,97 @@ def evaluate_heldout_publication(
     eff_workers = min(episodes, workers)
     started = time.monotonic()
     rows: list[dict[str, Any]] = []
-    with BatchedPolicyInferenceServer(
-        loaded.model,
-        macro_cfg.training.model.to_encoding_config(),
-        device,
-        max_batch_size=max(8, eff_workers),
-        allow_tf32=macro_cfg.learner.allow_tf32,
-    ) as server:
-        with ThreadPoolExecutor(max_workers=eff_workers) as pool:
-            futures = {
-                pool.submit(
-                    _run_one_heldout_seed,
-                    seed=s,
-                    policy=server,
-                    training_config=macro_cfg.training,
-                    sim_exe=simulator.executable,
-                    max_native_steps=macro_cfg.branches.max_native_steps,
-                    timeout_seconds=macro_cfg.branches.timeout_seconds,
-                ): s
-                for s in seeds
-            }
-            for fut in as_completed(futures):
-                rows.append(fut.result())
+    if eff_workers == 1:
+        with BatchedPolicyInferenceServer(
+            loaded.model,
+            macro_cfg.training.model.to_encoding_config(),
+            device,
+            max_batch_size=8,
+            allow_tf32=macro_cfg.learner.allow_tf32,
+        ) as server:
+            shared = HeadlessBackend(exe_path=str(simulator.executable))
+            try:
+                for s in seeds:
+                    rows.append(
+                        _run_one_heldout_seed(
+                            seed=s,
+                            policy=server,
+                            training_config=macro_cfg.training,
+                            sim_exe=simulator.executable,
+                            max_native_steps=macro_cfg.branches.max_native_steps,
+                            timeout_seconds=macro_cfg.branches.timeout_seconds,
+                            shared_backend=shared,
+                        )
+                    )
+            finally:
+                shared.close()
+    else:
+        mp_ctx = get_context("spawn")
+        task_queue = mp_ctx.Queue()
+        result_queue = mp_ctx.Queue()
+        infer_request_queue = mp_ctx.Queue()
+        recv_conns: list[Any] = []
+        send_conns: list[Any] = []
+        for _ in range(eff_workers):
+            r_conn, s_conn = mp_ctx.Pipe(duplex=False)
+            recv_conns.append(r_conn)
+            send_conns.append(s_conn)
+        for s in seeds:
+            task_queue.put(int(s))
+        for _ in range(eff_workers):
+            task_queue.put(None)
+
+        procs: list[Any] = []
+        with BatchedPolicyInferenceServer(
+            loaded.model,
+            macro_cfg.training.model.to_encoding_config(),
+            device,
+            worker_send_conns=send_conns,
+            mp_request_queue=infer_request_queue,
+            max_batch_size=max(8, eff_workers),
+            allow_tf32=macro_cfg.learner.allow_tf32,
+        ) as server:
+            try:
+                for wid in range(eff_workers):
+                    p = mp_ctx.Process(
+                        target=_heldout_worker_entry,
+                        args=(
+                            wid,
+                            task_queue,
+                            result_queue,
+                            infer_request_queue,
+                            recv_conns[wid],
+                            str(simulator.executable),
+                            str(root),
+                            macro_cfg.training,
+                            macro_cfg.branches.max_native_steps,
+                            macro_cfg.branches.timeout_seconds,
+                            server.recurrent_hidden_dim,
+                            server.hierarchical_branch_greedy,
+                        ),
+                        daemon=True,
+                    )
+                    p.start()
+                    recv_conns[wid].close()
+                    procs.append(p)
+                for _ in range(len(seeds)):
+                    status_tag, payload = result_queue.get(
+                        timeout=max(120.0, float(macro_cfg.branches.timeout_seconds) + 60.0)
+                    )
+                    if status_tag != "ok":
+                        raise RuntimeError(f"held-out worker failed: {payload}")
+                    rows.append(payload)
+            finally:
+                for p in procs:
+                    p.join(timeout=5.0)
+                    if p.is_alive():
+                        p.terminate()
+                        p.join(timeout=2.0)
+                for s_conn in send_conns:
+                    try:
+                        s_conn.close()
+                    except OSError:
+                        pass
 
     rows.sort(key=lambda item: int(item["seed"]))
     n = len(rows)
@@ -402,7 +542,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--policy-version", type=int, required=True)
     parser.add_argument("--episodes", type=int, default=48)
-    parser.add_argument("--workers", type=int, default=24)
+    parser.add_argument("--workers", type=int, default=32)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--sim-exe", type=Path)
     parser.add_argument("--set", action="append", default=[], dest="overrides", metavar="KEY=TOML_VALUE")

@@ -212,12 +212,45 @@ def _extract_marked_json(stdout: str, begin_marker: str, end_marker: str) -> dic
 
 
 _WSL_BRIDGE_SERVER_SCRIPT = """
-import json, os, shutil, subprocess, sys, tempfile
-from pathlib import Path
+import contextlib, io, json, sys, time, uuid
+from colab_cli.common import state
+from colab_cli.runtime import ColabRuntime
 
-colab_bin = os.environ.get("COLAB_BIN") or str(Path.home() / ".local" / "bin" / "colab")
-if not Path(colab_bin).is_file():
-    colab_bin = shutil.which("colab") or colab_bin
+real_stdout = sys.stdout
+runtimes = {}
+
+def close_cached(session):
+    entry = runtimes.pop(session, None)
+    if entry is not None:
+        rt, _ = entry
+        try:
+            rt.stop()
+        except Exception:
+            pass
+
+def get_runtime(session, force_refresh=False):
+    if force_refresh:
+        close_cached(session)
+        state._sessions = None
+    s = state.get_session(session)
+    cached = runtimes.get(session)
+    if cached is not None:
+        rt, tok = cached
+        if tok == s.token:
+            return rt
+        close_cached(session)
+    def _on_k(kid):
+        s.kernel_id = kid
+        state.store.add(s)
+    rt = ColabRuntime(
+        s.url,
+        s.token,
+        kernel_id=s.kernel_id,
+        session_id=str(uuid.uuid4()),
+        on_kernel_started=_on_k,
+    )
+    runtimes[session] = (rt, s.token)
+    return rt
 
 for raw_line in sys.stdin:
     line = raw_line.strip()
@@ -227,35 +260,46 @@ for raw_line in sys.stdin:
     session = str(req["session"])
     timeout_s = int(req["timeout_seconds"])
     script = str(req["script"])
-    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as handle:
-        handle.write(script)
-        tmp_path = Path(handle.name)
-    try:
-        proc = subprocess.run(
-            ["timeout", "-k", "5", f"{timeout_s + 15}s", colab_bin, "exec", "-s", session, "--timeout", str(timeout_s), "-f", str(tmp_path)],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_s + 25,
-            check=False,
-        )
-        resp = {
-            "returncode": proc.returncode,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-        }
-    except Exception as exc:
+    last_err = ""
+    resp = None
+    for attempt in range(3):
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rt = get_runtime(session, force_refresh=(attempt > 0))
+                outputs = rt.execute_code(script, timeout=timeout_s)
+            out_parts = []
+            err_parts = []
+            has_err = False
+            for out in outputs:
+                if "text" in out:
+                    out_parts.append(str(out["text"]))
+                elif out.get("output_type") == "error":
+                    has_err = True
+                    ename = str(out.get("ename", "Error"))
+                    evalue = str(out.get("evalue", ""))
+                    tb = out.get("traceback") or []
+                    err_parts.append("".join(tb) if tb else f"{ename}: {evalue}")
+            resp = {
+                "returncode": 1 if has_err else 0,
+                "stdout": "".join(out_parts),
+                "stderr": "\\n".join(err_parts),
+            }
+            break
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)) and not isinstance(exc, SystemExit):
+                raise
+            last_err = f"{type(exc).__name__}: {exc}"
+            close_cached(session)
+            if attempt < 2:
+                time.sleep(1.0 * (attempt + 1))
+    if resp is None:
         resp = {
             "returncode": -1,
             "stdout": "",
-            "stderr": f"{type(exc).__name__}: {exc}",
+            "stderr": last_err,
         }
-    finally:
-        tmp_path.unlink(missing_ok=True)
-    sys.stdout.write(json.dumps(resp, separators=(",", ":")) + "\\n")
-    sys.stdout.flush()
+    real_stdout.write(json.dumps(resp, separators=(",", ":")) + "\\n")
+    real_stdout.flush()
 """
 
 
@@ -279,7 +323,11 @@ class _PersistentWslColabBridge:
                 "-e",
                 "bash",
                 "-lc",
-                f"exec python3 -u -c 'import base64; exec(base64.b64decode(\"{b64_script}\").decode(\"utf-8\"))'",
+                (
+                    "colab_bin=${COLAB_BIN:-$HOME/.local/bin/colab}; "
+                    "py_bin=$(head -n 1 \"$colab_bin\" | cut -c 3-); "
+                    f"exec \"$py_bin\" -u -c 'import base64; exec(base64.b64decode(\"{b64_script}\").decode(\"utf-8\"))'"
+                ),
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
