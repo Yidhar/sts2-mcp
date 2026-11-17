@@ -24,6 +24,7 @@ import json
 import math
 import os
 import queue
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -231,13 +232,13 @@ for raw_line in sys.stdin:
         tmp_path = Path(handle.name)
     try:
         proc = subprocess.run(
-            [colab_bin, "exec", "-s", session, "--timeout", str(timeout_s), "-f", str(tmp_path)],
+            ["timeout", "-k", "5", f"{timeout_s + 15}s", colab_bin, "exec", "-s", session, "--timeout", str(timeout_s), "-f", str(tmp_path)],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout_s + 20,
+            timeout=timeout_s + 25,
             check=False,
         )
         resp = {
@@ -272,7 +273,13 @@ class _PersistentWslColabBridge:
         self.close()
         self._out_queue = queue.Queue()
         proc = subprocess.Popen(
-            ["wsl", "-e", "python3", "-u", "-c", _WSL_BRIDGE_SERVER_SCRIPT],
+            [
+                "wsl",
+                "-e",
+                "bash",
+                "-lc",
+                f"exec python3 -u -c {shlex.quote(_WSL_BRIDGE_SERVER_SCRIPT)}",
+            ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
