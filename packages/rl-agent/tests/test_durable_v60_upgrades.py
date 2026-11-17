@@ -1,0 +1,653 @@
+"""Unit tests for Durable Afterstate Macro Credit v6.0 (durable_v11 + Twin Double-MPO + Multi-Step KL)."""
+
+from __future__ import annotations
+
+import copy
+import importlib.util
+import json
+import os
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+
+torch = pytest.importorskip("torch")
+
+from sts2_baseline import act_frontloaded_death_reward_identity  # noqa: E402
+from sts2_rl.encoding import GroundedObservationEncoder  # noqa: E402
+from sts2_rl.encoding.snapshot import collate_encoded_snapshots, collate_encoded_worlds  # noqa: E402
+from sts2_rl.joint.afterstate import synthesize_deterministic_afterstates  # noqa: E402
+from sts2_rl.joint.macro_checkpoint import (  # noqa: E402
+    MacroCheckpointIdentity,
+    publish_macro_checkpoint,
+    save_macro_checkpoint,
+)
+from sts2_rl.joint.macro_credit_data import (  # noqa: E402
+    MacroAfterstateNode,
+    MacroCreditCohort,
+    MacroCreditTrajectory,
+    MacroRewardFacts,
+    macro_mixture_log_probs,
+)
+from sts2_rl.joint.macro_credit_learner import (  # noqa: E402
+    MACRO_CREDIT_LEARNER_VERSION,
+    MacroCreditLearner,
+    MacroCreditLearnerConfig,
+)
+from sts2_rl.joint.macro_targets import project_hierarchical_macro_policy  # noqa: E402
+from sts2_rl.joint.transitions import HybridVTraceStep  # noqa: E402
+from sts2_rl.macro_root_policy import FrozenMacroRootPolicy, load_frozen_macro_teacher  # noqa: E402
+from sts2_rl.models.hybrid_actor_critic import (  # noqa: E402
+    HybridActorCriticConfig,
+    HybridDomainActorCriticModel,
+)
+from sts2_rl.semantics.forward import forward_decision  # noqa: E402
+from sts2_rl.train_macro_credit import _actor_critic_config, load_macro_training_config  # noqa: E402
+from sts2_rl.training.config import ModelConfig, load_training_config  # noqa: E402
+
+
+def _tiny_model_config() -> ModelConfig:
+    return ModelConfig(
+        d_model=32,
+        n_heads=4,
+        ffn_dim=64,
+        world_layers=1,
+        latent_slots=4,
+        latent_layers=1,
+        recurrent_hidden_dim=64,
+        dropout=0.0,
+        max_world_tokens=256,
+        max_candidates=32,
+        max_candidate_local_tokens=16,
+    )
+
+
+def _deck_alpha() -> list[dict[str, Any]]:
+    return [
+        {"id": f"strike_{i}", "type": "Attack", "rarity": "Basic", "cost": 1, "dynamic_vars": {"Damage": 6}}
+        for i in range(5)
+    ] + [
+        {"id": "reaper_heal", "type": "Attack", "rarity": "Rare", "cost": 2, "dynamic_vars": {"Damage": 10}},
+    ]
+
+
+def _deck_beta() -> list[dict[str, Any]]:
+    return [
+        {"id": f"shrug_{i}", "type": "Skill", "rarity": "Common", "cost": 1, "dynamic_vars": {"Block": 11}}
+        for i in range(6)
+    ] + [
+        {"id": "barricade_def", "type": "Power", "rarity": "Rare", "cost": 3, "dynamic_vars": {"Block": 20}},
+        {"id": "body_slam", "type": "Attack", "rarity": "Common", "cost": 0, "dynamic_vars": {"Damage": 15}},
+    ]
+
+
+def _encode_world_state(
+    encoder: GroundedObservationEncoder,
+    *,
+    deck: list[dict[str, Any]],
+    hp: int,
+    gold: int,
+    shop: dict[str, Any] | None = None,
+    legal_actions: list[dict[str, Any]] | None = None,
+) -> Any:
+    obs: dict[str, Any] = {
+        "phase": "shop" if shop is not None else "map",
+        "decision_domain": "shop" if shop is not None else "map",
+        "run": {"active": True, "act": 1, "floor": 6},
+        "player": {
+            "character_id": "IRONCLAD",
+            "hp": hp,
+            "current_hp": hp,
+            "max_hp": 80,
+            "gold": gold,
+            "open_potion_slots": 2,
+            "deck": copy.deepcopy(deck),
+            "relics": [{"id": "BURNING_BLOOD"}],
+            "potions": [],
+        },
+    }
+    if shop is not None:
+        obs["shop"] = copy.deepcopy(shop)
+    else:
+        obs["map"] = {"nodes": [{"x": 0, "y": 1, "type": "Monster"}]}
+    actions = legal_actions or [
+        {"action_id": "noop", "kind": "proceed", "model_action_kind": "map", "is_enabled": True}
+    ]
+    return encoder.encode(obs, actions).snapshot
+
+
+def test_durable_v11_restores_build_vitals_cross_derivative_and_preserves_monotonicity() -> None:
+    torch.manual_seed(11)
+    cfg = _tiny_model_config()
+    encoder = GroundedObservationEncoder(cfg.to_encoding_config())
+
+    model_v10 = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v10(cfg.to_model_config()))
+    model_v11 = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v11(cfg.to_model_config()))
+    with torch.no_grad():
+        model_v10.durable_deck_out.weight.normal_(0.0, 0.1)
+        model_v11.durable_deck_out.weight.normal_(0.0, 0.1)
+        cast(Any, model_v11.durable_hp_build_gate[-1]).weight.normal_(0.0, 0.25)
+        cast(Any, model_v11.durable_liquid_build_gate[-1]).weight.normal_(0.0, 0.25)
+
+    worlds = tuple(
+        _encode_world_state(encoder, deck=d, hp=hp, gold=gold)
+        for d in (_deck_alpha(), _deck_beta())
+        for hp, gold in ((16, 50), (68, 50), (68, 150))
+    )
+    wb, dom = collate_encoded_worlds(
+        worlds,
+        expected_config=worlds[0].config,
+        expected_fingerprint=worlds[0].encoding_fingerprint,
+        device=torch.device("cpu"),
+    )
+    with torch.no_grad():
+        v10_vals, _ = model_v10.forward_durable_value(wb, dom, None)
+        v11_h1, v11_h2, _ = model_v11.forward_durable_value_pair(wb, dom, None)
+
+    # Confirm v10 additive separation vs v11 non-zero cross-derivative (Build x HP and Build x Gold).
+    v10_dhp_a = float((v10_vals[1] - v10_vals[0]).item())
+    v10_dhp_b = float((v10_vals[4] - v10_vals[3]).item())
+    assert abs(v10_dhp_a - v10_dhp_b) < 1e-6
+
+    v11_dhp_a = float((v11_h1[1] - v11_h1[0]).item())
+    v11_dhp_b = float((v11_h1[4] - v11_h1[3]).item())
+    v11_dgold_a = float((v11_h1[2] - v11_h1[1]).item())
+    v11_dgold_b = float((v11_h1[5] - v11_h1[4]).item())
+    assert abs(v11_dhp_a - v11_dhp_b) > 1e-4
+    assert abs(v11_dgold_a - v11_dgold_b) > 1e-4
+    assert torch.isfinite(v11_h2).all()
+
+    # Strict monotonicity across HP and Gold grids for both decks.
+    for deck in (_deck_alpha(), _deck_beta()):
+        hp_worlds = tuple(_encode_world_state(encoder, deck=deck, hp=h, gold=100) for h in (5, 16, 40, 68, 80))
+        hwb, hdom = collate_encoded_worlds(
+            hp_worlds,
+            expected_config=hp_worlds[0].config,
+            expected_fingerprint=hp_worlds[0].encoding_fingerprint,
+            device=torch.device("cpu"),
+        )
+        gold_worlds = tuple(_encode_world_state(encoder, deck=deck, hp=50, gold=g) for g in (0, 50, 150, 300))
+        gwb, gdom = collate_encoded_worlds(
+            gold_worlds,
+            expected_config=gold_worlds[0].config,
+            expected_fingerprint=gold_worlds[0].encoding_fingerprint,
+            device=torch.device("cpu"),
+        )
+        with torch.no_grad():
+            hv, _ = model_v11.forward_durable_value(hwb, hdom, None)
+            gv, _ = model_v11.forward_durable_value(gwb, gdom, None)
+        assert bool((hv[1:] >= hv[:-1] - 1e-6).all().item())
+        assert bool((gv[1:] >= gv[:-1] - 1e-6).all().item())
+
+
+def test_durable_v11_preserves_shop_continuation_without_candidate_leakage() -> None:
+    torch.manual_seed(19)
+    cfg = _tiny_model_config()
+    encoder = GroundedObservationEncoder(cfg.to_encoding_config())
+    model_v11 = HybridDomainActorCriticModel(HybridActorCriticConfig.durable_v11(cfg.to_model_config()))
+    with torch.no_grad():
+        cast(Any, model_v11.durable_shop_base_head[-1]).weight.normal_(0.0, 0.25)
+        cast(Any, model_v11.durable_shop_liquid_gate[-1]).weight.normal_(0.0, 0.25)
+
+    shelf_items: list[dict[str, Any]] = [
+        {"index": 0, "slot_index": 0, "category": "relic", "type": "relic", "cost": 150, "relic": {"id": "ANCHOR", "has_upon_pickup_effect": False}},
+        {"index": 1, "slot_index": 1, "category": "card", "type": "card", "cost": 70, "card": {"id": "OFFERING", "type": "Skill", "rarity": "Rare", "cost": 0}},
+    ]
+    shelf_rich: dict[str, Any] = {
+        "visible": True,
+        "is_open": True,
+        "gold": 180,
+        "items": shelf_items,
+    }
+    shelf_empty = {
+        "visible": True,
+        "is_open": True,
+        "gold": 180,
+        "items": [
+            {"index": 0, "slot_index": 0, "category": "card", "type": "card", "cost": 175, "card": {"id": "STRIKE", "type": "Attack", "rarity": "Basic", "cost": 1}},
+        ],
+    }
+    w_in_rich = _encode_world_state(encoder, deck=_deck_alpha(), hp=60, gold=180, shop=shelf_rich)
+    w_in_poor = _encode_world_state(encoder, deck=_deck_alpha(), hp=60, gold=180, shop=shelf_empty)
+    w_exited = _encode_world_state(encoder, deck=_deck_alpha(), hp=60, gold=180, shop=None)
+
+    wb, dom = collate_encoded_worlds(
+        (w_in_rich, w_in_poor, w_exited),
+        expected_config=w_in_rich.config,
+        expected_fingerprint=w_in_rich.encoding_fingerprint,
+        device=torch.device("cpu"),
+    )
+    with torch.no_grad():
+        vals, _ = model_v11.forward_durable_value(wb, dom, None)
+    assert abs(float((vals[0] - vals[2]).item())) > 1e-4
+    assert abs(float((vals[0] - vals[1]).item())) > 1e-4
+
+    # Candidate firewall check: changing legal candidate actions (zone 24) must have zero effect on durable value.
+    snap_a = _encode_world_state(
+        encoder,
+        deck=_deck_alpha(),
+        hp=60,
+        gold=180,
+        shop=shelf_rich,
+        legal_actions=[
+            {"action_id": "leave", "kind": "shop_leave", "model_action_kind": "shop", "is_enabled": True},
+        ],
+    )
+    snap_b = _encode_world_state(
+        encoder,
+        deck=_deck_alpha(),
+        hp=60,
+        gold=180,
+        shop=shelf_rich,
+        legal_actions=[
+            {"action_id": "buy0", "kind": "shop_purchase", "model_action_kind": "shop", "is_enabled": True, "item": shelf_items[0]},
+            {"action_id": "leave", "kind": "shop_leave", "model_action_kind": "shop", "is_enabled": True},
+        ],
+    )
+    b_snaps = collate_encoded_snapshots(
+        (snap_a, snap_b),
+        expected_config=snap_a.config,
+        expected_fingerprint=snap_a.encoding_fingerprint,
+        device=torch.device("cpu"),
+    )
+    with torch.no_grad():
+        dv1, dv2, _ = model_v11.forward_durable_value_pair(b_snaps.world, b_snaps.domain_ids, None)
+    assert float((dv1[0] - dv1[1]).abs().item()) < 1e-6
+    assert float((dv2[0] - dv2[1]).abs().item()) < 1e-6
+
+
+def test_durable_v10_to_v11_warmstart_and_teacher_roundtrip(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    torch.manual_seed(29)
+    cfg = _tiny_model_config()
+    train_cfg = load_training_config(profile="preheat")
+    from dataclasses import replace
+
+    train_cfg = replace(
+        train_cfg,
+        model=cfg,
+        curriculum=replace(train_cfg.curriculum, revival_budget=16),
+    )
+    ac_v10 = HybridActorCriticConfig.durable_v10(cfg.to_model_config())
+    src_model = HybridDomainActorCriticModel(ac_v10)
+    with torch.no_grad():
+        cast(Any, src_model.durable_value_head[-1]).weight.normal_(0.0, 0.05)
+        src_model.durable_deck_out.weight.normal_(0.0, 0.05)
+    opt = torch.optim.AdamW(src_model.parameters(), lr=1e-4)
+    identity = MacroCheckpointIdentity(
+        course_config={"version": "test"},
+        model_config=ac_v10.as_mapping(),
+        reward_identity=act_frontloaded_death_reward_identity(revival_budget=32),
+        lineage_id="v10-parent",
+        learner_version=MACRO_CREDIT_LEARNER_VERSION,
+    )
+    ckpt_path = tmp_path / "src" / "checkpoint.pt"
+    pub_path = tmp_path / "src" / "publication.pt"
+    save_macro_checkpoint(
+        ckpt_path,
+        identity=identity,
+        model=src_model,
+        optimizer=opt,
+        update=125,
+        next_seed_index=6000,
+        initialization={"mode": "test"},
+        artifact_root=tmp_path,
+    )
+    publish_macro_checkpoint(ckpt_path, pub_path, identity=identity, artifact_root=tmp_path)
+
+    # 1. Teacher load round-trip on v10 publication must still pass exact as_mapping() equality.
+    teacher = load_frozen_macro_teacher(
+        pub_path,
+        expected_encoding=cfg.to_encoding_config(),
+        device=torch.device("cpu"),
+        rocm_sdpa_backend="math",
+    )
+    assert not teacher.model.actor_critic_config.enable_build_conditioned_durable_value
+
+    # 2. Student warm-start into durable_v11 preserves Head 1 on non-shop states and breaks symmetry on Head 2.
+    ac_v11 = HybridActorCriticConfig.durable_v11(cfg.to_model_config())
+    student_policy = FrozenMacroRootPolicy(
+        pub_path,
+        train_cfg,
+        "cpu",
+        initialize_from_macro_publication=True,
+        actor_critic_config=ac_v11,
+    )
+    student = student_policy.model
+    student.eval()
+    encoder = GroundedObservationEncoder(cfg.to_encoding_config())
+    w_map = _encode_world_state(encoder, deck=_deck_alpha(), hp=52, gold=120, shop=None)
+    wb, dom = collate_encoded_worlds(
+        (w_map,),
+        expected_config=w_map.config,
+        expected_fingerprint=w_map.encoding_fingerprint,
+        device=torch.device("cpu"),
+    )
+    with torch.no_grad():
+        v_src, _ = src_model.forward_durable_value(wb, dom, None)
+        s_h1, s_h2, _ = student.forward_durable_value_pair(wb, dom, None)
+    assert float((s_h1 - v_src).abs().max().item()) < 1e-6
+    assert float((s_h1 - s_h2).abs().max().item()) > 1e-7
+
+
+def test_double_mpo_eliminates_multi_card_winners_curse_bias() -> None:
+    # 3 take actions with true Q = 0.0 (branch 0) vs 1 skip action with true Q = +0.02 (branch 1).
+    true_q = torch.tensor([0.0, 0.0, 0.0, 0.02], dtype=torch.float32)
+    prior_probs = torch.tensor([0.5 / 3, 0.5 / 3, 0.5 / 3, 0.5], dtype=torch.float32)
+    teacher_logs = prior_probs.log()
+    branch_ids = torch.tensor([0, 0, 0, 1], dtype=torch.long)
+
+    noiseless_proj = project_hierarchical_macro_policy(
+        det_action_values=true_q,
+        teacher_log_probs=teacher_logs,
+        policy_branch_ids=branch_ids,
+        branch_max_kl=0.04,
+        within_max_kl=0.05,
+        min_temperature=0.02,
+    )
+    noiseless_skip = float(noiseless_proj.target_probabilities[3].item())
+    assert noiseless_skip > 0.60
+
+    gen = torch.Generator(device="cpu").manual_seed(20261117)
+    single_skip_probs: list[float] = []
+    double_skip_probs: list[float] = []
+    for _ in range(200):
+        eps1 = torch.randn((4,), generator=gen) * 0.08
+        eps2 = torch.randn((4,), generator=gen) * 0.08
+        # Unchanged deck on skip has much lower epistemic noise than speculative card picks.
+        eps1[3] *= 0.2
+        eps2[3] *= 0.2
+        v1 = true_q + eps1
+        v2 = true_q + eps2
+
+        proj_single = project_hierarchical_macro_policy(
+            det_action_values=v1,
+            teacher_log_probs=teacher_logs,
+            policy_branch_ids=branch_ids,
+            branch_max_kl=0.04,
+            within_max_kl=0.05,
+            min_temperature=0.02,
+        )
+        proj_double = project_hierarchical_macro_policy(
+            det_action_values=v1,
+            det_action_values_twin=v2,
+            pessimism_coef=0.25,
+            teacher_log_probs=teacher_logs,
+            policy_branch_ids=branch_ids,
+            branch_max_kl=0.04,
+            within_max_kl=0.05,
+            min_temperature=0.02,
+        )
+        single_skip_probs.append(float(proj_single.target_probabilities[3].item()))
+        double_skip_probs.append(float(proj_double.target_probabilities[3].item()))
+
+    mean_single_skip = sum(single_skip_probs) / len(single_skip_probs)
+    mean_double_skip = sum(double_skip_probs) / len(double_skip_probs)
+    # Single critic loses >0.10 skip probability vs noiseless oracle due to 3-card Winner's Curse,
+    # whereas Twin Double-MPO recovers high skip discipline!
+    assert noiseless_skip - mean_single_skip > 0.10
+    assert mean_double_skip > 0.55
+    assert mean_double_skip - mean_single_skip > 0.08
+
+
+def _build_synthetic_durable_cohort(
+    model: HybridDomainActorCriticModel,
+    encoder: GroundedObservationEncoder,
+    *,
+    num_games: int = 4,
+) -> MacroCreditCohort:
+    trajs: list[MacroCreditTrajectory] = []
+    for g in range(num_games):
+        reward_obs = {
+            "phase": "card_reward",
+            "decision_domain": "card_reward",
+            "run": {"active": True, "act": 1, "floor": 2 + g},
+            "player": {
+                "character_id": "IRONCLAD",
+                "hp": 45 + 4 * g,
+                "current_hp": 45 + 4 * g,
+                "max_hp": 80,
+                "gold": 90 + 15 * g,
+                "deck": _deck_alpha(),
+                "relics": [],
+                "potions": [],
+            },
+            "card_reward_selection": {
+                "can_skip": True,
+                "cards": [
+                    {"id": f"pommel_{g}", "type": "Attack", "cost": 1},
+                    {"id": f"shrug_{g}", "type": "Skill", "cost": 1},
+                ],
+            },
+        }
+        reward_legal = [
+            {"action_id": "r0", "kind": "select_card_reward", "model_action_kind": "card_reward", "is_enabled": True, "card": {"id": f"pommel_{g}", "type": "Attack", "cost": 1}},
+            {"action_id": "r1", "kind": "select_card_reward", "model_action_kind": "card_reward", "is_enabled": True, "card": {"id": f"shrug_{g}", "type": "Skill", "cost": 1}},
+            {"action_id": "skip", "kind": "skip_card_reward", "model_action_kind": "card_reward", "is_enabled": True},
+        ]
+        dec = forward_decision(reward_obs, reward_legal, control_domain="macro")
+        assert dec is not None
+        enc = encoder.encode(reward_obs, [c.semantic_action for c in dec.candidates])
+        grouped_cands = tuple(dec.candidates[ref.representative_position] for ref in enc.actions)
+        post_worlds = synthesize_deterministic_afterstates(
+            encoder=encoder, observation=reward_obs, decision=dec, candidates=grouped_cands
+        )
+        assert post_worlds is not None
+
+        combat_obs = {
+            "phase": "combat",
+            "decision_domain": "combat",
+            "run": {"active": True, "act": 1, "floor": 3 + g},
+            "player": {
+                "id": "ironclad",
+                "side": "player",
+                "hp": 44 + 4 * g,
+                "max_hp": 80,
+                "energy": 3,
+                "hand": [{"id": "strike", "cost": 1}, {"id": "defend", "cost": 1}],
+            },
+            "combat": {"in_progress": True, "enemies": [{"id": "cultist", "side": "enemy", "hp": 35, "max_hp": 48}]},
+        }
+        combat_legal = [
+            {"action_handle": "c0", "kind": "play_card", "model_action_kind": "play_card", "is_enabled": True, "card": {"id": "strike", "cost": 1}},
+            {"action_handle": "c1", "kind": "play_card", "model_action_kind": "play_card", "is_enabled": True, "card": {"id": "defend", "cost": 1}},
+        ]
+        combat_snap = encoder.encode(combat_obs, combat_legal).snapshot
+
+        with torch.no_grad():
+            b0 = collate_encoded_snapshots(
+                (enc.snapshot,),
+                expected_config=enc.snapshot.config,
+                expected_fingerprint=enc.snapshot.encoding_fingerprint,
+                device=torch.device("cpu"),
+            )
+            out0 = model(b0, None, validate=False)
+            mask0 = torch.tensor(enc.snapshot.action_mask, dtype=torch.bool)
+            lp0 = torch.log_softmax(out0.policy_logits[0, : mask0.numel()].masked_fill(~mask0, -torch.inf), dim=0)
+            beh0 = macro_mixture_log_probs(lp0, enc.snapshot, 0.04)
+
+            b1 = collate_encoded_snapshots(
+                (combat_snap,),
+                expected_config=combat_snap.config,
+                expected_fingerprint=combat_snap.encoding_fingerprint,
+                device=torch.device("cpu"),
+            )
+            out1 = model(b1, out0.recurrent_state, validate=False)
+            mask1 = torch.tensor(combat_snap.action_mask, dtype=torch.bool)
+            lp1 = torch.log_softmax(out1.policy_logits[0, : mask1.numel()].masked_fill(~mask1, -torch.inf), dim=0)
+
+        en0 = [idx for idx, flag in enumerate(enc.snapshot.action_mask) if flag]
+        en1 = [idx for idx, flag in enumerate(combat_snap.action_mask) if flag]
+        a0 = en0[g % len(en0)]
+        a1 = en1[g % len(en1)]
+        b_name = grouped_cands[a0].branch
+        from sts2_rl.semantics.clock import decision_discount
+
+        disc0 = decision_discount(floor_before=2 + g, floor_after=3 + g, terminal=False)
+        r_term = 0.5 if g % 2 == 0 else -0.3
+        s0 = HybridVTraceStep(enc.snapshot, a0, float(beh0[a0].item()), 0.1, disc0, False, "reward", b_name, "macro", 0)
+        s1 = HybridVTraceStep(combat_snap, a1, float(lp1[a1].item()), r_term, 0.0, True, "combat", "play_card", "combat", 0)
+        f0 = MacroRewardFacts(0.0, 0.1, 0.0, 0.0, 0.0, 0, 0.0, 2 + g, 3 + g, 1)
+        f1 = MacroRewardFacts(r_term, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 3 + g, 3 + g, 1)
+        node0 = MacroAfterstateNode(0, "reward", tuple(c.branch for c in grouped_cands), post_worlds)
+        trajs.append(
+            MacroCreditTrajectory(
+                f"traj-{g}",
+                2 * (6_700_000 + g),
+                0,
+                (),
+                (s0, s1),
+                None,
+                None,
+                "factual_terminal",
+                (f0, f1),
+                afterstate_nodes=(node0,),
+                macro_branch_epsilon=0.04,
+            )
+        )
+    return MacroCreditCohort("cohort-v60", 0, (), natural_only=tuple(trajs))
+
+
+def test_multi_minibatch_twin_learner_executes_trust_region_and_kl_early_stop() -> None:
+    torch.manual_seed(41)
+    cfg = _tiny_model_config()
+    encoder = GroundedObservationEncoder(cfg.to_encoding_config())
+    ac_cfg = HybridActorCriticConfig.durable_v11(cfg.to_model_config())
+    model_a = HybridDomainActorCriticModel(ac_cfg)
+    with torch.no_grad():
+        cast(Any, model_a.durable_value_head[-1]).weight.normal_(0.0, 0.15)
+        cast(Any, model_a.durable_twin_value_head[-1]).weight.normal_(0.0, 0.15)
+    model_b = copy.deepcopy(model_a)
+    cohort = _build_synthetic_durable_cohort(model_a, encoder, num_games=4)
+
+    base_kwargs: dict[str, Any] = {
+        "target_mode": "durable_afterstate_v2",
+        "domain_layers": 2,
+        "joint_layers": 3,
+        "enable_direct_vitals_context": True,
+        "enable_macro_branch_prior": True,
+        "enable_persistent_only_durable_value": True,
+        "enable_asymmetric_revival_critic": True,
+        "enable_draw_weighted_durable_value": True,
+        "enable_role_conditioned_candidate_policy": True,
+        "enable_deconfounded_durable_value": True,
+        "enable_monotone_deconfounded_durable_value": True,
+        "enable_balanced_deconfounded_durable_value": True,
+        "enable_expressive_synergy_backbone": True,
+        "enable_debloated_synergy_durable_value": True,
+        "enable_build_conditioned_durable_value": True,
+        "enable_twin_durable_value_heads": True,
+        "double_mpo_pessimism_coef": 0.25,
+        "enable_hierarchical_afterstate_mpo": True,
+        "revival_budget": 16,
+        "durable_warmup_updates": 0,
+        "combat_actor_warmup_updates": 0,
+        "clip_combat_pg": True,
+        "clip_macro_pg_fallback": True,
+        "macro_mpo_trust_kl_weight": 0.06,
+        "learning_rate": 5e-4,
+        "ppo_epochs_per_cohort": 2,
+        "ppo_minibatches_per_cohort": 2,
+    }
+
+    learner_full = MacroCreditLearner(
+        model=model_a,
+        config=MacroCreditLearnerConfig(**base_kwargs, target_macro_step_kl=0.50),
+    )
+    metrics_full = learner_full.learn(cohort)
+    assert metrics_full["ppo_optimizer_steps_executed"] == 4
+    assert metrics_full["ppo_kl_early_stopped"] is False
+    assert metrics_full["mean_updated_macro_policy_kl"] > 0.0
+    assert metrics_full["mean_updated_policy_kl_to_teacher"] == metrics_full["mean_updated_macro_policy_kl"]
+    assert metrics_full["mean_afterstate_twin_disagreement"] > 0.0
+
+    # Tight target_macro_step_kl must allow step 0 and stop early on subsequent minibatches.
+    learner_tight = MacroCreditLearner(
+        model=model_b,
+        config=MacroCreditLearnerConfig(**base_kwargs, target_macro_step_kl=1e-9),
+    )
+    metrics_tight = learner_tight.learn(cohort)
+    assert 1 <= metrics_tight["ppo_optimizer_steps_executed"] < 4
+    assert metrics_tight["ppo_kl_early_stopped"] is True
+
+
+def test_v60_experiment_config_and_campaign_heldout_gate_sync(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    v60_toml = (
+        Path(__file__).resolve().parents[1]
+        / "config/experiments/hybrid_macro_credit_v16_durable_afterstate_v60_wide256_b16_g4_turbo.toml"
+    )
+    cfg = load_macro_training_config(v60_toml)
+    assert cfg.learner.revival_budget == 16
+    assert cfg.training.curriculum.revival_budget == 16
+    assert cfg.course.seed_index_offset == 300000
+    assert cfg.learner.enable_build_conditioned_durable_value is True
+    assert cfg.learner.enable_twin_durable_value_heads is True
+    assert cfg.learner.ppo_epochs_per_cohort == 2
+    assert cfg.learner.ppo_minibatches_per_cohort == 4
+    ac_cfg = _actor_critic_config(cfg)
+    assert ac_cfg.enable_build_conditioned_durable_value is True
+    assert ac_cfg.enable_twin_durable_value_heads is True
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts/run_colab_g4_durable_campaign.py"
+    spec = importlib.util.spec_from_file_location("run_colab_g4_durable_campaign", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    out_dir = tmp_path / "exp"
+    drive_dir = tmp_path / "drive"
+    out_dir.mkdir()
+    (out_dir / "checkpoint.pt").write_bytes(b"ckpt")
+    (out_dir / "publication.pt").write_bytes(b"pub")
+    (out_dir / "status.json").write_text('{"committed_update": 1, "next_seed_index": 48}\n', encoding="utf-8")
+
+    monkeypatch.setattr(
+        module,
+        "_run_competence_probes",
+        lambda **_: {
+            "campfire_hp_sensitivity": {"p_rest_low_minus_high": 0.2, "durable_value_rest_advantage_shift": 0.03},
+            "smith_vs_remove_divergence": {"mean_smith_remove_jsd": 0.1, "mean_smith_remove_spearman": -0.2},
+            "multiset_split_invariance": {"grouped_vs_split_abs_diff": 0.0, "smith_high_delta_minus_basic_adv": 0.01},
+            "episode_macro_discipline": {"episodes": 48},
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_run_heldout_evaluation",
+        lambda **_: {
+            "evaluation_gate": 1,
+            "policy_version": 1,
+            "data_partition": "validation",
+            "seed_parity": "odd_held_out",
+            "revival_budget": 16,
+            "episodes": 48,
+            "successful_run_count": 11,
+            "run_win_rate": 11 / 48,
+            "act1_clear_rate": 38 / 48,
+            "act3_reach_rate": 21 / 48,
+            "skip_rate": 0.388,
+            "mean_final_deck_size": 25.3,
+        },
+    )
+    manifest = module._probe_prune_and_sync(
+        output_dir=out_dir,
+        drive_dir=drive_dir,
+        lineage_id="durable-afterstate-v6-0-wide256-b16-g4",
+        committed_after=1,
+        train_summary={"ok": True},
+        device="cpu",
+        env=dict(os.environ),
+        snapshot_interval=5,
+        keep_recent_cohorts=2,
+        config_path=v60_toml,
+        heldout_eval_interval=10,
+        heldout_eval_episodes=48,
+        heldout_eval_workers=8,
+    )
+    assert manifest["latest_heldout"] is not None
+    assert (drive_dir / "heldout_evaluations.jsonl").is_file()
+    assert (drive_dir / "snapshots" / "update-000001" / "heldout.json").is_file()
+    saved_line = json.loads((drive_dir / "heldout_evaluations.jsonl").read_text(encoding="utf-8").strip())
+    assert saved_line["revival_budget"] == 16
+    assert saved_line["seed_parity"] == "odd_held_out"

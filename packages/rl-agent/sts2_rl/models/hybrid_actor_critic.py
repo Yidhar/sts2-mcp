@@ -38,15 +38,18 @@ HYBRID_ACTOR_CRITIC_V2_MODEL_VERSION: Final = "sts2-hybrid-domain-actor-critic-v
 # facts (deck=2, player=13, relic=15, potion=16, modifier=20, run=22), isolated
 # from variable-size map graphs and transient picker containers.
 DECK_ZONE_ID: Final = 2
+SHOP_ZONE_ID: Final = 9
 PLAYER_ZONE_ID: Final = 13
 MODIFIER_ZONE_ID: Final = 20
 RUN_ZONE_ID: Final = 22
+SHOP_SUB_ZONE_ID: Final = 28
 NUMERIC_FACT_SLOT_START: Final = 6
 NUMERIC_FACT_SLOT_END: Final = 166
 DECK_FLOOR_ADDED_SLOT: Final = 52
 DECK_QUANTITY_SLOT: Final = 131
 DECK_REFERENCE_SIZE: Final = 12.0
 DURABLE_DECK_SIZE_DIM: Final = 4
+DURABLE_DECK_SUMMARY_DIM: Final = 4
 PLAYER_CURRENT_HP_OFFSET: Final = 34 - NUMERIC_FACT_SLOT_START
 PLAYER_GOLD_OFFSET: Final = 54 - NUMERIC_FACT_SLOT_START
 PLAYER_HP_OFFSET: Final = 62 - NUMERIC_FACT_SLOT_START
@@ -76,7 +79,9 @@ V2_FRESH_TENSOR_PREFIXES: Final[tuple[str, ...]] = (
     "durable_liquid_",
     "durable_progress_vitals_",
     "durable_revival_",
+    "durable_shop_",
     "durable_stage_",
+    "durable_twin_",
     "durable_value_head.",
     "durable_vitals_",
     "latent_slot_readout.",
@@ -115,6 +120,8 @@ class HybridActorCriticConfig:
     enable_balanced_deconfounded_durable_value: bool = False
     enable_expressive_synergy_backbone: bool = False
     enable_debloated_synergy_durable_value: bool = False
+    enable_build_conditioned_durable_value: bool = False
+    enable_twin_durable_value_heads: bool = False
 
     def __post_init__(self) -> None:
         HybridCandidateQConfig(
@@ -137,6 +144,8 @@ class HybridActorCriticConfig:
             "enable_balanced_deconfounded_durable_value",
             "enable_expressive_synergy_backbone",
             "enable_debloated_synergy_durable_value",
+            "enable_build_conditioned_durable_value",
+            "enable_twin_durable_value_heads",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"hybrid actor-critic {name} must be boolean")
@@ -176,6 +185,19 @@ class HybridActorCriticConfig:
             raise ValueError(
                 "enable_debloated_synergy_durable_value requires enable_expressive_synergy_backbone=True"
             )
+        if (
+            self.enable_build_conditioned_durable_value
+            and not self.enable_debloated_synergy_durable_value
+        ):
+            raise ValueError(
+                "enable_build_conditioned_durable_value requires enable_debloated_synergy_durable_value=True"
+            )
+        if self.enable_twin_durable_value_heads and not (
+            self.enable_durable_value_head and self.enable_persistent_only_durable_value
+        ):
+            raise ValueError(
+                "enable_twin_durable_value_heads requires enable_durable_value_head=True and enable_persistent_only_durable_value=True"
+            )
 
     @property
     def has_v2_extensions(self) -> bool:
@@ -194,6 +216,8 @@ class HybridActorCriticConfig:
             or self.enable_balanced_deconfounded_durable_value
             or self.enable_expressive_synergy_backbone
             or self.enable_debloated_synergy_durable_value
+            or self.enable_build_conditioned_durable_value
+            or self.enable_twin_durable_value_heads
         )
 
     @classmethod
@@ -407,6 +431,36 @@ class HybridActorCriticConfig:
         )
 
     @classmethod
+    def durable_v11(
+        cls,
+        grounded: GroundedCandidateConfig | None = None,
+        *,
+        domain_layers: int = 1,
+        joint_layers: int = 2,
+    ) -> HybridActorCriticConfig:
+        return cls(
+            grounded=grounded or GroundedCandidateConfig(),
+            domain_layers=domain_layers,
+            joint_layers=joint_layers,
+            enable_hierarchical_branch_policy=True,
+            enable_durable_value_head=True,
+            enable_persistent_build_context=True,
+            enable_direct_vitals_context=True,
+            enable_macro_branch_prior=True,
+            enable_persistent_only_durable_value=True,
+            enable_asymmetric_revival_critic=True,
+            enable_draw_weighted_durable_value=True,
+            enable_role_conditioned_candidate_policy=True,
+            enable_deconfounded_durable_value=True,
+            enable_monotone_deconfounded_durable_value=True,
+            enable_balanced_deconfounded_durable_value=True,
+            enable_expressive_synergy_backbone=True,
+            enable_debloated_synergy_durable_value=True,
+            enable_build_conditioned_durable_value=True,
+            enable_twin_durable_value_heads=True,
+        )
+
+    @classmethod
     def from_mapping(
         cls,
         mapping: dict[str, Any],
@@ -472,6 +526,12 @@ class HybridActorCriticConfig:
                 ),
                 enable_debloated_synergy_durable_value=bool(
                     mapping.get("enable_debloated_synergy_durable_value", False)
+                ),
+                enable_build_conditioned_durable_value=bool(
+                    mapping.get("enable_build_conditioned_durable_value", False)
+                ),
+                enable_twin_durable_value_heads=bool(
+                    mapping.get("enable_twin_durable_value_heads", False)
                 ),
             )
         raise ValueError(f"unsupported hybrid actor-critic model_config version: {version!r}")
@@ -548,6 +608,18 @@ class HybridActorCriticConfig:
                 base.update(
                     enable_debloated_synergy_durable_value=(
                         self.enable_debloated_synergy_durable_value
+                    ),
+                )
+            if self.enable_build_conditioned_durable_value:
+                base.update(
+                    enable_build_conditioned_durable_value=(
+                        self.enable_build_conditioned_durable_value
+                    ),
+                )
+            if self.enable_twin_durable_value_heads:
+                base.update(
+                    enable_twin_durable_value_heads=(
+                        self.enable_twin_durable_value_heads
                     ),
                 )
         return base
@@ -1013,6 +1085,155 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                     )
                     self.durable_deck_size_linear = nn.Linear(DURABLE_DECK_SIZE_DIM, 1, bias=False)
                     nn.init.zeros_(self.durable_deck_size_linear.weight)
+            if actor_critic.enable_build_conditioned_durable_value:
+                stage_in_dim_bc = DURABLE_STAGE_DIM + rev_dim
+                stage_mid_bc = max(16, cfg.ffn_dim // 2)
+                z_build_dim = cfg.d_model * 2 + cfg.ffn_dim + DURABLE_DECK_SUMMARY_DIM
+                build_stage_dim = z_build_dim + stage_in_dim_bc
+                shop_heads = cfg.n_heads if cfg.d_model % cfg.n_heads == 0 else 1
+                shop_readout_dim = z_build_dim + cfg.d_model + stage_in_dim_bc
+
+                def _make_zero_mlp(in_d: int, mid_d: int, out_d: int, bias_val: float = 0.0) -> nn.Sequential:
+                    fc1 = nn.Linear(in_d, mid_d)
+                    nn.init.normal_(fc1.weight, mean=0.0, std=0.08)
+                    nn.init.zeros_(fc1.bias)
+                    fc_out = nn.Linear(mid_d, out_d)
+                    nn.init.zeros_(fc_out.weight)
+                    nn.init.constant_(fc_out.bias, bias_val)
+                    return nn.Sequential(nn.LayerNorm(in_d), fc1, nn.SiLU(), fc_out)
+
+                self.durable_hp_build_gate = _make_zero_mlp(
+                    build_stage_dim, stage_mid_bc, DURABLE_HP_BASIS_DIM, 0.0
+                )
+                self.durable_liquid_build_gate = _make_zero_mlp(
+                    build_stage_dim, stage_mid_bc, DURABLE_LIQUID_BASIS_DIM, 0.0
+                )
+                self.durable_shop_query_proj = nn.Sequential(
+                    nn.LayerNorm(build_stage_dim),
+                    nn.Linear(build_stage_dim, cfg.d_model),
+                )
+                self.durable_shop_null = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
+                self.durable_shop_attn = nn.MultiheadAttention(
+                    cfg.d_model,
+                    shop_heads,
+                    dropout=cfg.dropout,
+                    batch_first=True,
+                )
+                self.durable_shop_base_head = _make_zero_mlp(shop_readout_dim, stage_mid_bc, 1, 0.0)
+                self.durable_shop_liquid_gate = _make_zero_mlp(
+                    shop_readout_dim, stage_mid_bc, DURABLE_LIQUID_BASIS_DIM, -6.5
+                )
+            self._twin_dropout_active = False
+            if actor_critic.enable_twin_durable_value_heads:
+                self.durable_twin_head1_dropout = nn.Dropout(p=0.05)
+                self.durable_twin_dropout = nn.Dropout(p=0.05)
+                self.durable_twin_head1_dropout.eval()
+                self.durable_twin_dropout.eval()
+                twin_val_out = nn.Linear(cfg.ffn_dim, 1)
+                nn.init.zeros_(twin_val_out.weight)
+                nn.init.zeros_(twin_val_out.bias)
+                self.durable_twin_value_head = nn.Sequential(
+                    nn.LayerNorm(durable_dim),
+                    nn.Linear(durable_dim, cfg.ffn_dim),
+                    nn.SiLU(),
+                    twin_val_out,
+                )
+                if actor_critic.enable_monotone_deconfounded_durable_value:
+                    t_stage_in_dim = DURABLE_STAGE_DIM + rev_dim
+                    t_stage_mid = max(16, cfg.ffn_dim // 2)
+                    t_bal = actor_critic.enable_balanced_deconfounded_durable_value
+
+                    def _make_twin_gate(out_d: int, init_b: float) -> nn.Sequential:
+                        g_fc1 = nn.Linear(t_stage_in_dim, t_stage_mid)
+                        nn.init.normal_(g_fc1.weight, mean=0.0, std=0.10)
+                        nn.init.zeros_(g_fc1.bias)
+                        g_out = nn.Linear(t_stage_mid, out_d)
+                        nn.init.zeros_(g_out.weight)
+                        nn.init.constant_(g_out.bias, init_b)
+                        return nn.Sequential(nn.LayerNorm(t_stage_in_dim), g_fc1, nn.SiLU(), g_out)
+
+                    self.durable_twin_hp_gate = _make_twin_gate(
+                        DURABLE_HP_BASIS_DIM, -5.2 if t_bal else -2.8
+                    )
+                    self.durable_twin_liquid_gate = _make_twin_gate(
+                        DURABLE_LIQUID_BASIS_DIM, -5.2 if t_bal else -3.2
+                    )
+                    self.durable_twin_cycle_gate = _make_twin_gate(
+                        DURABLE_CYCLE_BASIS_DIM, -5.5 if t_bal else -3.8
+                    )
+                if actor_critic.enable_draw_weighted_durable_value:
+                    t_deck_ctx_dim = (
+                        cfg.d_model * (1 + int(actor_critic.enable_direct_vitals_context))
+                        + memory_half
+                        + rev_dim
+                    )
+                    self.durable_twin_deck_norm = nn.LayerNorm(cfg.d_model * 3)
+                    self.durable_twin_deck_card_fc = nn.Linear(cfg.d_model * 3, cfg.ffn_dim)
+                    self.durable_twin_deck_raw_fc = nn.Linear(cfg.token_feature_dim * 2, cfg.ffn_dim)
+                    self.durable_twin_deck_ctx_norm = nn.LayerNorm(t_deck_ctx_dim)
+                    self.durable_twin_deck_ctx_fc = nn.Linear(t_deck_ctx_dim, cfg.ffn_dim, bias=False)
+                    self.durable_twin_deck_out = nn.Linear(cfg.ffn_dim * 3, 1)
+                    nn.init.zeros_(self.durable_twin_deck_out.weight)
+                    nn.init.zeros_(self.durable_twin_deck_out.bias)
+                    if actor_critic.enable_monotone_deconfounded_durable_value:
+                        self.durable_twin_deck_tilted_out = nn.Linear(
+                            cfg.ffn_dim * 3,
+                            len(DURABLE_TILT_BETAS),
+                        )
+                        nn.init.zeros_(self.durable_twin_deck_tilted_out.weight)
+                        nn.init.zeros_(self.durable_twin_deck_tilted_out.bias)
+                        if actor_critic.enable_balanced_deconfounded_durable_value:
+                            self.durable_twin_deck_linear_logit = nn.Parameter(
+                                torch.tensor(math.log(math.e - 1.0))
+                            )
+                            self.durable_twin_deck_tilt_logits = nn.Parameter(
+                                torch.tensor([-4.2, -4.0, -4.2])
+                            )
+                        else:
+                            self.durable_twin_deck_linear_logit = nn.Parameter(torch.zeros(()))
+                            self.durable_twin_deck_tilt_logits = nn.Parameter(
+                                torch.tensor([-1.8, -1.5, -1.8])
+                            )
+                if actor_critic.enable_build_conditioned_durable_value:
+                    t_stage_in = DURABLE_STAGE_DIM + rev_dim
+                    t_mid = max(16, cfg.ffn_dim // 2)
+                    t_zb = cfg.d_model * 2 + cfg.ffn_dim + DURABLE_DECK_SUMMARY_DIM
+                    t_bs = t_zb + t_stage_in
+                    t_sheads = cfg.n_heads if cfg.d_model % cfg.n_heads == 0 else 1
+                    t_sread = t_zb + cfg.d_model + t_stage_in
+
+                    def _make_twin_zero_mlp(
+                        in_d: int, mid_d: int, out_d: int, bias_val: float = 0.0
+                    ) -> nn.Sequential:
+                        fc1 = nn.Linear(in_d, mid_d)
+                        nn.init.normal_(fc1.weight, mean=0.0, std=0.08)
+                        nn.init.zeros_(fc1.bias)
+                        fc_out = nn.Linear(mid_d, out_d)
+                        nn.init.zeros_(fc_out.weight)
+                        nn.init.constant_(fc_out.bias, bias_val)
+                        return nn.Sequential(nn.LayerNorm(in_d), fc1, nn.SiLU(), fc_out)
+
+                    self.durable_twin_hp_build_gate = _make_twin_zero_mlp(
+                        t_bs, t_mid, DURABLE_HP_BASIS_DIM, 0.0
+                    )
+                    self.durable_twin_liquid_build_gate = _make_twin_zero_mlp(
+                        t_bs, t_mid, DURABLE_LIQUID_BASIS_DIM, 0.0
+                    )
+                    self.durable_twin_shop_query_proj = nn.Sequential(
+                        nn.LayerNorm(t_bs),
+                        nn.Linear(t_bs, cfg.d_model),
+                    )
+                    self.durable_twin_shop_null = nn.Parameter(torch.zeros(1, 1, cfg.d_model))
+                    self.durable_twin_shop_attn = nn.MultiheadAttention(
+                        cfg.d_model,
+                        t_sheads,
+                        dropout=cfg.dropout,
+                        batch_first=True,
+                    )
+                    self.durable_twin_shop_base_head = _make_twin_zero_mlp(t_sread, t_mid, 1, 0.0)
+                    self.durable_twin_shop_liquid_gate = _make_twin_zero_mlp(
+                        t_sread, t_mid, DURABLE_LIQUID_BASIS_DIM, -6.5
+                    )
         if actor_critic.enable_hierarchical_branch_policy:
             branch_context_blocks = 3 + int(actor_critic.enable_direct_vitals_context)
             branch_dim = cfg.d_model * branch_context_blocks + cfg.recurrent_hidden_dim
@@ -1898,6 +2119,32 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             )
         return scaled
 
+    def _encode_shop_tokens(
+        self,
+        world: WorldTokenBatch,
+    ) -> tuple[Tensor | None, Tensor | None, Tensor]:
+        shop_mask_full = (
+            world.zone_ids.eq(SHOP_ZONE_ID) | world.zone_ids.eq(SHOP_SUB_ZONE_ID)
+        ) & world.mask.bool()
+        in_shop = shop_mask_full.any(dim=1)
+        if not bool(in_shop.any().item()):
+            return None, None, in_shop
+        shop_world, _ = self._compact_world_by_mask(world, shop_mask_full)
+        shop_valid = shop_world.mask.bool()
+        raw_shop = self.token_embedder(
+            shop_world.features,
+            type_ids=shop_world.type_ids,
+            role_ids=shop_world.role_ids,
+            owner_ids=shop_world.owner_ids,
+            entity_ids=shop_world.entity_ids,
+            entity_aux_ids=shop_world.entity_aux_ids,
+            zone_ids=shop_world.zone_ids,
+            order_ids=shop_world.order_ids,
+            segment_id=0,
+        )
+        shop_tokens = raw_shop * shop_valid.unsqueeze(-1).to(dtype=raw_shop.dtype)
+        return shop_tokens, shop_valid, in_shop
+
     def _durable_readout(
         self,
         *,
@@ -1915,68 +2162,70 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         draw_prob: Tensor | None = None,
         deck_size: Tensor | None = None,
         has_deck: Tensor | None = None,
+        shop_context: tuple[Tensor | None, Tensor | None, Tensor] | None = None,
+        use_twin: bool = False,
     ) -> Tensor:
-        parts = [world_state_embedding]
-        if build_embedding is not None:
-            parts.append(build_embedding)
+        ac = self.actor_critic_config
+        has_twin = ac.enable_twin_durable_value_heads
+        if use_twin and not has_twin:
+            raise RuntimeError("use_twin=True requires enable_twin_durable_value_heads=True")
+        head_drop = (
+            (self.durable_twin_dropout if use_twin else self.durable_twin_head1_dropout)
+            if (has_twin and getattr(self, "_twin_dropout_active", False))
+            else None
+        )
+        ws_emb = head_drop(world_state_embedding) if head_drop is not None else world_state_embedding
+        b_emb = (
+            head_drop(build_embedding)
+            if (head_drop is not None and build_embedding is not None)
+            else build_embedding
+        )
+        parts = [ws_emb]
+        if b_emb is not None:
+            parts.append(b_emb)
         if vitals_embedding is not None:
             parts.append(vitals_embedding)
         parts.append(run_memory)
         rev_scaled = revival_context * 4.0 if revival_context is not None else None
         if rev_scaled is not None:
             parts.append(rev_scaled)
-        out: Tensor = self.durable_value_head(torch.cat(parts, dim=-1)).squeeze(-1)
+        val_head = self.durable_twin_value_head if use_twin else self.durable_value_head
+        out: Tensor = val_head(torch.cat(parts, dim=-1)).squeeze(-1)
         stage_in: Tensor | None = None
-        if self.actor_critic_config.enable_monotone_deconfounded_durable_value:
-            if monotone_parts is not None:
-                stage_feats, hp_basis, liquid_basis = monotone_parts
-                stage_in = (
-                    torch.cat([stage_feats, rev_scaled], dim=-1)
-                    if rev_scaled is not None
-                    else stage_feats
-                )
-                v_stage = self.durable_stage_baseline_head(stage_in).squeeze(-1)
-                w_hp = nn.functional.softplus(self.durable_hp_gate(stage_in))
-                w_liq = nn.functional.softplus(self.durable_liquid_gate(stage_in))
-                stage_term = (
-                    v_stage
-                    if self.actor_critic_config.enable_balanced_deconfounded_durable_value
-                    else v_stage.detach()
-                )
-                out = (
-                    out
-                    + stage_term
-                    + (w_hp * hp_basis).sum(dim=-1)
-                    + (w_liq * liquid_basis).sum(dim=-1)
-                )
-        elif self.actor_critic_config.enable_deconfounded_durable_value:
-            if progress_vitals is not None:
-                prog_in = (
-                    torch.cat([progress_vitals, rev_scaled], dim=-1)
-                    if rev_scaled is not None
-                    else progress_vitals
-                )
-                out = out + self.durable_progress_vitals_head(prog_in).squeeze(-1)
-        elif raw_vitals is not None:
-            vitals_in = (
-                torch.cat([raw_vitals, rev_scaled], dim=-1)
+        if ac.enable_monotone_deconfounded_durable_value and monotone_parts is not None:
+            stage_feats, _, _ = monotone_parts
+            stage_in = (
+                torch.cat([stage_feats, rev_scaled], dim=-1)
                 if rev_scaled is not None
-                else raw_vitals
+                else stage_feats
             )
-            out = out + self.durable_vitals_head(vitals_in).squeeze(-1)
-            if self.actor_critic_config.enable_persistent_only_durable_value:
-                out = out + self.durable_vitals_linear(
-                    raw_vitals[:, -SALIENT_VITALS_DIM:]
-                ).squeeze(-1)
+
+        deck_summary = torch.zeros(
+            (int(world_state_embedding.shape[0]), DURABLE_DECK_SUMMARY_DIM),
+            dtype=out.dtype,
+            device=out.device,
+        )
+        deck_archetype_emb = torch.zeros(
+            (int(world_state_embedding.shape[0]), self.config.ffn_dim),
+            dtype=out.dtype,
+            device=out.device,
+        )
         if (
-            self.actor_critic_config.enable_draw_weighted_durable_value
+            ac.enable_draw_weighted_durable_value
             and card_repr is not None
             and card_raw_feats is not None
             and draw_prob is not None
             and deck_size is not None
             and has_deck is not None
         ):
-            deck_ctx_parts = [world_state_embedding]
+            d_norm = self.durable_twin_deck_norm if use_twin else self.durable_deck_norm
+            d_card_fc = self.durable_twin_deck_card_fc if use_twin else self.durable_deck_card_fc
+            d_raw_fc = self.durable_twin_deck_raw_fc if use_twin else self.durable_deck_raw_fc
+            d_ctx_norm = self.durable_twin_deck_ctx_norm if use_twin else self.durable_deck_ctx_norm
+            d_ctx_fc = self.durable_twin_deck_ctx_fc if use_twin else self.durable_deck_ctx_fc
+            d_out = self.durable_twin_deck_out if use_twin else self.durable_deck_out
+
+            deck_ctx_parts = [ws_emb]
             if vitals_embedding is not None:
                 deck_ctx_parts.append(vitals_embedding)
             deck_ctx_parts.append(run_memory)
@@ -1984,14 +2233,15 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 deck_ctx_parts.append(rev_scaled)
             deck_ctx = (
                 0.5
-                * self.durable_deck_ctx_fc(
-                    self.durable_deck_ctx_norm(torch.cat(deck_ctx_parts, dim=-1))
+                * d_ctx_fc(
+                    d_ctx_norm(torch.cat(deck_ctx_parts, dim=-1))
                 ).unsqueeze(1)
             )
+            card_repr_in = head_drop(card_repr) if head_drop is not None else card_repr
             card_hidden = nn.functional.silu(
-                self.durable_deck_card_fc(self.durable_deck_norm(card_repr)) + deck_ctx
+                d_card_fc(d_norm(card_repr_in)) + deck_ctx
             )
-            if self.actor_critic_config.enable_expressive_synergy_backbone:
+            if ac.enable_expressive_synergy_backbone:
                 syn_batch = int(card_hidden.shape[0])
                 syn_card_mask = (
                     deck_card_mask
@@ -2027,21 +2277,44 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                     normed_seq,
                     syn_key_log_bias,
                 )
-                if self.actor_critic_config.enable_debloated_synergy_durable_value:
+                if ac.enable_debloated_synergy_durable_value:
                     syn_delta = 0.5 * torch.tanh(2.0 * syn_delta)
                 card_hidden = card_hidden + syn_delta * syn_mask_f
                 syn_ffn_delta: Tensor = self.durable_deck_synergy_ffn(card_hidden)
-                if self.actor_critic_config.enable_debloated_synergy_durable_value:
+                if ac.enable_debloated_synergy_durable_value:
                     syn_ffn_delta = 0.5 * torch.tanh(2.0 * syn_ffn_delta)
                 card_hidden = card_hidden + syn_ffn_delta * syn_mask_f
-            raw_hidden = nn.functional.silu(self.durable_deck_raw_fc(card_raw_feats))
+            raw_hidden = nn.functional.silu(d_raw_fc(card_raw_feats))
             bilinear_card = torch.cat(
                 [card_hidden, raw_hidden, card_hidden * raw_hidden],
                 dim=-1,
             )
-            card_utilities = self.durable_deck_out(bilinear_card).squeeze(-1)
+            deck_archetype_emb = (
+                torch.einsum(
+                    "bw,bwd->bd",
+                    draw_prob.to(dtype=card_hidden.dtype),
+                    card_hidden,
+                )
+                * has_deck.to(dtype=card_hidden.dtype).unsqueeze(-1)
+            ).to(dtype=out.dtype)
+            card_utilities = d_out(bilinear_card).squeeze(-1)
             expected_card_utility = torch.einsum("bw,bw->b", draw_prob, card_utilities)
-            if self.actor_critic_config.enable_monotone_deconfounded_durable_value:
+            if ac.enable_monotone_deconfounded_durable_value:
+                d_tilted = (
+                    self.durable_twin_deck_tilted_out if use_twin else self.durable_deck_tilted_out
+                )
+                d_lin_logit = (
+                    self.durable_twin_deck_linear_logit
+                    if use_twin
+                    else self.durable_deck_linear_logit
+                )
+                d_tilt_logits = (
+                    self.durable_twin_deck_tilt_logits
+                    if use_twin
+                    else self.durable_deck_tilt_logits
+                )
+                cyc_gate = self.durable_twin_cycle_gate if use_twin else self.durable_cycle_gate
+
                 has_deck_f = has_deck.to(dtype=out.dtype)
                 eff_card_mask = (
                     deck_card_mask
@@ -2049,7 +2322,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                     else (draw_prob > 0.0)
                 )
                 u_tilt_all = 2.5 * torch.tanh(
-                    (card_utilities.unsqueeze(-1) + self.durable_deck_tilted_out(bilinear_card))
+                    (card_utilities.unsqueeze(-1) + d_tilted(bilinear_card))
                     / 2.5
                 )
                 u_beta_cols: list[Tensor] = []
@@ -2075,14 +2348,23 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                     u_beta_cols.append(log_mean_exp * has_deck_f)
                 u_betas = torch.stack(u_beta_cols, dim=-1)
                 alpha_lin = (
-                    nn.functional.softplus(self.durable_deck_linear_logit)
-                    if self.actor_critic_config.enable_balanced_deconfounded_durable_value
-                    else torch.sigmoid(self.durable_deck_linear_logit)
+                    nn.functional.softplus(d_lin_logit)
+                    if ac.enable_balanced_deconfounded_durable_value
+                    else torch.sigmoid(d_lin_logit)
                 )
-                w_tilt = nn.functional.softplus(self.durable_deck_tilt_logits)
+                w_tilt = nn.functional.softplus(d_tilt_logits)
                 deck_utility = alpha_lin * expected_card_utility + (w_tilt * u_betas).sum(dim=-1)
+                safe_n = deck_size.clamp_min(1.0)
+                deck_summary = torch.stack(
+                    [
+                        expected_card_utility * has_deck_f,
+                        u_betas[:, 0],
+                        u_betas[:, 1],
+                        ((safe_n - DECK_REFERENCE_SIZE) / 16.0).clamp(-1.0, 4.0) * has_deck_f,
+                    ],
+                    dim=-1,
+                ).to(dtype=out.dtype)
                 if stage_in is not None:
-                    safe_n = deck_size.clamp_min(1.0)
                     bloat_basis = (
                         torch.stack(
                             [
@@ -2094,14 +2376,14 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                         )
                         * has_deck_f.unsqueeze(-1)
                     )
-                    cyc_logits = self.durable_cycle_gate(stage_in)
-                    if self.actor_critic_config.enable_debloated_synergy_durable_value:
+                    cyc_logits = cyc_gate(stage_in)
+                    if ac.enable_debloated_synergy_durable_value:
                         cyc_logits = cyc_logits + 1.5
                     w_cycle = nn.functional.softplus(cyc_logits)
                     v_cycle = -(w_cycle * bloat_basis).sum(dim=-1)
                     deck_utility = deck_utility + v_cycle
                 out = out + deck_utility
-            elif self.actor_critic_config.enable_deconfounded_durable_value:
+            elif ac.enable_deconfounded_durable_value:
                 out = out + expected_card_utility
             else:
                 has_deck_f = has_deck.to(dtype=out.dtype)
@@ -2128,6 +2410,124 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                     + self.durable_deck_size_linear(deck_size_vec).squeeze(-1)
                 ) * has_deck_f
                 out = out + expected_card_utility + deck_size_delta
+
+        if ac.enable_monotone_deconfounded_durable_value:
+            if monotone_parts is not None and stage_in is not None:
+                _, hp_basis, liquid_basis = monotone_parts
+                v_stage = self.durable_stage_baseline_head(stage_in).squeeze(-1)
+                hp_gate = self.durable_twin_hp_gate if use_twin else self.durable_hp_gate
+                liq_gate = self.durable_twin_liquid_gate if use_twin else self.durable_liquid_gate
+                hp_logits = hp_gate(stage_in)
+                liq_logits = liq_gate(stage_in)
+                if ac.enable_build_conditioned_durable_value:
+                    b_vec = (
+                        b_emb
+                        if b_emb is not None
+                        else torch.zeros_like(ws_emb)
+                    )
+                    z_build = torch.cat(
+                        [ws_emb, b_vec, deck_archetype_emb, deck_summary], dim=-1
+                    )
+                    build_stage_in = torch.cat([z_build, stage_in], dim=-1)
+                    hp_b_gate = (
+                        self.durable_twin_hp_build_gate
+                        if use_twin
+                        else self.durable_hp_build_gate
+                    )
+                    liq_b_gate = (
+                        self.durable_twin_liquid_build_gate
+                        if use_twin
+                        else self.durable_liquid_build_gate
+                    )
+                    hp_logits = hp_logits + hp_b_gate(build_stage_in)
+                    liq_logits = liq_logits + liq_b_gate(build_stage_in)
+                    if shop_context is not None:
+                        shop_tokens, shop_valid, in_shop = shop_context
+                        if shop_tokens is not None and shop_valid is not None:
+                            s_q_proj = (
+                                self.durable_twin_shop_query_proj
+                                if use_twin
+                                else self.durable_shop_query_proj
+                            )
+                            s_null = (
+                                self.durable_twin_shop_null
+                                if use_twin
+                                else self.durable_shop_null
+                            )
+                            s_attn = (
+                                self.durable_twin_shop_attn
+                                if use_twin
+                                else self.durable_shop_attn
+                            )
+                            s_base_h = (
+                                self.durable_twin_shop_base_head
+                                if use_twin
+                                else self.durable_shop_base_head
+                            )
+                            s_liq_g = (
+                                self.durable_twin_shop_liquid_gate
+                                if use_twin
+                                else self.durable_shop_liquid_gate
+                            )
+                            s_bsz = int(z_build.shape[0])
+                            q_shop = s_q_proj(build_stage_in).unsqueeze(1)
+                            kv_shop = torch.cat(
+                                [
+                                    s_null.expand(s_bsz, -1, -1).to(dtype=shop_tokens.dtype),
+                                    shop_tokens,
+                                ],
+                                dim=1,
+                            )
+                            s_neg = -1e4 if shop_tokens.dtype == torch.float16 else -1e9
+                            null_v = torch.ones(
+                                (s_bsz, 1), dtype=torch.bool, device=shop_tokens.device
+                            )
+                            kv_valid = torch.cat([null_v, shop_valid], dim=1)
+                            s_log_bias = torch.where(
+                                kv_valid,
+                                torch.zeros((s_bsz, int(kv_valid.shape[1])), dtype=shop_tokens.dtype, device=shop_tokens.device),
+                                torch.full((s_bsz, int(kv_valid.shape[1])), s_neg, dtype=shop_tokens.dtype, device=shop_tokens.device),
+                            )
+                            shop_pooled = self._weighted_multihead_attention(
+                                s_attn, q_shop, kv_shop, s_log_bias
+                            ).squeeze(1)
+                            shop_in = torch.cat([z_build, shop_pooled, stage_in], dim=-1)
+                            v_shop_raw = s_base_h(shop_in).squeeze(-1) + (
+                                nn.functional.softplus(s_liq_g(shop_in)) * liquid_basis
+                            ).sum(dim=-1)
+                            out = out + v_shop_raw * in_shop.to(dtype=out.dtype)
+                w_hp = nn.functional.softplus(hp_logits)
+                w_liq = nn.functional.softplus(liq_logits)
+                stage_term = (
+                    v_stage
+                    if ac.enable_balanced_deconfounded_durable_value
+                    else v_stage.detach()
+                )
+                out = (
+                    out
+                    + stage_term
+                    + (w_hp * hp_basis).sum(dim=-1)
+                    + (w_liq * liquid_basis).sum(dim=-1)
+                )
+        elif ac.enable_deconfounded_durable_value:
+            if progress_vitals is not None:
+                prog_in = (
+                    torch.cat([progress_vitals, rev_scaled], dim=-1)
+                    if rev_scaled is not None
+                    else progress_vitals
+                )
+                out = out + self.durable_progress_vitals_head(prog_in).squeeze(-1)
+        elif raw_vitals is not None:
+            vitals_in = (
+                torch.cat([raw_vitals, rev_scaled], dim=-1)
+                if rev_scaled is not None
+                else raw_vitals
+            )
+            out = out + self.durable_vitals_head(vitals_in).squeeze(-1)
+            if ac.enable_persistent_only_durable_value:
+                out = out + self.durable_vitals_linear(
+                    raw_vitals[:, -SALIENT_VITALS_DIM:]
+                ).squeeze(-1)
         if rev_scaled is not None:
             out = (
                 out
@@ -2160,14 +2560,14 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             )
         return recurrent_state[:, :memory_half]
 
-    def _compute_persistent_durable_value(
+    def _compute_persistent_durable_value_pair(
         self,
         world: WorldTokenBatch,
         recurrent_state: Tensor | None,
         *,
         critic_revival_context: Tensor | None,
         validate: bool,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         batch_size = int(world.features.shape[0])
         previous_run = self._extract_previous_run_memory(
             recurrent_state,
@@ -2320,7 +2720,12 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 and not self.actor_critic_config.enable_monotone_deconfounded_durable_value
             ):
                 progress_vitals = self._extract_progress_vitals(pers_world)
-        durable_val = self._durable_readout(
+        shop_ctx = (
+            self._encode_shop_tokens(world)
+            if self.actor_critic_config.enable_build_conditioned_durable_value
+            else None
+        )
+        v1 = self._durable_readout(
             world_state_embedding=base_state_emb,
             build_embedding=build_emb,
             vitals_embedding=vitals_emb,
@@ -2335,8 +2740,78 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             draw_prob=draw_prob,
             deck_size=deck_size,
             has_deck=has_deck,
+            shop_context=shop_ctx,
+            use_twin=False,
         )
-        return durable_val, pers_run
+        if not self.actor_critic_config.enable_twin_durable_value_heads:
+            return v1, v1, pers_run
+        v2 = self._durable_readout(
+            world_state_embedding=base_state_emb,
+            build_embedding=build_emb,
+            vitals_embedding=vitals_emb,
+            raw_vitals=raw_vitals,
+            progress_vitals=progress_vitals,
+            monotone_parts=monotone_parts,
+            run_memory=pers_run,
+            revival_context=rev_ctx,
+            card_repr=card_repr,
+            card_raw_feats=card_raw_feats,
+            deck_card_mask=deck_card_mask,
+            draw_prob=draw_prob,
+            deck_size=deck_size,
+            has_deck=has_deck,
+            shop_context=shop_ctx,
+            use_twin=True,
+        )
+        return v1, v2, pers_run
+
+    def _compute_persistent_durable_value(
+        self,
+        world: WorldTokenBatch,
+        recurrent_state: Tensor | None,
+        *,
+        critic_revival_context: Tensor | None,
+        validate: bool,
+    ) -> tuple[Tensor, Tensor]:
+        v1, v2, pers_run = self._compute_persistent_durable_value_pair(
+            world,
+            recurrent_state,
+            critic_revival_context=critic_revival_context,
+            validate=validate,
+        )
+        if self.actor_critic_config.enable_twin_durable_value_heads:
+            return 0.5 * (v1 + v2), pers_run
+        return v1, pers_run
+
+    def forward_durable_value_pair(
+        self,
+        world: WorldTokenBatch,
+        domain_ids: Tensor,
+        recurrent_state: Tensor | None = None,
+        *,
+        critic_revival_context: Tensor | None = None,
+        validate: bool = True,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Return ``(v1 [B], v2 [B], next_run_memory [B, H/2])`` for Twin Durable Heads."""
+        if not self.actor_critic_config.enable_durable_value_head:
+            raise RuntimeError("forward_durable_value_pair requires enable_durable_value_head=True")
+        if validate:
+            world.validate(self.config)
+        if self.actor_critic_config.enable_persistent_only_durable_value:
+            return self._compute_persistent_durable_value_pair(
+                world,
+                recurrent_state,
+                critic_revival_context=critic_revival_context,
+                validate=validate,
+            )
+        val, next_run = self.forward_durable_value(
+            world,
+            domain_ids,
+            recurrent_state,
+            critic_revival_context=critic_revival_context,
+            validate=False,
+        )
+        return val, val, next_run
 
     def forward_durable_value(
         self,
@@ -2854,6 +3329,46 @@ def initialize_actor_critic_from_macro_publication(
             "macro publication leaves non-extension tensors uninitialized: "
             + ", ".join(sorted(unexpected_fresh))
         )
+    if (
+        model.actor_critic_config.enable_twin_durable_value_heads
+        and "durable_twin_value_head.1.weight" in result.missing_keys
+    ):
+        # Warm-start Twin Head 2 from Head 1's inherited readout + small deterministic symmetry-breaking noise
+        twin_map = (
+            ("durable_value_head.", "durable_twin_value_head."),
+            ("durable_hp_gate.", "durable_twin_hp_gate."),
+            ("durable_liquid_gate.", "durable_twin_liquid_gate."),
+            ("durable_cycle_gate.", "durable_twin_cycle_gate."),
+            ("durable_deck_norm.", "durable_twin_deck_norm."),
+            ("durable_deck_card_fc.", "durable_twin_deck_card_fc."),
+            ("durable_deck_raw_fc.", "durable_twin_deck_raw_fc."),
+            ("durable_deck_ctx_norm.", "durable_twin_deck_ctx_norm."),
+            ("durable_deck_ctx_fc.", "durable_twin_deck_ctx_fc."),
+            ("durable_deck_out.", "durable_twin_deck_out."),
+            ("durable_deck_tilted_out.", "durable_twin_deck_tilted_out."),
+            ("durable_deck_linear_logit", "durable_twin_deck_linear_logit"),
+            ("durable_deck_tilt_logits", "durable_twin_deck_tilt_logits"),
+        )
+        param_dict = dict(model.named_parameters())
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(20261117)
+        with torch.no_grad():
+            for dst_name, dst_param in sorted(param_dict.items()):
+                if not dst_name.startswith("durable_twin_"):
+                    continue
+                for src_pref, dst_pref in twin_map:
+                    if dst_name.startswith(dst_pref):
+                        src_name = src_pref + dst_name[len(dst_pref) :]
+                        src_param = param_dict.get(src_name)
+                        if src_param is not None and src_param.shape == dst_param.shape:
+                            dst_param.copy_(src_param)
+                            if dst_param.ndim == 2:
+                                scale = float(src_param.detach().std().clamp_min(1e-3).item()) * 0.015
+                                noise = torch.randn(
+                                    dst_param.shape, generator=gen, dtype=torch.float32
+                                ).to(device=dst_param.device, dtype=dst_param.dtype)
+                                dst_param.add_(noise * scale)
+                        break
     summary: dict[str, tuple[str, ...]] = {
         "inherited": tuple(sorted(loaded)),
         "fresh": tuple(sorted(result.missing_keys)),

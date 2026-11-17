@@ -122,6 +122,7 @@ def sync_campaign_to_drive(
     lineage_id: str,
     snapshot_interval: int = 5,
     latest_probe: dict[str, Any] | None = None,
+    latest_heldout: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Atomically mirror resumable campaign state from local NVMe to Google Drive."""
     checkpoint_src = output_dir / "checkpoint.pt"
@@ -179,6 +180,8 @@ def sync_campaign_to_drive(
             _atomic_copy_file(publication_src, snap_dir / "publication.pt", verify_sha256=True)
             if latest_probe is not None:
                 _atomic_write_json(snap_dir / "probe.json", latest_probe)
+            if latest_heldout is not None:
+                _atomic_write_json(snap_dir / "heldout.json", latest_heldout)
             snapshot_saved = True
 
     manifest = {
@@ -196,6 +199,7 @@ def sync_campaign_to_drive(
             else None
         ),
         "latest_probe": latest_probe,
+        "latest_heldout": latest_heldout,
     }
     _atomic_write_json(drive_dir / "sync_manifest.json", manifest)
     return manifest
@@ -293,6 +297,69 @@ def _run_competence_probes(
     return payload
 
 
+def _existing_heldout_gates(output_dir: Path) -> set[int]:
+    path = output_dir / "heldout_evaluations.jsonl"
+    if not path.is_file():
+        return set()
+    gates: set[int] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        item = json.loads(raw)
+        if isinstance(item, dict):
+            gv = item.get("policy_version", item.get("evaluation_gate"))
+            if isinstance(gv, int) and not isinstance(gv, bool):
+                gates.add(gv)
+    return gates
+
+
+def _run_heldout_evaluation(
+    *,
+    python_exe: str,
+    output_dir: Path,
+    config_path: Path,
+    committed_after: int,
+    episodes: int,
+    workers: int,
+    device: str,
+    env: dict[str, str],
+    sim_exe: Path | None = None,
+    overrides: Sequence[str] = (),
+) -> dict[str, Any]:
+    cmd = [
+        python_exe,
+        "-m",
+        "sts2_rl.macro_heldout_eval",
+        "--publication",
+        str(output_dir / "publication.pt"),
+        "--config",
+        str(config_path),
+        "--policy-version",
+        str(committed_after),
+        "--episodes",
+        str(episodes),
+        "--workers",
+        str(workers),
+        "--device",
+        device,
+    ]
+    if sim_exe is not None:
+        cmd.extend(["--sim-exe", str(sim_exe)])
+    for item in overrides:
+        cmd.extend(["--set", item])
+    completed = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"macro_heldout_eval failed (exit {completed.returncode}): {completed.stderr.strip() or completed.stdout.strip()}"
+        )
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if not lines:
+        raise RuntimeError("macro_heldout_eval produced empty stdout")
+    payload: dict[str, Any] = json.loads(lines[-1])
+    return payload
+
+
 def _probe_prune_and_sync(
     *,
     output_dir: Path,
@@ -304,6 +371,12 @@ def _probe_prune_and_sync(
     env: dict[str, str],
     snapshot_interval: int,
     keep_recent_cohorts: int,
+    config_path: Path | None = None,
+    heldout_eval_interval: int = 0,
+    heldout_eval_episodes: int = 48,
+    heldout_eval_workers: int = 24,
+    sim_exe: Path | None = None,
+    overrides: Sequence[str] = (),
 ) -> dict[str, Any]:
     probe_report = _run_competence_probes(
         python_exe=sys.executable,
@@ -318,12 +391,34 @@ def _probe_prune_and_sync(
     }
     _append_jsonl(output_dir / "probe_metrics.jsonl", probe_entry)
 
+    heldout_entry: dict[str, Any] | None = None
+    if (
+        heldout_eval_interval > 0
+        and config_path is not None
+        and committed_after > 0
+        and (committed_after == 1 or committed_after % heldout_eval_interval == 0)
+        and committed_after not in _existing_heldout_gates(output_dir)
+    ):
+        heldout_entry = _run_heldout_evaluation(
+            python_exe=sys.executable,
+            output_dir=output_dir,
+            config_path=config_path,
+            committed_after=committed_after,
+            episodes=heldout_eval_episodes,
+            workers=heldout_eval_workers,
+            device=device,
+            env=env,
+            sim_exe=sim_exe,
+            overrides=overrides,
+        )
+        _append_jsonl(output_dir / "heldout_evaluations.jsonl", heldout_entry)
+
     pruned_bytes = prune_old_raw_cohort_traces(
         output_dir,
         keep_recent_cohorts=keep_recent_cohorts,
     )
     split_inv = probe_report.get("multiset_split_invariance") or {}
-    history_entry = {
+    history_entry: dict[str, Any] = {
         "committed_update": committed_after,
         "completed_at_utc": _utc_now_iso(),
         "train_summary": train_summary,
@@ -338,6 +433,15 @@ def _probe_prune_and_sync(
         "smith_high_delta_minus_basic_adv": split_inv.get("smith_high_delta_minus_basic_adv"),
         "episode_macro_discipline": probe_report["episode_macro_discipline"],
     }
+    if heldout_entry is not None:
+        history_entry["heldout_evaluation"] = {
+            "episodes": heldout_entry["episodes"],
+            "run_win_rate": heldout_entry["run_win_rate"],
+            "act1_clear_rate": heldout_entry["act1_clear_rate"],
+            "act3_reach_rate": heldout_entry["act3_reach_rate"],
+            "skip_rate": heldout_entry.get("skip_rate"),
+            "mean_final_deck_size": heldout_entry.get("mean_final_deck_size"),
+        }
     _append_jsonl(output_dir / "campaign_history.jsonl", history_entry)
 
     sync_manifest = sync_campaign_to_drive(
@@ -346,32 +450,32 @@ def _probe_prune_and_sync(
         lineage_id=lineage_id,
         snapshot_interval=snapshot_interval,
         latest_probe=probe_entry,
+        latest_heldout=heldout_entry,
     )
-    print(
-        json.dumps(
-            {
-                "event": "chunk_committed_and_synced",
-                "committed_update": committed_after,
-                "pruned_raw_trace_bytes": pruned_bytes,
-                "drive_checkpoint_sha256": sync_manifest["checkpoint"]["sha256"],
-                "snapshot_saved": sync_manifest["snapshot_saved"],
-                "campfire_low_minus_high_rest_prob": history_entry["campfire_low_minus_high_rest_prob"],
-                "smith_vs_remove_jsd": history_entry["smith_vs_remove_jsd"],
-                "smith_vs_remove_spearman": history_entry["smith_vs_remove_spearman"],
-                "grouped_vs_split_abs_diff": history_entry["grouped_vs_split_abs_diff"],
-                "smith_high_delta_minus_basic_adv": history_entry["smith_high_delta_minus_basic_adv"],
-            },
-            sort_keys=True,
-        ),
-        flush=True,
-    )
+    log_payload: dict[str, Any] = {
+        "event": "chunk_committed_and_synced",
+        "committed_update": committed_after,
+        "pruned_raw_trace_bytes": pruned_bytes,
+        "drive_checkpoint_sha256": sync_manifest["checkpoint"]["sha256"],
+        "snapshot_saved": sync_manifest["snapshot_saved"],
+        "campfire_low_minus_high_rest_prob": history_entry["campfire_low_minus_high_rest_prob"],
+        "smith_vs_remove_jsd": history_entry["smith_vs_remove_jsd"],
+        "smith_vs_remove_spearman": history_entry["smith_vs_remove_spearman"],
+        "grouped_vs_split_abs_diff": history_entry["grouped_vs_split_abs_diff"],
+        "smith_high_delta_minus_basic_adv": history_entry["smith_high_delta_minus_basic_adv"],
+    }
+    if heldout_entry is not None:
+        log_payload["heldout_win_rate"] = heldout_entry["run_win_rate"]
+        log_payload["heldout_skip_rate"] = heldout_entry.get("skip_rate")
+        log_payload["heldout_mean_deck_size"] = heldout_entry.get("mean_final_deck_size")
+    print(json.dumps(log_payload, sort_keys=True), flush=True)
     return sync_manifest
 
 
 def _copy_migration_history(source_dir: Path, output_dir: Path) -> int:
     """Preserve prior cohort summaries and probe history when migrating runtime settings."""
     copied = 0
-    for name in ("probe_metrics.jsonl", "campaign_history.jsonl"):
+    for name in ("probe_metrics.jsonl", "campaign_history.jsonl", "heldout_evaluations.jsonl"):
         src_file = source_dir / name
         dst_file = output_dir / name
         if src_file.is_file() and not dst_file.exists():
@@ -413,6 +517,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--updates-per-chunk", type=int, default=1)
     parser.add_argument("--snapshot-interval", type=int, default=5)
     parser.add_argument("--keep-raw-trace-cohorts", type=int, default=2)
+    parser.add_argument("--heldout-eval-interval", type=int, default=0)
+    parser.add_argument("--heldout-eval-episodes", type=int, default=48)
+    parser.add_argument("--heldout-eval-workers", type=int, default=24)
     parser.add_argument("--set", action="append", default=[], dest="overrides", metavar="KEY=TOML_VALUE")
     return parser
 
@@ -547,6 +654,12 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
             env=env,
             snapshot_interval=args.snapshot_interval,
             keep_recent_cohorts=args.keep_raw_trace_cohorts,
+            config_path=config_path,
+            heldout_eval_interval=args.heldout_eval_interval,
+            heldout_eval_episodes=args.heldout_eval_episodes,
+            heldout_eval_workers=args.heldout_eval_workers,
+            sim_exe=args.sim_exe,
+            overrides=args.overrides,
         )
 
     while True:
@@ -578,11 +691,22 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
             return 0
 
         chunk_updates = min(args.updates_per_chunk, max(1, args.target_updates - current_update))
-        if args.updates_per_chunk > 1 and args.snapshot_interval > 1:
-            next_milestone = ((current_update // args.snapshot_interval) + 1) * args.snapshot_interval
-            if current_update == 0:
-                next_milestone = 1
-            chunk_updates = min(chunk_updates, max(1, next_milestone - current_update))
+        if args.updates_per_chunk > 1:
+            milestones: list[int] = []
+            if args.snapshot_interval > 1:
+                milestones.append(
+                    1
+                    if current_update == 0
+                    else ((current_update // args.snapshot_interval) + 1) * args.snapshot_interval
+                )
+            if args.heldout_eval_interval > 1:
+                milestones.append(
+                    1
+                    if current_update == 0
+                    else ((current_update // args.heldout_eval_interval) + 1) * args.heldout_eval_interval
+                )
+            if milestones:
+                chunk_updates = min(chunk_updates, max(1, min(milestones) - current_update))
         cmd = [
             sys.executable,
             "-m",
@@ -670,6 +794,12 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
             env=env,
             snapshot_interval=args.snapshot_interval,
             keep_recent_cohorts=args.keep_raw_trace_cohorts,
+            config_path=config_path,
+            heldout_eval_interval=args.heldout_eval_interval,
+            heldout_eval_episodes=args.heldout_eval_episodes,
+            heldout_eval_workers=args.heldout_eval_workers,
+            sim_exe=args.sim_exe,
+            overrides=args.overrides,
         )
 
 

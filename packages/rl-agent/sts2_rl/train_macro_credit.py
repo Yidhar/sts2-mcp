@@ -278,6 +278,12 @@ def _actor_critic_config(config: MacroTrainingConfig) -> HybridActorCriticConfig
             enable_debloated_synergy_durable_value=(
                 config.learner.enable_debloated_synergy_durable_value
             ),
+            enable_build_conditioned_durable_value=(
+                config.learner.enable_build_conditioned_durable_value
+            ),
+            enable_twin_durable_value_heads=(
+                config.learner.enable_twin_durable_value_heads
+            ),
         )
     return HybridActorCriticConfig(
         grounded,

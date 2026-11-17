@@ -323,12 +323,16 @@ def project_hierarchical_macro_policy(
     branch_max_kl: float,
     within_max_kl: float,
     min_temperature: float = 0.0,
+    det_action_values_twin: Tensor | None = None,
+    pessimism_coef: float = 0.0,
 ) -> MacroPolicyProjection:
     """Two-level hierarchical MPO matching ``branch_policy_head + within_log_probs``.
 
     1. Within each deterministic branch ``D_b`` of size >= 2, solves a conditional
        MPO projection ``pi*(. | D_b)`` under ``within_max_kl`` and ``min_temperature``,
-       yielding post-improvement branch value ``Q_branch(b) = sum_{i in D_b} pi*(i | D_b) Q(i)``
+       yielding post-improvement branch value ``Q_branch(b)`` (cross-evaluated across
+       twin heads when ``det_action_values_twin`` is supplied to eliminate multi-card
+       Winner's Curse maximization bias, minus ``pessimism_coef * |V1 - V2|``)
        plus unattenuated conditional targets ``within_branch_targets`` so minority
        branches (e.g. ``shop:remove``, ``rest:smith``) learn accurate target polarity
        even when current branch probability ``P(b)`` is small.
@@ -342,6 +346,15 @@ def project_hierarchical_macro_policy(
             raise ValueError(f"{name} must be finite and non-negative")
     if isinstance(min_temperature, bool) or not math.isfinite(min_temperature) or min_temperature < 0:
         raise ValueError("min_temperature must be finite and non-negative")
+    if isinstance(pessimism_coef, bool) or not math.isfinite(pessimism_coef) or pessimism_coef < 0:
+        raise ValueError("pessimism_coef must be finite and non-negative")
+    if det_action_values_twin is not None:
+        if not isinstance(det_action_values_twin, Tensor) or tuple(det_action_values_twin.shape) != tuple(
+            det_action_values.shape
+        ):
+            raise ValueError("det_action_values_twin must match det_action_values shape")
+        if not bool(torch.isfinite(det_action_values_twin).all().item()):
+            raise FloatingPointError("det_action_values_twin must be finite")
     if not isinstance(policy_branch_ids, Tensor) or policy_branch_ids.ndim != 1:
         raise ValueError("policy_branch_ids must be a rank-1 tensor")
     if int(policy_branch_ids.numel()) < int(teacher_log_probs.numel()):
@@ -351,12 +364,23 @@ def project_hierarchical_macro_policy(
     log_prior = log_prior - torch.logsumexp(log_prior, dim=0)
     prior = log_prior.exp()
     det_idx_t = torch.tensor(list(det_idx), device=teacher_log_probs.device, dtype=torch.long)
-    det_values = det_action_values.detach().double()
+    det_v1 = det_action_values.detach().double()
+    if det_action_values_twin is not None:
+        det_v2 = det_action_values_twin.detach().double()
+        det_disagree = (det_v1 - det_v2).abs()
+        det_mean = 0.5 * (det_v1 + det_v2)
+        det_cons = det_mean - pessimism_coef * det_disagree
+    else:
+        det_v2 = None
+        det_disagree = torch.zeros_like(det_v1)
+        det_mean = det_v1
+        det_cons = det_v1
+
     log_p_det = float(torch.logsumexp(log_prior[det_idx_t], dim=0).item())
     p_det = math.exp(log_p_det) if math.isfinite(log_p_det) else 0.0
     teacher = prior.to(dtype=det_action_values.dtype).detach()
     if p_det <= 1e-12 or (branch_max_kl == 0.0 and within_max_kl == 0.0):
-        val_t = det_values.mean() if p_det <= 1e-12 else (prior[det_idx_t] * det_values).sum() / p_det
+        val_t = det_mean.mean() if p_det <= 1e-12 else (prior[det_idx_t] * det_mean).sum() / p_det
         return MacroPolicyProjection(
             target_probabilities=teacher.clone(),
             teacher_probabilities=teacher,
@@ -379,6 +403,7 @@ def project_hierarchical_macro_policy(
     within_stars: list[Tensor] = []
     within_targets_out: list[tuple[tuple[int, ...], Tensor]] = []
     rep_temp: float | None = None
+    det_eff_values = det_cons.clone()
 
     for b_id in ordered_branches:
         local_pos = branch_groups[b_id]
@@ -386,22 +411,47 @@ def project_hierarchical_macro_policy(
         full_pos_t = torch.tensor(list(full_pos), device=teacher_log_probs.device, dtype=torch.long)
         log_mass_b = float(torch.logsumexp(log_prior[full_pos_t], dim=0).item())
         log_masses.append(log_mass_b)
-        vals_b = det_values[local_pos]
+        vals_cons_b = det_cons[local_pos]
         if len(local_pos) == 1:
             within_stars.append(torch.ones((1,), device=teacher_log_probs.device, dtype=torch.float64))
-            q_branches.append(float(vals_b[0].item()))
+            q_branches.append(float(vals_cons_b[0].item()))
         elif math.isfinite(log_mass_b):
             log_within_prior_b = (log_prior[full_pos_t] - log_mass_b).clamp(max=0.0)
             log_within_prior_b = (log_within_prior_b - torch.logsumexp(log_within_prior_b, dim=0)).clamp(max=0.0)
             within_proj = project_macro_policy(
-                action_value_targets=vals_b,
+                action_value_targets=vals_cons_b,
                 teacher_log_probs=log_within_prior_b,
                 max_kl=within_max_kl,
                 min_temperature=min_temperature,
             )
             w_star = within_proj.target_probabilities.double()
             within_stars.append(w_star)
-            q_branches.append(float((w_star * vals_b).sum().item()))
+            if det_v2 is not None:
+                v1_b = det_v1[local_pos]
+                v2_b = det_v2[local_pos]
+                dis_b = det_disagree[local_pos]
+                proj_1 = project_macro_policy(
+                    action_value_targets=v1_b,
+                    teacher_log_probs=log_within_prior_b,
+                    max_kl=within_max_kl,
+                    min_temperature=min_temperature,
+                )
+                proj_2 = project_macro_policy(
+                    action_value_targets=v2_b,
+                    teacher_log_probs=log_within_prior_b,
+                    max_kl=within_max_kl,
+                    min_temperature=min_temperature,
+                )
+                w1 = proj_1.target_probabilities.double()
+                w2 = proj_2.target_probabilities.double()
+                q_cross = 0.5 * float(((w1 * v2_b).sum() + (w2 * v1_b).sum()).item())
+                w_bar = 0.5 * (w1 + w2)
+                q_b = q_cross - pessimism_coef * float((w_bar * dis_b).sum().item())
+                delta_b = q_b - float((w_star * vals_cons_b).sum().item())
+                det_eff_values[local_pos] = vals_cons_b + delta_b
+                q_branches.append(q_b)
+            else:
+                q_branches.append(float((w_star * vals_cons_b).sum().item()))
             if within_proj.actor_enabled:
                 within_targets_out.append((full_pos, w_star.to(dtype=det_action_values.dtype).detach()))
                 if rep_temp is None and within_proj.temperature is not None:
@@ -414,7 +464,7 @@ def project_hierarchical_macro_policy(
                 dtype=torch.float64,
             )
             within_stars.append(unif)
-            q_branches.append(float(vals_b.mean().item()))
+            q_branches.append(float(vals_cons_b.mean().item()))
 
     if len(ordered_branches) >= 2 and branch_max_kl > 0.0:
         log_branch_prior = torch.tensor(
@@ -456,7 +506,9 @@ def project_hierarchical_macro_policy(
     pos = posterior > 0
     log_post = torch.where(pos, posterior.clamp_min(1e-300).log(), 0.0)
     divergence = max(0.0, float((posterior[pos] * (log_post[pos] - log_prior[pos])).sum().item()))
-    improvement = float(((posterior[det_idx_t] - prior[det_idx_t]) * (det_values - det_values.max())).sum().item())
+    improvement = float(
+        ((posterior[det_idx_t] - prior[det_idx_t]) * (det_eff_values - det_eff_values.max())).sum().item()
+    )
     target = posterior.to(dtype=det_action_values.dtype).detach()
     joint_changed = improvement > 0.0 and not torch.equal(target, teacher)
     actor_enabled = joint_changed or bool(within_targets_out)
@@ -468,7 +520,7 @@ def project_hierarchical_macro_policy(
             rep_temp = None
     if not bool(torch.isfinite(target).all().item()):
         raise FloatingPointError("macro policy probabilities are non-finite")
-    val_t = (prior[det_idx_t] * det_values).sum() / p_det
+    val_t = (prior[det_idx_t] * det_mean).sum() / p_det
     return MacroPolicyProjection(
         target_probabilities=target,
         teacher_probabilities=teacher,
