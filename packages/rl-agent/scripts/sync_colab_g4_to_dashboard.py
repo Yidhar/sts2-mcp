@@ -4,8 +4,9 @@ This read-only local bridge queries the remote Colab G4 VM via short one-shot
 ``colab exec`` calls (never blocking the remote Jupyter kernel), streams
 committed ``update.json`` + ``campaign_history.jsonl`` metrics into a canonical
 local ``runs/<lineage>/run-<uuid>/metrics.jsonl``, and deterministically
-reconstructs completed cohort episodes via the local verified ``HeadlessSim``
-into canonical ``evaluation-step-XXXXXXXXX.jsonl`` journals.
+reconstructs completed training-sample cohort episodes via the local verified
+``HeadlessSim`` into ``train-cohort-step-XXXXXXXXX.jsonl`` journals (distinct
+from odd-seed ``heldout_evaluations.jsonl`` validation gates).
 
 That enables full drill-down in ``http://127.0.0.1:8765/`` including:
 - Learner loss / gradient / episode floor / revival / win-rate curves
@@ -161,6 +162,16 @@ if hist_path.is_file():
             except Exception:
                 pass
 
+heldout_evaluations = []
+heldout_path = local_dir / "heldout_evaluations.jsonl"
+if heldout_path.is_file():
+    for line in heldout_path.read_text().splitlines():
+        if line.strip():
+            try:
+                heldout_evaluations.append(json.loads(line))
+            except Exception:
+                pass
+
 print("PULLED_JSON_START")
 print(json.dumps({
     "alive": alive,
@@ -170,6 +181,7 @@ print(json.dumps({
     "revival_budget": remote_revival_budget,
     "updates": updates,
     "history": history,
+    "heldout_evaluations": heldout_evaluations,
     "cohort_replays": cohort_replays,
 }, separators=(",", ":")))
 print("PULLED_JSON_END")
@@ -406,6 +418,8 @@ def _reconstruct_heldout_journal(
     cohort_episodes: Sequence[Mapping[str, Any]],
     simulator: VerifiedSimulatorIdentity,
     revival_budget: int = 64,
+    gate_kind: str = "train_cohort",
+    data_partition: str = "train_cohort",
 ) -> int:
     """Replay recorded ``(seed, position)`` streams through HeadlessBackend into TrajectoryJournal."""
     sim_identity_payload = json.loads(simulator.identity_path.read_text(encoding="utf-8"))
@@ -421,13 +435,13 @@ def _reconstruct_heldout_journal(
                     "event": "evaluation_started",
                     "evaluation_gate": gate,
                     "evaluation_attempt": 1,
-                    "gate_kind": "validation",
-                    "data_partition": "validation",
+                    "gate_kind": gate_kind,
+                    "data_partition": data_partition,
                     "policy_version": gate,
                     "actor_policy_version": max(0, gate - 1),
                     "evaluation_seeds": seeds,
-                    "epsilon": 0.05,
-                    "deterministic": False,
+                    "epsilon": 0.05 if data_partition == "train_cohort" else 0.0,
+                    "deterministic": data_partition != "train_cohort",
                     "journal_version": "sts2-trajectory-journal-v2",
                     "simulator": {
                         "backend": "headless",
@@ -445,7 +459,8 @@ def _reconstruct_heldout_journal(
                 te = ep.get("training_episode")
                 te_map = te if isinstance(te, Mapping) else {}
                 run_won = str(te_map.get("run_result") or "") == "victory"
-                ep_prefix = f"heldout-seed-{seed}-attempt-1:"
+                prefix_kind = "train" if data_partition == "train_cohort" else "heldout"
+                ep_prefix = f"{prefix_kind}-seed-{seed}-attempt-1:"
 
                 journal.write_episode_boundary(
                     {
@@ -453,7 +468,7 @@ def _reconstruct_heldout_journal(
                         "evaluation_seed": seed,
                         "attempt": 1,
                         "journal_episode_namespace": ep_prefix,
-                        "data_partition": "validation",
+                        "data_partition": data_partition,
                     }
                 )
 
@@ -646,6 +661,8 @@ def sync_once(
     state_data: dict[str, Any] = {
         "synced_updates": [],
         "synced_journals": [],
+        "synced_heldout_gates": [],
+        "update_env_steps": {},
         "cumulative_env_steps": 0,
         "last_unix_s": 0.0,
     }
@@ -659,9 +676,16 @@ def sync_once(
 
     synced_updates: set[int] = {int(x) for x in state_data.get("synced_updates", [])}
     synced_journals: set[int] = {int(x) for x in state_data.get("synced_journals", [])}
-    # Also scan existing evaluation-step-*.jsonl files in run_dir
-    for existing_j in run_dir.glob("evaluation-step-*.jsonl"):
-        stem_digits = existing_j.stem.removeprefix("evaluation-step-")
+    synced_heldout_gates: set[int] = {int(x) for x in state_data.get("synced_heldout_gates", [])}
+    raw_update_steps = state_data.get("update_env_steps")
+    update_env_steps: dict[int, int] = (
+        {int(k): int(v) for k, v in raw_update_steps.items() if str(k).isdigit() and isinstance(v, int | float)}
+        if isinstance(raw_update_steps, Mapping)
+        else {}
+    )
+    # Also scan existing train-cohort-step-*.jsonl files in run_dir
+    for existing_j in run_dir.glob("train-cohort-step-*.jsonl"):
+        stem_digits = existing_j.stem.removeprefix("train-cohort-step-")
         if stem_digits.isdigit():
             synced_journals.add(int(stem_digits))
 
@@ -780,18 +804,23 @@ def sync_once(
             handle.write(json.dumps(early_hb, ensure_ascii=False) + "\n")
 
     new_journals_built: list[int] = []
-    # Reconstruct any available held-out journals first so evaluation events find complete journals on disk.
+    # Reconstruct any available training-sample replay journals first (explicitly tagged as train_cohort).
     for upd_num in sorted(cohort_replays):
         if upd_num in synced_journals:
             continue
-        journal_path = run_dir / f"evaluation-step-{upd_num:09d}.jsonl"
-        print(f"[sync] Reconstructing rich deck/route journal for update {upd_num} -> {journal_path.name} ...", flush=True)
+        journal_path = run_dir / f"train-cohort-step-{upd_num:09d}.jsonl"
+        print(
+            f"[sync] Reconstructing rich deck/route training-sample journal for update {upd_num} -> {journal_path.name} ...",
+            flush=True,
+        )
         count = _reconstruct_heldout_journal(
             journal_path=journal_path,
             gate=upd_num,
             cohort_episodes=cohort_replays[upd_num],
             simulator=simulator,
             revival_budget=effective_revival_budget,
+            gate_kind="train_cohort",
+            data_partition="train_cohort",
         )
         if count > 0:
             synced_journals.add(upd_num)
@@ -815,7 +844,10 @@ def sync_once(
             max_act = 3 if max_floor >= 34 else (2 if max_floor >= 18 else 1)
             revivals = int(_finite(ep.get("revivals_used")) or 0)
             hp_lost = _finite(ep.get("player_hp_lost")) or 0.0
-            reward_total = _finite(ep.get("total_reward")) or 0.0
+            reward_val = _finite(ep.get("observed_discounted_return"))
+            if reward_val is None:
+                reward_val = _finite(ep.get("total_reward"))
+            reward_total = reward_val if reward_val is not None else 0.0
             events_to_append.append(
                 {
                     "event": "train_episode",
@@ -836,6 +868,7 @@ def sync_once(
                     "deadlocked": False,
                 }
             )
+        update_env_steps[upd_num] = cumulative_env_steps
 
         v_dur = _finite(lrn.get("durable_value_loss")) or 0.0
         v_post = _finite(lrn.get("durable_post_value_loss")) or 0.0
@@ -919,13 +952,13 @@ def sync_once(
         revivs = [_finite(e.get("revivals_used")) or 0.0 for e in eps]
         hp_losses = [_finite(e.get("player_hp_lost")) or 0.0 for e in eps]
 
-        eval_event: dict[str, Any] = {
-            "event": "evaluation",
+        cohort_event: dict[str, Any] = {
+            "event": "train_cohort_summary",
             "unix_s": monotonic_ts(base_ts + 0.4),
             "evaluation_gate": upd_num,
             "evaluation_attempt": 1,
-            "gate_kind": "validation",
-            "data_partition": "validation",
+            "gate_kind": "train_cohort",
+            "data_partition": "train_cohort",
             "environment_steps": cumulative_env_steps,
             "policy_version": upd_num,
             "actor_policy_version": max(0, upd_num - 1),
@@ -951,17 +984,95 @@ def sync_once(
             "evaluation_context": {
                 "policy_version": upd_num,
                 "actor_policy_version": max(0, upd_num - 1),
-                "data_partition": "validation",
+                "data_partition": "train_cohort",
                 "deterministic": False,
                 "epsilon": 0.05,
             },
         }
         if upd_num in synced_journals:
-            eval_event["journal_name"] = f"evaluation-step-{upd_num:09d}.jsonl"
-        events_to_append.append(eval_event)
+            cohort_event["journal_name"] = f"train-cohort-step-{upd_num:09d}.jsonl"
+        events_to_append.append(cohort_event)
 
         synced_updates.add(upd_num)
         new_updates_synced.append(upd_num)
+
+    # Emit genuine odd-seed held-out evaluation records ONLY from heldout_evaluations.jsonl.
+    heldout_by_gate: dict[int, dict[str, Any]] = {}
+    for src_h in (seed_bundle.get("heldout_evaluations", []), remote_bundle.get("heldout_evaluations", [])):
+        if not isinstance(src_h, list):
+            continue
+        for h_row in src_h:
+            if not isinstance(h_row, Mapping):
+                continue
+            if str(h_row.get("data_partition") or "validation") != "validation":
+                continue
+            rec_budget = _finite(h_row.get("revival_budget"))
+            if rec_budget is not None and int(rec_budget) != effective_revival_budget:
+                continue
+            pv = _finite(h_row.get("policy_version", h_row.get("evaluation_gate")))
+            if pv is None:
+                continue
+            heldout_by_gate[int(pv)] = dict(h_row)
+
+    new_heldout_synced: list[int] = []
+    for h_gate in sorted(heldout_by_gate):
+        if h_gate in synced_heldout_gates:
+            continue
+        hr = heldout_by_gate[h_gate]
+        h_eps = max(1, int(_finite(hr.get("episodes")) or 48))
+        h_a1_rate = _finite(hr.get("act1_clear_rate")) or 0.0
+        h_a3_rate = _finite(hr.get("act3_reach_rate")) or 0.0
+        h_win_rate = _finite(hr.get("run_win_rate")) or 0.0
+        h_z_wins = int(_finite(hr.get("zero_revival_victories")) or 0)
+        h_env_steps = update_env_steps.get(h_gate, cumulative_env_steps)
+        events_to_append.append(
+            {
+                "event": "evaluation",
+                "unix_s": monotonic_ts(_finite(hr.get("unix_s"))),
+                "evaluation_gate": h_gate,
+                "evaluation_attempt": max(1, int(_finite(hr.get("evaluation_attempt")) or 1)),
+                "gate_kind": "validation",
+                "data_partition": "validation",
+                "environment_steps": h_env_steps,
+                "policy_version": h_gate,
+                "actor_policy_version": h_gate,
+                "episodes": h_eps,
+                "act1_clear_count": int(_finite(hr.get("act1_clear_count")) or round(h_a1_rate * h_eps)),
+                "act1_clear_rate": h_a1_rate,
+                "act3_reach_count": int(_finite(hr.get("act3_reach_count")) or round(h_a3_rate * h_eps)),
+                "act3_reach_rate": h_a3_rate,
+                "run_win_rate": h_win_rate,
+                "successful_run_count": int(_finite(hr.get("successful_run_count")) or round(h_win_rate * h_eps)),
+                "zero_revival_victories": h_z_wins,
+                "zero_revival_act1_successes": int(
+                    _finite(hr.get("zero_revival_act1_successes")) or h_z_wins
+                ),
+                "revival_free_act1_clear_rate": (
+                    _finite(hr.get("revival_free_act1_clear_rate"))
+                    if _finite(hr.get("revival_free_act1_clear_rate")) is not None
+                    else (h_z_wins / h_eps)
+                ),
+                "mean_revivals_used": _finite(hr.get("mean_revivals_used")),
+                "mean_player_hp_lost": _finite(hr.get("mean_player_hp_lost")),
+                "mean_max_floor": _finite(hr.get("mean_max_floor")),
+                "maximum_floor": int(_finite(hr.get("maximum_floor")) or 50),
+                "deadlock_count": int(_finite(hr.get("deadlock_count")) or 0),
+                "deadlock_rate": _finite(hr.get("deadlock_rate")) or 0.0,
+                "combat_progress_stall_rate": _finite(hr.get("combat_progress_stall_rate")) or 0.0,
+                "noncombat_progress_stall_rate": _finite(hr.get("noncombat_progress_stall_rate")) or 0.0,
+                "combat_policy_failure_count": int(_finite(hr.get("combat_policy_failure_count")) or 0),
+                "evaluation_context": {
+                    "policy_version": h_gate,
+                    "actor_policy_version": h_gate,
+                    "data_partition": "validation",
+                    "seed_parity": str(hr.get("seed_parity") or "odd_held_out"),
+                    "deterministic": True,
+                    "epsilon": 0.0,
+                },
+            }
+        )
+        synced_heldout_gates.add(h_gate)
+        new_heldout_synced.append(h_gate)
 
     # Emit live heartbeat when remote Colab G4 daemon is actively running so dashboard badge stays "训练中".
     terminal_emitted = bool(state_data.get("terminal_emitted", False))
@@ -1023,6 +1134,8 @@ def sync_once(
     new_state = {
         "synced_updates": sorted(synced_updates),
         "synced_journals": sorted(synced_journals),
+        "synced_heldout_gates": sorted(synced_heldout_gates),
+        "update_env_steps": {str(k): v for k, v in sorted(update_env_steps.items())},
         "cumulative_env_steps": cumulative_env_steps,
         "last_unix_s": last_unix_s,
         "terminal_emitted": terminal_emitted,
@@ -1033,8 +1146,10 @@ def sync_once(
         "run_dir": str(run_dir),
         "alive": bool(remote_bundle.get("alive")),
         "new_updates_synced": new_updates_synced,
+        "new_heldout_synced": new_heldout_synced,
         "new_journals_built": new_journals_built,
         "total_updates": len(synced_updates),
+        "total_heldout_gates": len(synced_heldout_gates),
         "total_journals": len(synced_journals),
     }
 

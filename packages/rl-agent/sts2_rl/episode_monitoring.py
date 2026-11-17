@@ -67,6 +67,7 @@ _GATE_KIND_BY_JOURNAL = {
     "evaluation": "validation",
     "early-validation": "early_validation",
     "final-audit": "final_audit",
+    "train-cohort": "train_cohort",
 }
 
 

@@ -33,7 +33,7 @@ _PARENT_RUN_RE = re.compile(
 )
 _CHECKPOINT_RE = re.compile(r"^(?P<kind>periodic|final)-step-(?P<step>[0-9]+)$")
 _EVALUATION_RE = re.compile(
-    r"^(?P<journal_kind>evaluation|early-validation|final-audit)-"
+    r"^(?P<journal_kind>evaluation|early-validation|final-audit|train-cohort)-"
     r"step-(?P<step>[0-9]{1,18})"
     r"(?:-attempt-(?P<attempt>(?=[0-9]{1,9}\.jsonl$)0*[1-9][0-9]*))?\.jsonl$"
 )
@@ -41,11 +41,13 @@ _EVALUATION_GATE_KIND_BY_JOURNAL = {
     "evaluation": "validation",
     "early-validation": "early_validation",
     "final-audit": "final_audit",
+    "train-cohort": "train_cohort",
 }
 _EVALUATION_GATE_KIND_ORDER = {
     "validation": 0,
     "early_validation": 1,
     "final_audit": 2,
+    "train_cohort": 3,
 }
 _MAX_METRICS_LINE_BYTES = 8 * 1024 * 1024
 _MAX_START_LINE_BYTES = 8 * 1024 * 1024
@@ -456,6 +458,7 @@ class IncrementalMetrics:
         self.episodes: list[JsonDict] = []
         self.learner_series: list[JsonDict] = []
         self.evaluations: list[JsonDict] = []
+        self.train_cohorts: list[JsonDict] = []
         self.checkpoint_events: list[JsonDict] = []
         self.incidents: list[JsonDict] = []
         self.candidate_peaks: list[JsonDict] = []
@@ -478,6 +481,7 @@ class IncrementalMetrics:
         self.episodes.clear()
         self.learner_series.clear()
         self.evaluations.clear()
+        self.train_cohorts.clear()
         self.checkpoint_events.clear()
         self.incidents.clear()
         self.candidate_peaks.clear()
@@ -547,6 +551,7 @@ class IncrementalMetrics:
                 "learner_update_start",
                 "learner_update",
                 "train_episode",
+                "train_cohort_summary",
             }:
                 environment_steps = _finite_number(event.get("environment_steps"))
                 if environment_steps is not None:
@@ -612,6 +617,12 @@ class IncrementalMetrics:
                 self.learner_points.append((unix_s, _integer(event.get("policy_version"))))
                 if len(self.learner_points) > 200:
                     del self.learner_points[: len(self.learner_points) - 200]
+            return
+
+        if event_name == "train_cohort_summary" or (
+            event_name == "evaluation" and _is_train_cohort_event(event)
+        ):
+            self.train_cohorts.append(event)
             return
 
         if event_name == "evaluation":
@@ -812,7 +823,22 @@ def _downsample_extrema(points: list[JsonDict], limit: int, key: str) -> list[Js
     return [item for _, item in selected[:limit]]
 
 
+def _is_train_cohort_event(event: JsonDict) -> bool:
+    if _string(event.get("event")) == "train_cohort_summary":
+        return True
+    gate_kind = _string(event.get("gate_kind")).replace("-", "_")
+    if gate_kind == "train_cohort":
+        return True
+    partition = _string(event.get("data_partition")).replace("-", "_")
+    if partition in {"train_cohort", "training"}:
+        return True
+    ctx_partition = _string(_mapping(event.get("evaluation_context")).get("data_partition")).replace("-", "_")
+    return ctx_partition in {"train_cohort", "training"}
+
+
 def _evaluation_gate_kind(event: JsonDict) -> str:
+    if _is_train_cohort_event(event):
+        return "train_cohort"
     supplied = _string(event.get("gate_kind")).replace("-", "_")
     if supplied in {"validation", "early_validation", "final_audit"}:
         return supplied
@@ -856,7 +882,11 @@ def _normalise_evaluation(event: JsonDict) -> JsonDict:
         "evaluation_guard_rollbacks": max(0, _integer(event.get("evaluation_guard_rollbacks"))),
         "gate_kind": gate_kind,
         "data_partition": _string(event.get("data_partition"))
-        or ("final_audit" if gate_kind == "final_audit" else "validation"),
+        or (
+            "train_cohort"
+            if gate_kind == "train_cohort"
+            else ("final_audit" if gate_kind == "final_audit" else "validation")
+        ),
         "environment_steps": _integer(event.get("environment_steps")),
         "policy_version": int(policy_number) if policy_number is not None else None,
         "actor_policy_version": (int(actor_policy_number) if actor_policy_number is not None else None),
@@ -958,6 +988,17 @@ def _bounded_evaluations(aggregate: IncrementalMetrics, boundary: JsonDict | Non
         result.append(event)
         consumed = next_count
     return result
+
+
+def _bounded_train_cohorts(aggregate: IncrementalMetrics, boundary: JsonDict | None) -> list[JsonDict]:
+    if boundary is None:
+        return list(aggregate.train_cohorts)
+    maximum_policy = _integer(boundary.get("policy_version"))
+    return [
+        event
+        for event in aggregate.train_cohorts
+        if _integer(event.get("policy_version", event.get("evaluation_gate"))) <= maximum_policy
+    ]
 
 
 def _bounded_incidents(aggregate: IncrementalMetrics, boundary: JsonDict | None) -> list[JsonDict]:
@@ -1171,7 +1212,7 @@ class DashboardStore:
                 max(1, _integer(event.get("evaluation_attempt"), 1)),
             )
             for event in recent_objects
-            if event.get("event") == "evaluation"
+            if event.get("event") == "evaluation" and not _is_train_cohort_event(event)
         }
         evaluation_activity, pending_evaluation = self._evaluation_journal_activity(
             run,
@@ -1265,7 +1306,7 @@ class DashboardStore:
                     ),
                     max(1, _integer(event.get("evaluation_attempt"), 1)),
                 )
-                for event in parser.evaluations
+                for event in (*parser.evaluations, *parser.train_cohorts)
             }
             journals: list[JsonDict] = []
             entries: Iterator[Path]
@@ -1606,6 +1647,8 @@ class DashboardStore:
                 except (OSError, OverflowError, ValueError):
                     continue
                 gate_kind = _EVALUATION_GATE_KIND_BY_JOURNAL[match.group("journal_kind")]
+                if gate_kind == "train_cohort":
+                    continue
                 attempt = int(match.group("attempt") or 1)
                 if latest_mtime is None or modified > latest_mtime:
                     latest_mtime = modified
@@ -1801,6 +1844,7 @@ class DashboardStore:
             "latest_learner": None,
             "latest_actor": None,
             "evaluations": [],
+            "train_cohorts": [],
             "episodes": [],
             "learner_series": [],
             "checkpoints": {"published": [], "publishing": []},
@@ -1987,6 +2031,28 @@ class DashboardStore:
                 projected_evaluations.sort(key=lambda item: item[0])
             evaluations = [evaluation for _, evaluation in projected_evaluations]
 
+            cohorts_by_gate: dict[tuple[str, int, int], tuple[int, JsonDict]] = {}
+            cohort_sequence = 0
+            for _, aggregate, boundary in segments:
+                for event in _bounded_train_cohorts(aggregate, boundary):
+                    normalised_cohort = _normalise_evaluation(event)
+                    normalised_cohort["gate_kind"] = "train_cohort"
+                    normalised_cohort["data_partition"] = "train_cohort"
+                    ckey = (
+                        "train_cohort",
+                        _integer(normalised_cohort.get("evaluation_gate")),
+                        max(1, _integer(normalised_cohort.get("evaluation_attempt"), 1)),
+                    )
+                    cohorts_by_gate[ckey] = (cohort_sequence, normalised_cohort)
+                    cohort_sequence += 1
+            train_cohorts = [
+                cohort
+                for _, cohort in sorted(
+                    cohorts_by_gate.values(),
+                    key=lambda item: (_integer(item[1].get("evaluation_gate")), item[0]),
+                )
+            ]
+
             episodes = _annotate_episode_generations(
                 [
                     episode
@@ -2168,6 +2234,7 @@ class DashboardStore:
                 "latest_learner": selected_parser.latest_learner,
                 "latest_actor": selected_parser.latest_actor,
                 "evaluations": evaluations,
+                "train_cohorts": train_cohorts,
                 "episodes": episodes,
                 "learner_series": learner_series,
                 "checkpoints": {

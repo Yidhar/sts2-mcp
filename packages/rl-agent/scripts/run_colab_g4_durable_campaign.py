@@ -37,6 +37,7 @@ _CORE_SYNC_FILES: tuple[str, ...] = (
     "status.json",
     "probe_metrics.jsonl",
     "campaign_history.jsonl",
+    "heldout_evaluations.jsonl",
 )
 
 

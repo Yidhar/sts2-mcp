@@ -1301,3 +1301,164 @@ def test_http_heldout_drilldown_is_lazy_key_scoped_and_read_only(tmp_path: Path)
         assert status == 400
         status, _, _ = _request(server, "GET", replay_path + "&extra=1")
         assert status == 400
+def test_train_cohort_summaries_and_journals_never_contaminate_heldout_evaluations(
+    tmp_path: Path,
+) -> None:
+    now = 5_000.0
+    root = tmp_path / "artifacts"
+    run_directory, metrics = _create_run(root, RUN_A, unix_s=100.0)
+    _append_jsonl(
+        metrics,
+        {
+            "event": "train_cohort_summary",
+            "unix_s": 120.0,
+            "evaluation_gate": 5,
+            "gate_kind": "train_cohort",
+            "data_partition": "train_cohort",
+            "environment_steps": 3_000,
+            "policy_version": 5,
+            "episodes": 48,
+            "act1_clear_rate": 1.0,
+            "act3_reach_rate": 0.75,
+            "run_win_rate": 0.25,
+        },
+        {
+            "event": "evaluation",
+            "unix_s": 130.0,
+            "evaluation_gate": 6,
+            "data_partition": "training",
+            "environment_steps": 3_600,
+            "policy_version": 6,
+            "episodes": 48,
+            "run_win_rate": 0.5,
+        },
+    )
+    os.utime(metrics, (now - 5.0, now - 5.0))
+    cohort_journal = run_directory / "train-cohort-step-000000005.jsonl"
+    _append_jsonl(
+        cohort_journal,
+        {
+            "event": "evaluation_started",
+            "evaluation_gate": 5,
+            "gate_kind": "train_cohort",
+            "data_partition": "train_cohort",
+            "policy_version": 5,
+            "evaluation_seeds": [2, 4],
+        },
+    )
+    os.utime(cohort_journal, (now - 1.0, now - 1.0))
+
+    store = DashboardStore(root, stale_seconds=100.0, now=lambda: now)
+    snapshot = store.snapshot()
+    run_key = f"lineage/run-{RUN_A}"
+    journals = store.heldout_journals(run_key)["journals"]
+
+    assert snapshot["evaluations"] == []
+    assert snapshot["progress"]["evaluation_episodes"] == 0
+    assert snapshot["lifecycle"]["pending_evaluation"] is None
+    assert snapshot["status"]["state"] == "running"
+    assert [c["evaluation_gate"] for c in snapshot["train_cohorts"]] == [5, 6]
+    assert all(c["data_partition"] == "train_cohort" for c in snapshot["train_cohorts"])
+    assert len(journals) == 1
+    assert journals[0]["gate_kind"] == "train_cohort"
+    assert journals[0]["complete"] is True
+
+
+def test_sync_colab_g4_separates_training_cohorts_from_heldout_and_preserves_observed_return(
+    tmp_path: Path,
+) -> None:
+    import importlib.util
+    from types import SimpleNamespace
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "sync_colab_g4_to_dashboard.py"
+    spec = importlib.util.spec_from_file_location("sync_colab_g4_to_dashboard", script_path)
+    assert spec is not None and spec.loader is not None
+    sync_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sync_mod)
+
+    root = tmp_path / "artifacts"
+    seed_pull = tmp_path / "seed_pull.json"
+    seed_pull.write_text(
+        json.dumps(
+            {
+                "alive": False,
+                "status": {"state": "completed"},
+                "revival_budget": 32,
+                "updates": [
+                    {
+                        "committed_update": 5,
+                        "_mtime": 1_000.0,
+                        "rollout_policy": "learned_model",
+                        "learner": {"durable_value_loss": 0.02, "macro_mpo_policy_loss": 0.1},
+                        "training_episodes": [
+                            {
+                                "seed": 13_440_000,
+                                "native_steps": 620,
+                                "run_result": "victory",
+                                "max_floor": 50,
+                                "revivals_used": 18,
+                                "player_hp_lost": 940.0,
+                                "observed_discounted_return": -0.875,
+                            }
+                        ],
+                    }
+                ],
+                "heldout_evaluations": [
+                    {
+                        "policy_version": 5,
+                        "revival_budget": 32,
+                        "data_partition": "validation",
+                        "seed_parity": "odd_held_out",
+                        "episodes": 48,
+                        "act1_clear_rate": 1.0,
+                        "act3_reach_rate": 0.8125,
+                        "run_win_rate": 0.375,
+                        "successful_run_count": 18,
+                        "zero_revival_victories": 0,
+                        "mean_revivals_used": 23.5,
+                        "mean_player_hp_lost": 1250.0,
+                        "mean_max_floor": 42.0,
+                    },
+                    {
+                        "policy_version": 5,
+                        "revival_budget": 16,
+                        "data_partition": "validation",
+                        "seed_parity": "odd_held_out",
+                        "episodes": 48,
+                        "run_win_rate": 0.125,
+                    },
+                ],
+                "cohort_replays": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_id = tmp_path / "sim_id.json"
+    fake_id.write_text("{}", encoding="utf-8")
+    fake_sim = SimpleNamespace(executable=tmp_path / "HeadlessSim", identity_path=fake_id)
+
+    res = sync_mod.sync_once(
+        root=root,
+        simulator=fake_sim,
+        session="unused",
+        lineage="durable-afterstate-v5-2-wide256-b32-g4",
+        run_uuid=RUN_A,
+        pid_path="/unused",
+        remote_local_dir="/unused",
+        target_updates=200,
+        revival_budget=32,
+        seed_pull_file=seed_pull,
+        offline_only=True,
+    )
+    assert res["new_updates_synced"] == [5]
+    assert res["new_heldout_synced"] == [5]
+
+    snapshot = DashboardStore(root, now=lambda: 1_010.0).snapshot()
+    assert snapshot["episodes"][0]["reward"] == pytest.approx(-0.875)
+    assert len(snapshot["train_cohorts"]) == 1
+    assert snapshot["train_cohorts"][0]["data_partition"] == "train_cohort"
+    assert snapshot["train_cohorts"][0]["run_win_rate"] == pytest.approx(1.0)
+    assert len(snapshot["evaluations"]) == 1
+    assert snapshot["evaluations"][0]["data_partition"] == "validation"
+    assert snapshot["evaluations"][0]["run_win_rate"] == pytest.approx(0.375)
+    assert snapshot["status"]["state"] == "completed"
