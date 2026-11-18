@@ -744,6 +744,10 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
     )
     local_initial_update = _read_committed_update(output_dir) if local_ckpt.is_file() else 0
     if local_ckpt.is_file() and local_initial_update > drive_synced_update:
+        (output_dir / "campaign_wrapper_stage.json").write_text(
+            json.dumps({"stage": "evaluating_heldout", "update": local_initial_update}) + "\n",
+            encoding="utf-8",
+        )
         _probe_prune_and_sync(
             output_dir=output_dir,
             drive_dir=drive_dir,
@@ -763,6 +767,7 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
             sim_exe=args.sim_exe,
             overrides=args.overrides,
         )
+        (output_dir / "campaign_wrapper_stage.json").unlink(missing_ok=True)
 
     pending_u0_primary: dict[str, Any] | None = None
     pending_u0_extra: dict[str, Any] | None = None
@@ -978,6 +983,10 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
             )
             pending_u0_extra = None
 
+        (output_dir / "campaign_wrapper_stage.json").write_text(
+            json.dumps({"stage": "evaluating_heldout", "update": committed_after}) + "\n",
+            encoding="utf-8",
+        )
         _probe_prune_and_sync(
             output_dir=output_dir,
             drive_dir=drive_dir,
@@ -997,6 +1006,7 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
             sim_exe=args.sim_exe,
             overrides=args.overrides,
         )
+        (output_dir / "campaign_wrapper_stage.json").unlink(missing_ok=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

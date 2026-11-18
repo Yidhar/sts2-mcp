@@ -69,6 +69,14 @@ alive = bool(pid is not None and is_live(pid))
 sim_proc = subprocess.run(["pgrep", "-fc", "HeadlessSim"], capture_output=True, text=True)
 sim_workers = int(sim_proc.stdout.strip() or "0") if sim_proc.returncode == 0 else 0
 status = json.loads((local_dir / "status.json").read_text()) if (local_dir / "status.json").is_file() else {}
+wrapper_stage_f = local_dir / "campaign_wrapper_stage.json"
+if wrapper_stage_f.is_file():
+    try:
+        ws = json.loads(wrapper_stage_f.read_text())
+        if isinstance(ws, dict) and ws.get("stage"):
+            status["state"] = str(ws["stage"])
+    except Exception:
+        pass
 remote_revival_budget = None
 course_file = local_dir / "course.json"
 if course_file.is_file():

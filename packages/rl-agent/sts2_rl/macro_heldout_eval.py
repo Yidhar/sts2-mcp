@@ -30,6 +30,7 @@ from sts2_rl.backends import HeadlessBackend
 from sts2_rl.contracts import EnvironmentResult, ResetRequest
 from sts2_rl.encoding import EncodedDecisionSnapshot, GroundedObservationEncoder
 from sts2_rl.joint.authority import HybridCollectionAuthority
+from sts2_rl.joint.macro_credit_collection import is_recoverable_episode_exception
 from sts2_rl.joint.parallel_collection import (
     BatchedPolicyInferenceServer,
     RemoteBatchedFrozenPolicy,
@@ -343,9 +344,10 @@ def _heldout_worker_entry(
     backend: HeadlessBackend | None = None
     try:
         while True:
-            seed = task_queue.get()
-            if seed is None:
+            task_item = task_queue.get()
+            if task_item is None:
                 break
+            seed, attempt = task_item
             if backend is None:
                 backend = HeadlessBackend(exe_path=str(sim_path))
             try:
@@ -365,7 +367,11 @@ def _heldout_worker_entry(
                 except BaseException:
                     pass
                 backend = None
-                result_queue.put(("err", f"{type(exc).__name__}: {exc}"))
+                err_desc = f"{type(exc).__name__}: {exc}"
+                if is_recoverable_episode_exception(exc):
+                    result_queue.put(("recoverable", (int(seed), int(attempt), err_desc)))
+                else:
+                    result_queue.put(("err", err_desc))
     finally:
         if backend is not None:
             try:
@@ -406,10 +412,17 @@ def evaluate_heldout_publication(
         rocm_sdpa_backend=macro_cfg.training.runtime.rocm_sdpa_backend,
         expected_sha256=pub_sha256,
     )
-    seeds = held_out_evaluation_seeds(macro_cfg.training.runtime.seed, episodes)
+    max_replacements = max(8, episodes // 2)
+    full_odd_pool = held_out_evaluation_seeds(
+        macro_cfg.training.runtime.seed,
+        episodes + max_replacements,
+    )
+    seeds = full_odd_pool[:episodes]
+    replacement_pool = list(full_odd_pool[episodes:])
     eff_workers = min(episodes, workers)
     started = time.monotonic()
     rows: list[dict[str, Any]] = []
+    recoverable_incidents = 0
     if eff_workers == 1:
         with BatchedPolicyInferenceServer(
             loaded.model,
@@ -419,22 +432,43 @@ def evaluate_heldout_publication(
             allow_tf32=macro_cfg.learner.allow_tf32,
             enable_bf16_amp=macro_cfg.learner.enable_bf16_amp,
         ) as server:
-            shared = HeadlessBackend(exe_path=str(simulator.executable))
+            shared: HeadlessBackend | None = HeadlessBackend(exe_path=str(simulator.executable))
             try:
-                for s in seeds:
-                    rows.append(
-                        _run_one_heldout_seed(
-                            seed=s,
-                            policy=server,
-                            training_config=macro_cfg.training,
-                            sim_exe=simulator.executable,
-                            max_native_steps=macro_cfg.branches.max_native_steps,
-                            timeout_seconds=macro_cfg.branches.timeout_seconds,
-                            shared_backend=shared,
+                pending_single = [(int(s), 0) for s in seeds]
+                while pending_single:
+                    cur_s, cur_att = pending_single.pop(0)
+                    if shared is None:
+                        shared = HeadlessBackend(exe_path=str(simulator.executable))
+                    try:
+                        rows.append(
+                            _run_one_heldout_seed(
+                                seed=cur_s,
+                                policy=server,
+                                training_config=macro_cfg.training,
+                                sim_exe=simulator.executable,
+                                max_native_steps=macro_cfg.branches.max_native_steps,
+                                timeout_seconds=macro_cfg.branches.timeout_seconds,
+                                shared_backend=shared,
+                            )
                         )
-                    )
+                    except BaseException as exc:
+                        try:
+                            shared.close()
+                        except BaseException:
+                            pass
+                        shared = None
+                        if not is_recoverable_episode_exception(exc) or recoverable_incidents >= max_replacements:
+                            raise
+                        recoverable_incidents += 1
+                        if cur_att == 0:
+                            pending_single.insert(0, (cur_s, 1))
+                        elif replacement_pool:
+                            pending_single.append((int(replacement_pool.pop(0)), 1))
+                        else:
+                            raise
             finally:
-                shared.close()
+                if shared is not None:
+                    shared.close()
     else:
         mp_ctx = get_context("spawn")
         task_queue = mp_ctx.Queue()
@@ -447,9 +481,7 @@ def evaluate_heldout_publication(
             recv_conns.append(r_conn)
             send_conns.append(s_conn)
         for s in seeds:
-            task_queue.put(int(s))
-        for _ in range(eff_workers):
-            task_queue.put(None)
+            task_queue.put((int(s), 0))
 
         procs: list[Any] = []
         with BatchedPolicyInferenceServer(
@@ -485,14 +517,33 @@ def evaluate_heldout_publication(
                     p.start()
                     recv_conns[wid].close()
                     procs.append(p)
-                for _ in range(len(seeds)):
+                while len(rows) < len(seeds):
                     status_tag, payload = result_queue.get(
                         timeout=max(120.0, float(macro_cfg.branches.timeout_seconds) + 60.0)
                     )
-                    if status_tag != "ok":
+                    if status_tag == "ok":
+                        rows.append(payload)
+                    elif status_tag == "recoverable":
+                        failed_seed, attempt, err_desc = payload
+                        recoverable_incidents += 1
+                        if recoverable_incidents > max_replacements:
+                            raise RuntimeError(
+                                f"held-out evaluation exceeded recoverable incident cap ({max_replacements}): {err_desc}"
+                            )
+                        if attempt == 0:
+                            task_queue.put((int(failed_seed), 1))
+                        elif replacement_pool:
+                            task_queue.put((int(replacement_pool.pop(0)), 1))
+                        else:
+                            raise RuntimeError(f"held-out replacement pool exhausted after: {err_desc}")
+                    else:
                         raise RuntimeError(f"held-out worker failed: {payload}")
-                    rows.append(payload)
             finally:
+                for _ in range(eff_workers):
+                    try:
+                        task_queue.put_nowait(None)
+                    except BaseException:
+                        pass
                 for p in procs:
                     p.join(timeout=5.0)
                     if p.is_alive():
@@ -551,6 +602,7 @@ def evaluate_heldout_publication(
         "shop_remove_rate": (tot_shp_rm / tot_shp_dec) if tot_shp_dec > 0 else None,
         "deadlock_count": stalls,
         "deadlock_rate": stalls / n,
+        "recoverable_incidents": recoverable_incidents,
         "elapsed_seconds": time.monotonic() - started,
     }
 
