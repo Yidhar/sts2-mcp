@@ -252,6 +252,7 @@ def get_runtime(session, force_refresh=False):
     if force_refresh:
         close_cached(session)
         state._sessions = None
+        state._store = None
     s = state.get_session(session)
     cached = runtimes.get(session)
     if cached is not None:
@@ -272,6 +273,8 @@ def get_runtime(session, force_refresh=False):
     runtimes[session] = (rt, s.token)
     return rt
 
+import re as _re
+
 for raw_line in sys.stdin:
     line = raw_line.strip()
     if not line:
@@ -283,8 +286,10 @@ for raw_line in sys.stdin:
     last_err = ""
     resp = None
     for attempt in range(3):
+        cap_out = io.StringIO()
+        cap_err = io.StringIO()
         try:
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with contextlib.redirect_stdout(cap_out), contextlib.redirect_stderr(cap_err):
                 rt = get_runtime(session, force_refresh=(attempt > 0))
                 outputs = rt.execute_code(script, timeout=timeout_s)
             out_parts = []
@@ -308,7 +313,8 @@ for raw_line in sys.stdin:
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)) and not isinstance(exc, SystemExit):
                 raise
-            last_err = f"{type(exc).__name__}: {exc}"
+            captured = _re.sub(r"https?://\\S+", "<REDACTED_URL>", (cap_out.getvalue() + " " + cap_err.getvalue()).strip())
+            last_err = f"{type(exc).__name__}: {exc}" + (f" ({captured})" if captured else "")
             close_cached(session)
             if attempt < 2:
                 time.sleep(1.0 * (attempt + 1))
