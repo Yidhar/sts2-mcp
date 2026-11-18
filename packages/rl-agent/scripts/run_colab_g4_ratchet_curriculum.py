@@ -197,8 +197,9 @@ def _prepare_runtime_env(root: Path) -> dict[str, str]:
     if shim.is_file() and str(shim) not in env.get("LD_PRELOAD", ""):
         prev = env.get("LD_PRELOAD", "").strip()
         env["LD_PRELOAD"] = f"{shim}:{prev}" if prev else str(shim)
-    if not env.get("DOTNET_ROOT"):
-        for cand_dn in (root / "dotnet", Path.home() / ".dotnet"):
+    cur_dn = env.get("DOTNET_ROOT", "").strip()
+    if not cur_dn or not (Path(cur_dn) / "dotnet").is_file():
+        for cand_dn in (root / "dotnet", Path.home() / ".dotnet", Path("/root/.dotnet")):
             if (cand_dn / "dotnet").is_file():
                 env["DOTNET_ROOT"] = str(cand_dn)
                 env["PATH"] = f"{cand_dn}{os.pathsep}{env.get('PATH', '')}"

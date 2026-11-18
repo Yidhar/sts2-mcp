@@ -725,8 +725,9 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
     if mountinfo_shim.is_file() and str(mountinfo_shim) not in env.get("LD_PRELOAD", ""):
         existing_preload = env.get("LD_PRELOAD", "").strip()
         env["LD_PRELOAD"] = f"{mountinfo_shim}:{existing_preload}" if existing_preload else str(mountinfo_shim)
-    if not env.get("DOTNET_ROOT"):
-        for candidate_dotnet in (root / "dotnet", Path.home() / ".dotnet"):
+    cur_dn = env.get("DOTNET_ROOT", "").strip()
+    if not cur_dn or not (Path(cur_dn) / "dotnet").is_file():
+        for candidate_dotnet in (root / "dotnet", Path.home() / ".dotnet", Path("/root/.dotnet")):
             if (candidate_dotnet / "dotnet").is_file():
                 env["DOTNET_ROOT"] = str(candidate_dotnet)
                 env["PATH"] = f"{candidate_dotnet}{os.pathsep}{env.get('PATH', '')}"
