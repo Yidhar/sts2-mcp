@@ -470,6 +470,57 @@ def _fetch_remote_bundle(
     return _extract_marked_json(stdout, "PULLED_JSON_START", "PULLED_JSON_END")
 
 
+_REMOTE_RATCHET_STATE_TEMPLATE = """
+import json
+from pathlib import Path
+
+p = Path(__RATCHET_STATE_PATH__)
+data = json.loads(p.read_text()) if p.is_file() else None
+print("RATCHET_JSON_START")
+print(json.dumps({"ratchet": data}, separators=(",", ":")))
+print("RATCHET_JSON_END")
+"""
+
+
+def _fetch_ratchet_state(
+    *,
+    session: str,
+    ratchet_state_path: str,
+    timeout_seconds: int = 30,
+) -> dict[str, Any] | None:
+    script = _REMOTE_RATCHET_STATE_TEMPLATE.replace("__RATCHET_STATE_PATH__", json.dumps(ratchet_state_path))
+    if os.name == "nt":
+        returncode, stdout, stderr = _WSL_BRIDGE.exec_script(
+            session=session,
+            script=script,
+            timeout_seconds=int(timeout_seconds),
+        )
+    else:
+        colab_bin = os.environ.get("COLAB_BIN") or str(Path.home() / ".local" / "bin" / "colab")
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as handle:
+            handle.write(script)
+            tmp_path = Path(handle.name)
+        try:
+            proc = subprocess.run(
+                [colab_bin, "exec", "-s", session, "--timeout", str(int(timeout_seconds)), "-f", str(tmp_path)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_seconds + 20,
+                check=False,
+            )
+            returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
+        finally:
+            tmp_path.unlink(missing_ok=True)
+    if returncode != 0:
+        detail = (stderr or stdout).strip()[-600:]
+        raise RuntimeError(f"colab ratchet state pull failed (exit {returncode}): {detail}")
+    wrapped = _extract_marked_json(stdout, "RATCHET_JSON_START", "RATCHET_JSON_END")
+    inner = wrapped.get("ratchet")
+    return dict(inner) if isinstance(inner, Mapping) else None
+
+
 def _load_seed_pull_cache(path: Path | None) -> dict[str, Any]:
     if path is None or not path.is_file():
         return {}
@@ -725,6 +776,8 @@ def sync_once(
     revival_budget: int = 64,
     seed_pull_file: Path | None = None,
     offline_only: bool = False,
+    force_terminal_status: str | None = None,
+    ratchet_state_label: str | None = None,
 ) -> dict[str, Any]:
     run_dir = root / "runs" / lineage / f"run-{run_uuid}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -831,21 +884,25 @@ def sync_once(
                         )
                     ),
                     "version": (
-                        "sts2-durable-afterstate-v6.2-ablation"
-                        if "v6-2" in lineage or "v6.2" in lineage
+                        "sts2-durable-afterstate-v6.3-ratchet"
+                        if "v6-3" in lineage or "v6.3" in lineage or "ratchet" in lineage
                         else (
-                            "sts2-durable-afterstate-v6-wide256"
-                            if "v6" in lineage
+                            "sts2-durable-afterstate-v6.2-ablation"
+                            if "v6-2" in lineage or "v6.2" in lineage
                             else (
-                                "sts2-durable-afterstate-v5-wide256"
-                                if "v5" in lineage
+                                "sts2-durable-afterstate-v6-wide256"
+                                if "v6" in lineage
                                 else (
-                                    "sts2-durable-afterstate-v4"
-                                    if "v4" in lineage
+                                    "sts2-durable-afterstate-v5-wide256"
+                                    if "v5" in lineage
                                     else (
-                                        "sts2-durable-afterstate-v3"
-                                        if "v3" in lineage
-                                        else "sts2-durable-afterstate-v2"
+                                        "sts2-durable-afterstate-v4"
+                                        if "v4" in lineage
+                                        else (
+                                            "sts2-durable-afterstate-v3"
+                                            if "v3" in lineage
+                                            else "sts2-durable-afterstate-v2"
+                                        )
                                     )
                                 )
                             )
@@ -874,8 +931,9 @@ def sync_once(
             }
         )
 
+    stage_alive = bool(remote_bundle.get("alive")) and force_terminal_status is None
     # Flush immediate live heartbeat BEFORE running local HeadlessSim journal replay so telemetry age resets right away.
-    if bool(remote_bundle.get("alive")) and metrics_path.is_file() and metrics_path.stat().st_size > 0:
+    if stage_alive and metrics_path.is_file() and metrics_path.stat().st_size > 0:
         remote_status_early = remote_bundle.get("status")
         stage_early = (
             str(remote_status_early.get("state") or "collecting")
@@ -1185,7 +1243,7 @@ def sync_once(
     # Emit live heartbeat when remote Colab G4 daemon is actively running so dashboard badge stays "训练中".
     terminal_emitted = bool(state_data.get("terminal_emitted", False))
     remote_status = remote_bundle.get("status")
-    if bool(remote_bundle.get("alive")):
+    if stage_alive:
         terminal_emitted = False
         stage = (
             str(remote_status.get("state") or "collecting")
@@ -1200,10 +1258,44 @@ def sync_once(
                 "stage": stage,
             }
         )
-    elif not terminal_emitted and isinstance(remote_status, Mapping):
-        st_state = str(remote_status.get("state") or "")
+    elif not terminal_emitted:
         latest_ver = max(synced_updates, default=0)
-        if st_state in {
+        st_state = str(remote_status.get("state") or "") if isinstance(remote_status, Mapping) else ""
+        if force_terminal_status is not None:
+            events_to_append.append(
+                {
+                    "event": "run_complete",
+                    "unix_s": monotonic_ts(time.time()),
+                    "environment_steps": cumulative_env_steps,
+                    "policy_version": latest_ver,
+                    "completion_status": force_terminal_status,
+                }
+            )
+            terminal_emitted = True
+        elif ratchet_state_label in {"ratchet_complete", "stage_promoted", "paused_stage_cap_reached"}:
+            events_to_append.append(
+                {
+                    "event": "run_complete",
+                    "unix_s": monotonic_ts(time.time()),
+                    "environment_steps": cumulative_env_steps,
+                    "policy_version": latest_ver,
+                    "completion_status": ratchet_state_label,
+                }
+            )
+            terminal_emitted = True
+        elif ratchet_state_label == "aborted":
+            events_to_append.append(
+                {
+                    "event": "run_failed",
+                    "unix_s": monotonic_ts(time.time()),
+                    "environment_steps": cumulative_env_steps,
+                    "policy_version": latest_ver,
+                    "error_type": "RatchetAborted",
+                    "message": "Ratchet orchestrator reported aborted state",
+                }
+            )
+            terminal_emitted = True
+        elif st_state in {
             "completed",
             "campaign_complete",
             "archived_complete",
@@ -1218,7 +1310,7 @@ def sync_once(
                 }
             )
             terminal_emitted = True
-        elif st_state in {"aborted", "failed"}:
+        elif st_state in {"aborted", "failed"} and isinstance(remote_status, Mapping):
             err_type = str(remote_status.get("error_type") or "RuntimeError")
             err_msg = str(remote_status.get("error") or st_state)
             events_to_append.append(
@@ -1250,8 +1342,10 @@ def sync_once(
     state_file.write_text(json.dumps(new_state, indent=2) + "\n", encoding="utf-8")
 
     return {
+        "lineage": lineage,
+        "revival_budget": effective_revival_budget,
         "run_dir": str(run_dir),
-        "alive": bool(remote_bundle.get("alive")),
+        "alive": stage_alive,
         "new_updates_synced": new_updates_synced,
         "new_heldout_synced": new_heldout_synced,
         "new_journals_built": new_journals_built,
@@ -1259,6 +1353,84 @@ def sync_once(
         "total_heldout_gates": len(synced_heldout_gates),
         "total_journals": len(synced_journals),
     }
+
+
+def _is_local_stage_terminal(root: Path, stage_lineage: str) -> bool:
+    st_file = root / "colab_g4_sync" / stage_lineage / "sync_state.json"
+    if not st_file.is_file():
+        return False
+    try:
+        data = json.loads(st_file.read_text(encoding="utf-8"))
+        return isinstance(data, Mapping) and bool(data.get("terminal_emitted", False))
+    except Exception:
+        return False
+
+
+def _sync_ratchet_tick(
+    *,
+    root: Path,
+    simulator: VerifiedSimulatorIdentity,
+    session: str,
+    pid_path: str,
+    ratchet_state_path: str,
+) -> dict[str, Any]:
+    ratchet_info = _fetch_ratchet_state(session=session, ratchet_state_path=ratchet_state_path)
+    if ratchet_info is None:
+        return {"status": "waiting_for_ratchet_state", "ratchet_state_path": ratchet_state_path}
+
+    max_stage_updates = int(ratchet_info.get("max_updates_per_stage") or 80)
+    cur_lineage = str(ratchet_info["current_lineage"]).strip().replace("_", "-")
+    cur_local_dir = str(ratchet_info["current_local_dir"])
+    cur_budget = int(ratchet_info.get("current_budget") or 24)
+    cur_state = str(ratchet_info.get("state") or "")
+    campaigns_parent = str(Path(cur_local_dir).parent).replace("\\", "/")
+
+    # Ensure every already-promoted stage in promoted_history has been finalized locally.
+    prom_hist = ratchet_info.get("promoted_history")
+    if isinstance(prom_hist, list):
+        for entry in prom_hist:
+            if not isinstance(entry, Mapping):
+                continue
+            p_lin = str(entry.get("lineage_id") or "").strip().replace("_", "-")
+            p_bud = int(entry.get("budget") or 24)
+            p_upd = int(entry.get("promoted_at_update") or max_stage_updates)
+            if not p_lin or p_lin == cur_lineage or _is_local_stage_terminal(root, p_lin):
+                continue
+            p_uuid = str(uuid5(NAMESPACE_DNS, f"sts2-colab-g4-{p_lin}"))
+            p_remote_dir = f"{campaigns_parent}/{p_lin}"
+            print(f"[sync] Finalizing promoted stage {p_lin} (u={p_upd}) -> run_complete ...", flush=True)
+            sync_once(
+                root=root,
+                simulator=simulator,
+                session=session,
+                lineage=p_lin,
+                run_uuid=p_uuid,
+                pid_path=pid_path,
+                remote_local_dir=p_remote_dir,
+                target_updates=max(p_upd, 1),
+                revival_budget=p_bud,
+                force_terminal_status=f"stage_promoted_at_u{p_upd}",
+            )
+
+    cur_uuid = str(uuid5(NAMESPACE_DNS, f"sts2-colab-g4-{cur_lineage}"))
+    force_term = "ratchet_complete" if cur_state == "ratchet_complete" else None
+    res = sync_once(
+        root=root,
+        simulator=simulator,
+        session=session,
+        lineage=cur_lineage,
+        run_uuid=cur_uuid,
+        pid_path=pid_path,
+        remote_local_dir=cur_local_dir,
+        target_updates=max_stage_updates,
+        revival_budget=cur_budget,
+        force_terminal_status=force_term,
+        ratchet_state_label=cur_state,
+    )
+    res["ratchet_state"] = cur_state
+    res["stage_index"] = ratchet_info.get("stage_index")
+    res["total_stages"] = ratchet_info.get("total_stages")
+    return res
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1274,6 +1446,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--remote-local-dir",
         default="/content/sts2_artifacts/campaigns/durable-afterstate-v2-b64-g4",
+    )
+    parser.add_argument(
+        "--follow-ratchet-state",
+        default=None,
+        help="remote path to active_ratchet_state.json for automatic multi-stage curriculum following",
     )
     parser.add_argument("--seed-pull-file", type=Path, default=None, help="optional cached pull payload")
     parser.add_argument("--offline-only", action="store_true", help="ingest only from --seed-pull-file")
@@ -1296,19 +1473,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     if not args.watch:
-        result = sync_once(
-            root=root,
-            simulator=simulator,
-            session=args.session,
-            lineage=lineage,
-            run_uuid=run_uuid,
-            pid_path=args.pid_path,
-            remote_local_dir=args.remote_local_dir,
-            target_updates=args.target_updates,
-            revival_budget=args.revival_budget,
-            seed_pull_file=seed_pull_file,
-            offline_only=args.offline_only,
-        )
+        if args.follow_ratchet_state:
+            result = _sync_ratchet_tick(
+                root=root,
+                simulator=simulator,
+                session=args.session,
+                pid_path=args.pid_path,
+                ratchet_state_path=str(args.follow_ratchet_state),
+            )
+        else:
+            result = sync_once(
+                root=root,
+                simulator=simulator,
+                session=args.session,
+                lineage=lineage,
+                run_uuid=run_uuid,
+                pid_path=args.pid_path,
+                remote_local_dir=args.remote_local_dir,
+                target_updates=args.target_updates,
+                revival_budget=args.revival_budget,
+                seed_pull_file=seed_pull_file,
+                offline_only=args.offline_only,
+            )
         print(f"[sync] {json.dumps(result, ensure_ascii=False)}", flush=True)
         return 0
 
@@ -1320,19 +1506,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         while True:
             succeeded = False
             try:
-                step_res = sync_once(
-                    root=root,
-                    simulator=simulator,
-                    session=args.session,
-                    lineage=lineage,
-                    run_uuid=run_uuid,
-                    pid_path=args.pid_path,
-                    remote_local_dir=args.remote_local_dir,
-                    target_updates=args.target_updates,
-                    revival_budget=args.revival_budget,
-                    seed_pull_file=seed_pull_file if first_pass else None,
-                    offline_only=args.offline_only if first_pass else False,
-                )
+                if args.follow_ratchet_state:
+                    step_res = _sync_ratchet_tick(
+                        root=root,
+                        simulator=simulator,
+                        session=args.session,
+                        pid_path=args.pid_path,
+                        ratchet_state_path=str(args.follow_ratchet_state),
+                    )
+                else:
+                    step_res = sync_once(
+                        root=root,
+                        simulator=simulator,
+                        session=args.session,
+                        lineage=lineage,
+                        run_uuid=run_uuid,
+                        pid_path=args.pid_path,
+                        remote_local_dir=args.remote_local_dir,
+                        target_updates=args.target_updates,
+                        revival_budget=args.revival_budget,
+                        seed_pull_file=seed_pull_file if first_pass else None,
+                        offline_only=args.offline_only if first_pass else False,
+                    )
                 first_pass = False
                 succeeded = True
                 print(f"[sync] {json.dumps(step_res, ensure_ascii=False)}", flush=True)

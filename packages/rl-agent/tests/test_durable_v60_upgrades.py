@@ -927,3 +927,126 @@ def test_v62_ablation_config_packed_scatter_and_dual_heldout_sync(tmp_path: Path
     assert (drive_dir / "heldout_evaluations_b16.jsonl").is_file()
     assert (drive_dir / "snapshots" / "update-000005" / "heldout.json").is_file()
     assert (drive_dir / "snapshots" / "update-000005" / "heldout_b16.json").is_file()
+
+
+def test_v63_ratchet_promotion_gate_enforces_wins_revivals_and_antibloat(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    import json
+    import subprocess
+    import sys
+
+    monkeypatch.setenv("STS2_ARTIFACT_ROOT", str(tmp_path))
+    v63_toml = (
+        Path(__file__).resolve().parents[1]
+        / "config/experiments/hybrid_macro_credit_v19_durable_afterstate_v63_ratchet_g4_turbo.toml"
+    )
+    cfg = load_macro_training_config(v63_toml)
+    assert cfg.learner.revival_budget == 24
+    assert cfg.training.curriculum.revival_budget == 24
+    assert cfg.learner.double_mpo_pessimism_coef == 0.42
+    assert cfg.learner.kickstart_kl_floor == 0.048
+    assert cfg.learner.freeze_trunk_during_durable_warmup is True
+    assert cfg.learner.enable_post_step_kl_line_search is True
+    assert cfg.learner.enable_bf16_amp is True
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts/run_colab_g4_ratchet_curriculum.py"
+    spec = importlib.util.spec_from_file_location("run_colab_g4_ratchet_curriculum_v63", script_path)
+    assert spec is not None and spec.loader is not None
+    ratchet_mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = ratchet_mod
+    spec.loader.exec_module(ratchet_mod)
+
+    ladder = ratchet_mod.DEFAULT_SMOOTH_LADDER
+    budgets = [st.budget for st in ladder]
+    assert budgets == [24, 20, 16, 12, 8, 6, 4, 3, 2, 1]
+    assert len({st.seed_index_offset for st in ladder}) == len(ladder)
+
+    b24 = ladder[0]
+    base_row = {
+        "policy_version": 10,
+        "episodes": 48,
+        "revival_budget": 24,
+        "successful_run_count": 28,
+        "mean_revivals_used": 15.2,
+        "skip_rate": 0.165,
+        "mean_final_deck_size": 31.0,
+        "deadlock_count": 0,
+    }
+    ok_good, _ = ratchet_mod.evaluate_stage_promotion_gate(
+        base_row, b24, expected_episodes=48, min_policy_version=5
+    )
+    assert ok_good is True
+
+    # Must NOT promote at u=0 before frozen-trunk value warmup finishes
+    ok_u0, rep_u0 = ratchet_mod.evaluate_stage_promotion_gate(
+        {**base_row, "policy_version": 0}, b24, expected_episodes=48, min_policy_version=5
+    )
+    assert ok_u0 is False and rep_u0["checks"]["policy_version_ready"] is False
+
+    # Must NOT promote bloated 0%-skip / 40-card policy even with high wins
+    ok_bloat, rep_bloat = ratchet_mod.evaluate_stage_promotion_gate(
+        {**base_row, "successful_run_count": 34, "skip_rate": 0.0, "mean_final_deck_size": 40.35},
+        b24,
+        expected_episodes=48,
+        min_policy_version=5,
+    )
+    assert ok_bloat is False
+    assert rep_bloat["checks"]["skip_discipline_ok"] is False
+    assert rep_bloat["checks"]["deck_size_ok"] is False
+
+    # End-to-end 2-stage orchestration test (b24 -> b20)
+    seed_pub = tmp_path / "seed_u20.pt"
+    seed_pub.write_bytes(b"v62-u20-peak")
+    drive_root = tmp_path / "drive_campaigns"
+
+    def _fake_subproc_run(cmd: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        out_idx = cmd.index("--output-dir") + 1
+        tgt_idx = cmd.index("--target-updates") + 1
+        lin_idx = cmd.index("--lineage-id") + 1
+        st_dir = Path(cmd[out_idx])
+        tgt_u = int(cmd[tgt_idx])
+        lin = cmd[lin_idx]
+        bud = 24 if "-b24-" in lin else 20
+        st_dir.mkdir(parents=True, exist_ok=True)
+        (st_dir / "status.json").write_text(json.dumps({"committed_update": tgt_u}) + "\n", encoding="utf-8")
+        (st_dir / "publication.pt").write_bytes(f"pub-{lin}-u{tgt_u}".encode("utf-8"))
+        # b24 passes on second chunk (u=10); b20 passes on first chunk (u=5)
+        wins = (22 if tgt_u == 5 else 29) if bud == 24 else 27
+        rev = 14.5 if bud == 24 else 12.1
+        row = {
+            "policy_version": tgt_u,
+            "episodes": 48,
+            "revival_budget": bud,
+            "successful_run_count": wins,
+            "mean_revivals_used": rev,
+            "skip_rate": 0.15,
+            "mean_final_deck_size": 30.8,
+            "deadlock_count": 0,
+        }
+        with (st_dir / "heldout_evaluations.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(ratchet_mod.subprocess, "run", _fake_subproc_run)
+    rc = ratchet_mod.run_ratchet(
+        [
+            "--config",
+            str(v63_toml),
+            "--initial-publication",
+            str(seed_pub),
+            "--drive-root-dir",
+            str(drive_root),
+            "--budgets",
+            "24,20",
+            "--step-updates",
+            "5",
+            "--max-updates-per-stage",
+            "40",
+        ]
+    )
+    assert rc == 0
+    state_json = json.loads((tmp_path / "active_ratchet_state.json").read_text(encoding="utf-8"))
+    assert state_json["state"] == "ratchet_complete"
+    assert [p["budget"] for p in state_json["promoted_history"]] == [24, 20]
+    assert [p["promoted_at_update"] for p in state_json["promoted_history"]] == [10, 5]
