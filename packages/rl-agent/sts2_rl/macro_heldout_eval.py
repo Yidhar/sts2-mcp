@@ -218,6 +218,7 @@ def _run_one_heldout_seed(
         player_hp_lost = 0.0
         native_steps = 0
         stalled = False
+        recorded_actions: list[list[Any]] = []
 
         while not (state.terminated or state.truncated):
             if native_steps >= max_native_steps:
@@ -249,6 +250,14 @@ def _run_one_heldout_seed(
                 if len(indices) != 1:
                     raise RuntimeError("held-out authority declined a non-forced surface")
                 selected = int(indices[0])
+            recorded_actions.append(
+                [
+                    native_steps,
+                    int(encoded.action(selected).position),
+                    None,
+                    int(len(encoded.snapshot.action_mask)),
+                ]
+            )
             req = dispatch_request(
                 backend,
                 state,
@@ -305,6 +314,7 @@ def _run_one_heldout_seed(
             "rest_heals": authority.rest_heals,
             "shop_decisions": authority.shop_decisions,
             "shop_removes": authority.shop_removes,
+            "actions": recorded_actions,
         }
     finally:
         if owns_backend:
@@ -571,6 +581,28 @@ def evaluate_heldout_publication(
     tot_shp_rm = sum(int(r["shop_removes"]) for r in rows)
     now_ts = time.time()
 
+    ranked_for_replay = sorted(
+        (r for r in rows if isinstance(r.get("actions"), list) and r["actions"]),
+        key=lambda r: (1 if r["won"] else 0, int(r["max_floor"]), -int(r["revivals_used"])),
+        reverse=True,
+    )[:4]
+    replay_episodes = [
+        {
+            "seed": int(r["seed"]),
+            "training_episode": {
+                "run_result": "victory" if r["won"] else "defeat",
+                "ending": "victory" if r["won"] else ("truncated" if r["stalled"] else "defeat"),
+                "max_floor": int(r["max_floor"]),
+                "revivals_used": int(r["revivals_used"]),
+                "player_hp_lost": float(r["player_hp_lost"]),
+                "native_steps": int(r["native_steps"]),
+                "total_reward": float(r["observed_return"]),
+            },
+            "actions": r["actions"],
+        }
+        for r in ranked_for_replay
+    ]
+
     return {
         "version": MACRO_HELDOUT_EVAL_VERSION,
         "evaluated_at_utc": datetime.now(UTC).isoformat(),
@@ -604,6 +636,7 @@ def evaluate_heldout_publication(
         "deadlock_rate": stalls / n,
         "recoverable_incidents": recoverable_incidents,
         "elapsed_seconds": time.monotonic() - started,
+        "replay_episodes": replay_episodes,
     }
 
 

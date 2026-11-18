@@ -3530,18 +3530,37 @@
           populateJournalSelect(state.heldoutJournals);
           setDetailStatus(`发现 ${state.heldoutJournals.length} 个 journal`, "completed");
           if (preferred) {
-            const match = state.heldoutJournals.find((journal) =>
+            let fallbackNotice = null;
+            let match = state.heldoutJournals.find((journal) =>
               (preferred.journal && journal.key === preferred.journal) ||
               (preferred.checkpoint && journal.checkpoint && journal.checkpoint.name === preferred.checkpoint) ||
               (preferred.gate != null && int(journal.evaluation_gate) === int(preferred.gate) &&
                 (!preferred.gateKind || journal.gate_kind === preferred.gateKind))
             );
+            if (!match && preferred.gate != null) {
+              match = state.heldoutJournals.find(
+                (journal) => int(journal.evaluation_gate) === int(preferred.gate)
+              );
+              if (match) {
+                fallbackNotice = `无独立 ${scalar(preferred.gateKind || "validation")} 轨迹 · 已定位同版本 ${scalar(match.gate_kind)} journal`;
+              } else if (int(preferred.gate) === 0 && state.heldoutJournals.length) {
+                match = state.heldoutJournals[state.heldoutJournals.length - 1];
+                fallbackNotice = "u=0 无独立轨迹 · 已定位最早可用训练采样 journal";
+              }
+            }
             if (match) {
               element("heldout-journal-select").value = match.key;
               await loadHeldoutEpisodes(match.key, true);
+              if (fallbackNotice) {
+                setDetailStatus(`${fallbackNotice}（${state.heldoutEpisodes.length} 局）`, "completed");
+              }
             } else {
               setDetailStatus("未找到对应 journal", "failed");
             }
+          } else if (!state.selectedJournal && state.heldoutJournals.length > 0) {
+            const newest = state.heldoutJournals[0];
+            element("heldout-journal-select").value = newest.key;
+            await loadHeldoutEpisodes(newest.key, true);
           }
         } catch (error) {
           setDetailStatus("目录读取失败", "failed");
@@ -3873,7 +3892,10 @@
             createCell(dateTime(checkpointValue(item, ["created_at", "timestamp", "time", "modified_at"], null))),
             detailCell(detailButton(
               "对局",
-              () => loadHeldoutJournals({ checkpoint: checkpointName(item) }),
+              () => loadHeldoutJournals({
+                checkpoint: checkpointName(item),
+                gate: checkpointValue(item, ["policy_version", "update", "version"], null)
+              }),
               isPublishing
             ))
           );
@@ -4638,6 +4660,9 @@
           const snapshot = await fetchJson(`${API_SNAPSHOT}?run=${encodeURIComponent(selected)}`);
           clearError();
           renderSnapshot(snapshot);
+          if (state.heldoutRunKey !== selected && !state.detailLoading) {
+            void loadHeldoutJournals();
+          }
         } catch (error) {
           showError(`读取监控数据失败：${error instanceof Error ? error.message : String(error)}。已保留最后一次成功快照。`);
           element("main-content").setAttribute("aria-busy", "false");

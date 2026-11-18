@@ -1162,9 +1162,27 @@ def sync_once(
 
     new_heldout_synced: list[int] = []
     for h_gate in sorted(heldout_by_gate):
+        hr = heldout_by_gate[h_gate]
+        raw_rep_eps = hr.get("replay_episodes")
+        eval_journal_path = run_dir / f"evaluation-step-{h_gate:09d}.jsonl"
+        if isinstance(raw_rep_eps, list) and raw_rep_eps and not eval_journal_path.is_file():
+            rep_eps = [row for row in raw_rep_eps if isinstance(row, Mapping)]
+            if rep_eps:
+                print(
+                    f"[sync] Reconstructing odd-seed validation journal for gate {h_gate} -> {eval_journal_path.name} ...",
+                    flush=True,
+                )
+                _reconstruct_heldout_journal(
+                    journal_path=eval_journal_path,
+                    gate=h_gate,
+                    cohort_episodes=rep_eps,
+                    simulator=simulator,
+                    revival_budget=effective_revival_budget,
+                    gate_kind="validation",
+                    data_partition="validation",
+                )
         if h_gate in synced_heldout_gates:
             continue
-        hr = heldout_by_gate[h_gate]
         h_eps = max(1, int(_finite(hr.get("episodes")) or 48))
         h_a1_rate = _finite(hr.get("act1_clear_rate")) or 0.0
         h_a3_rate = _finite(hr.get("act3_reach_rate")) or 0.0
