@@ -138,15 +138,21 @@ def _extract_deck_size(state: EnvironmentResult) -> int | None:
         return None
     deck = player.get("deck")
     if isinstance(deck, list):
-        return len(deck)
+        return sum(int(c.get("quantity", 1)) if isinstance(c, Mapping) else 1 for c in deck)
     return None
 
 
 def _is_victory(state: EnvironmentResult) -> bool:
+    if state.transition is not None:
+        facts = getattr(state.transition, "facts", None)
+        if isinstance(facts, Mapping):
+            run_res = str(facts.get("run_result") or "").strip().lower()
+            if run_res in {"victory", "run_won", "win", "act3_victory"}:
+                return True
+        if bool(getattr(state.transition, "run_won", False)):
+            return True
     reason = str(state.terminal_reason or "").strip().lower()
     if reason in {"victory", "run_won", "win", "act3_victory"}:
-        return True
-    if state.transition is not None and bool(getattr(state.transition, "run_won", False)):
         return True
     run = state.observation.get("run")
     if isinstance(run, Mapping) and bool(run.get("victory") or run.get("is_victory")):
@@ -256,9 +262,18 @@ def _run_one_heldout_seed(
             post_deck = _extract_deck_size(state)
             if post_deck is not None:
                 last_deck_size = post_deck
-            if state.transition is not None and not state.truncated:
+            tr_obs = state.observation.get("_training")
+            if isinstance(tr_obs, Mapping):
+                raw_rev = tr_obs.get("revivals_used")
+                if isinstance(raw_rev, int | float) and not isinstance(raw_rev, bool):
+                    revivals_used = max(revivals_used, int(raw_rev))
+                raw_hp = tr_obs.get("player_hp_lost")
+                if isinstance(raw_hp, int | float) and not isinstance(raw_hp, bool):
+                    player_hp_lost = max(player_hp_lost, float(raw_hp))
+            elif state.transition is not None and not state.truncated:
                 revivals_used += int(getattr(state.transition, "revivals_used_delta", 0))
                 player_hp_lost += float(getattr(state.transition, "player_hp_lost", 0.0))
+            if state.transition is not None and not state.truncated:
                 step_r = reward_calc.evaluate(
                     before=prev_state,
                     after=state,
@@ -266,8 +281,10 @@ def _run_one_heldout_seed(
                     horizon_exhausted=False,
                 )
                 total_return += float(step_r.reward)
+                if step_r.task_terminal:
+                    break
 
-        won = (not stalled) and state.terminated and (not state.truncated) and _is_victory(state)
+        won = (not stalled) and (not state.truncated) and _is_victory(state)
         return {
             "seed": seed,
             "won": won,
