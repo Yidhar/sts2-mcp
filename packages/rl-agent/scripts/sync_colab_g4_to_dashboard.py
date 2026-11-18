@@ -884,29 +884,21 @@ def sync_once(
                         )
                     ),
                     "version": (
-                        "sts2-durable-afterstate-v6.3-ratchet"
-                        if "v6-3" in lineage or "v6.3" in lineage or "ratchet" in lineage
-                        else (
-                            "sts2-durable-afterstate-v6.2-ablation"
-                            if "v6-2" in lineage or "v6.2" in lineage
-                            else (
-                                "sts2-durable-afterstate-v6-wide256"
-                                if "v6" in lineage
-                                else (
-                                    "sts2-durable-afterstate-v5-wide256"
-                                    if "v5" in lineage
-                                    else (
-                                        "sts2-durable-afterstate-v4"
-                                        if "v4" in lineage
-                                        else (
-                                            "sts2-durable-afterstate-v3"
-                                            if "v3" in lineage
-                                            else "sts2-durable-afterstate-v2"
-                                        )
-                                    )
-                                )
-                            )
-                        )
+                        "sts2-durable-afterstate-v6.4-ratchet"
+                        if ("v6-4" in lineage or "v6.4" in lineage)
+                        else "sts2-durable-afterstate-v6.3-ratchet"
+                        if ("v6-3" in lineage or "v6.3" in lineage or "ratchet" in lineage)
+                        else "sts2-durable-afterstate-v6.2-ablation"
+                        if ("v6-2" in lineage or "v6.2" in lineage)
+                        else "sts2-durable-afterstate-v6-wide256"
+                        if "v6" in lineage
+                        else "sts2-durable-afterstate-v5-wide256"
+                        if "v5" in lineage
+                        else "sts2-durable-afterstate-v4"
+                        if "v4" in lineage
+                        else "sts2-durable-afterstate-v3"
+                        if "v3" in lineage
+                        else "sts2-durable-afterstate-v2"
                     ),
                     "curriculum": {
                         "mode": "native-revival-preheat",

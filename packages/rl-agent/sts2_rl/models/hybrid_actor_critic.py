@@ -10,6 +10,7 @@ the value regression.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import math
 from dataclasses import asdict, dataclass, field
@@ -741,6 +742,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         actor_critic = config or HybridActorCriticConfig()
         super().__init__(actor_critic.candidate_q_config())
         self.actor_critic_config = actor_critic
+        self._detach_value_heads_from_trunk: bool = False
         del self.candidate_q_head
         cfg = actor_critic.grounded
         player_owner_digest = hashlib.sha256(b"owner\0player").digest()
@@ -2632,173 +2634,179 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         critic_revival_context: Tensor | None,
         validate: bool,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        batch_size = int(world.features.shape[0])
-        previous_run = self._extract_previous_run_memory(
-            recurrent_state,
-            batch_size=batch_size,
-            reference=world.features,
-            validate=validate,
+        trunk_ctx = (
+            torch.no_grad()
+            if getattr(self, "_detach_value_heads_from_trunk", False)
+            else contextlib.nullcontext()
         )
-        rev_ctx = self._normalize_critic_revival_context(
-            critic_revival_context,
-            batch_size=batch_size,
-            device=world.features.device,
-            dtype=world.features.dtype,
-        )
-        zero_domains = torch.zeros(
-            (batch_size,),
-            dtype=torch.long,
-            device=world.features.device,
-        )
-        monotone_parts: tuple[Tensor, Tensor, Tensor] | None = None
-        if self.actor_critic_config.enable_monotone_deconfounded_durable_value:
-            monotone_parts = self._extract_monotone_stage_and_vitals(world)
-        card_repr: Tensor | None = None
-        card_raw_feats: Tensor | None = None
-        deck_card_mask: Tensor | None = None
-        draw_prob: Tensor | None = None
-        deck_size: Tensor | None = None
-        has_deck: Tensor | None = None
-        token_weights: Tensor | None = None
-        prep: _PreparedPersistentWorld | None = None
-        if self.actor_critic_config.enable_draw_weighted_durable_value:
-            prep = self._prepare_draw_weighted_persistent_world(world)
-            pers_world = prep.world
-            token_weights = prep.token_weights
-            deck_card_mask = prep.deck_card_mask
-            draw_prob = prep.draw_prob
-            deck_size = prep.deck_size
-            has_deck = prep.has_deck
-            pers_enc, raw_world_tokens = self._encode_world_with_weights(
-                pers_world,
-                zero_domains,
-                token_weights,
-                _validated=not validate,
+        with trunk_ctx:
+            batch_size = int(world.features.shape[0])
+            previous_run = self._extract_previous_run_memory(
+                recurrent_state,
+                batch_size=batch_size,
+                reference=world.features,
+                validate=validate,
             )
-            child_uv_f = prep.child_uv.to(dtype=pers_enc.tokens.dtype)
-            per_card_child_w = child_uv_f / child_uv_f.sum(dim=2, keepdim=True).clamp_min(1.0)
-            child_tok_sum = torch.einsum("buv,bud->bvd", per_card_child_w, pers_enc.tokens)
-            scaled_feats = self._scale_card_and_modifier_features(
-                pers_world.features.to(dtype=pers_enc.tokens.dtype)
+            rev_ctx = self._normalize_critic_revival_context(
+                critic_revival_context,
+                batch_size=batch_size,
+                device=world.features.device,
+                dtype=world.features.dtype,
             )
-            child_feat_sum = torch.einsum("buv,buf->bvf", per_card_child_w, scaled_feats)
-            card_mask_f = prep.deck_card_mask.unsqueeze(-1).to(dtype=pers_enc.tokens.dtype)
-            card_repr = (
-                torch.cat(
-                    [
-                        pers_enc.tokens,
-                        raw_world_tokens.to(dtype=pers_enc.tokens.dtype),
-                        child_tok_sum,
-                    ],
-                    dim=-1,
+            zero_domains = torch.zeros(
+                (batch_size,),
+                dtype=torch.long,
+                device=world.features.device,
+            )
+            monotone_parts: tuple[Tensor, Tensor, Tensor] | None = None
+            if self.actor_critic_config.enable_monotone_deconfounded_durable_value:
+                monotone_parts = self._extract_monotone_stage_and_vitals(world)
+            card_repr: Tensor | None = None
+            card_raw_feats: Tensor | None = None
+            deck_card_mask: Tensor | None = None
+            draw_prob: Tensor | None = None
+            deck_size: Tensor | None = None
+            has_deck: Tensor | None = None
+            token_weights: Tensor | None = None
+            prep: _PreparedPersistentWorld | None = None
+            if self.actor_critic_config.enable_draw_weighted_durable_value:
+                prep = self._prepare_draw_weighted_persistent_world(world)
+                pers_world = prep.world
+                token_weights = prep.token_weights
+                deck_card_mask = prep.deck_card_mask
+                draw_prob = prep.draw_prob
+                deck_size = prep.deck_size
+                has_deck = prep.has_deck
+                pers_enc, raw_world_tokens = self._encode_world_with_weights(
+                    pers_world,
+                    zero_domains,
+                    token_weights,
+                    _validated=not validate,
                 )
-                * card_mask_f
-            )
-            card_raw_feats = (
-                torch.cat([scaled_feats, child_feat_sum], dim=-1)
-                * card_mask_f
-            )
-            max_cards = max(1, int(deck_card_mask.long().sum(dim=1).max().item()))
-            if max_cards < int(card_repr.shape[1]):
-                card_idx = torch.argsort(
-                    (~deck_card_mask).to(dtype=torch.int8),
-                    dim=1,
-                    stable=True,
-                )[:, :max_cards]
-                card_repr = card_repr.gather(
-                    1,
-                    card_idx.unsqueeze(-1).expand(-1, -1, int(card_repr.shape[-1])),
+                child_uv_f = prep.child_uv.to(dtype=pers_enc.tokens.dtype)
+                per_card_child_w = child_uv_f / child_uv_f.sum(dim=2, keepdim=True).clamp_min(1.0)
+                child_tok_sum = torch.einsum("buv,bud->bvd", per_card_child_w, pers_enc.tokens)
+                scaled_feats = self._scale_card_and_modifier_features(
+                    pers_world.features.to(dtype=pers_enc.tokens.dtype)
                 )
-                card_raw_feats = card_raw_feats.gather(
-                    1,
-                    card_idx.unsqueeze(-1).expand(-1, -1, int(card_raw_feats.shape[-1])),
+                child_feat_sum = torch.einsum("buv,buf->bvf", per_card_child_w, scaled_feats)
+                card_mask_f = prep.deck_card_mask.unsqueeze(-1).to(dtype=pers_enc.tokens.dtype)
+                card_repr = (
+                    torch.cat(
+                        [
+                            pers_enc.tokens,
+                            raw_world_tokens.to(dtype=pers_enc.tokens.dtype),
+                            child_tok_sum,
+                        ],
+                        dim=-1,
+                    )
+                    * card_mask_f
                 )
-                deck_card_mask = deck_card_mask.gather(1, card_idx)
-                draw_prob = draw_prob.gather(1, card_idx)
-        else:
-            pers_world = self._mask_world_to_persistent(world)
-            pers_enc = self.encode_world(pers_world, zero_domains, _validated=not validate)
-        run_prev_for_durable = (
-            torch.zeros_like(previous_run)
-            if self.actor_critic_config.enable_monotone_deconfounded_durable_value
-            else previous_run
-        )
-        if (
-            self.actor_critic_config.enable_debloated_synergy_durable_value
-            and prep is not None
-        ):
-            non_deck_mask = (
-                pers_world.mask.bool()
-                & (~pers_world.zone_ids.eq(DECK_ZONE_ID))
-                & (~pers_world.zone_ids.eq(MODIFIER_ZONE_ID))
-                & (~prep.child_uv.any(dim=2))
-            )
-            non_deck_world, _ = self._compact_world_by_mask(pers_world, non_deck_mask)
-            base_enc = self.encode_world(
-                non_deck_world,
-                zero_domains,
-                _validated=not validate,
-            )
-            base_state_emb = base_enc.state_embedding
-            with torch.autocast(device_type=base_state_emb.device.type, enabled=False):
-                pers_run = self.run_recurrent_norm(
-                    self.run_recurrent_cell(base_state_emb.float(), run_prev_for_durable.float())
+                card_raw_feats = (
+                    torch.cat([scaled_feats, child_feat_sum], dim=-1)
+                    * card_mask_f
                 )
-            build_emb = (
-                self._pool_persistent_build(
-                    base_enc,
-                    non_deck_world.zone_ids,
-                    non_deck_world.owner_ids,
-                )
-                if self.actor_critic_config.enable_persistent_build_context
-                else None
-            )
-        else:
-            base_state_emb = pers_enc.state_embedding
-            with torch.autocast(device_type=base_state_emb.device.type, enabled=False):
-                pers_run = self.run_recurrent_norm(
-                    self.run_recurrent_cell(base_state_emb.float(), run_prev_for_durable.float())
-                )
-            build_emb = (
-                self._pool_persistent_build(
-                    pers_enc,
-                    pers_world.zone_ids,
-                    pers_world.owner_ids,
-                    token_weights=token_weights,
-                )
-                if self.actor_critic_config.enable_persistent_build_context
-                else None
-            )
-            if (
-                build_emb is not None
-                and card_repr is not None
-                and draw_prob is not None
-                and self.actor_critic_config.enable_draw_weighted_durable_value
-            ):
-                deck_proj = self.persistent_build_deck_proj(card_repr)
-                build_emb = build_emb + torch.einsum(
-                    "bw,bwd->bd",
-                    draw_prob.to(dtype=deck_proj.dtype),
-                    deck_proj,
-                ).to(dtype=build_emb.dtype)
-        vitals_emb: Tensor | None = None
-        raw_vitals: Tensor | None = None
-        progress_vitals: Tensor | None = None
-        if self.actor_critic_config.enable_direct_vitals_context:
-            if self.actor_critic_config.enable_balanced_deconfounded_durable_value:
-                vitals_emb, raw_vitals = self._encode_canonical_neutral_vitals(pers_world)
+                max_cards = max(1, int(deck_card_mask.long().sum(dim=1).max().item()))
+                if max_cards < int(card_repr.shape[1]):
+                    card_idx = torch.argsort(
+                        (~deck_card_mask).to(dtype=torch.int8),
+                        dim=1,
+                        stable=True,
+                    )[:, :max_cards]
+                    card_repr = card_repr.gather(
+                        1,
+                        card_idx.unsqueeze(-1).expand(-1, -1, int(card_repr.shape[-1])),
+                    )
+                    card_raw_feats = card_raw_feats.gather(
+                        1,
+                        card_idx.unsqueeze(-1).expand(-1, -1, int(card_raw_feats.shape[-1])),
+                    )
+                    deck_card_mask = deck_card_mask.gather(1, card_idx)
+                    draw_prob = draw_prob.gather(1, card_idx)
             else:
-                vitals_emb, raw_vitals = self._encode_direct_vitals(pers_world)
+                pers_world = self._mask_world_to_persistent(world)
+                pers_enc = self.encode_world(pers_world, zero_domains, _validated=not validate)
+            run_prev_for_durable = (
+                torch.zeros_like(previous_run)
+                if self.actor_critic_config.enable_monotone_deconfounded_durable_value
+                else previous_run
+            )
             if (
-                self.actor_critic_config.enable_deconfounded_durable_value
-                and not self.actor_critic_config.enable_monotone_deconfounded_durable_value
+                self.actor_critic_config.enable_debloated_synergy_durable_value
+                and prep is not None
             ):
-                progress_vitals = self._extract_progress_vitals(pers_world)
-        shop_ctx = (
-            self._encode_shop_tokens(world)
-            if self.actor_critic_config.enable_build_conditioned_durable_value
-            else None
-        )
+                non_deck_mask = (
+                    pers_world.mask.bool()
+                    & (~pers_world.zone_ids.eq(DECK_ZONE_ID))
+                    & (~pers_world.zone_ids.eq(MODIFIER_ZONE_ID))
+                    & (~prep.child_uv.any(dim=2))
+                )
+                non_deck_world, _ = self._compact_world_by_mask(pers_world, non_deck_mask)
+                base_enc = self.encode_world(
+                    non_deck_world,
+                    zero_domains,
+                    _validated=not validate,
+                )
+                base_state_emb = base_enc.state_embedding
+                with torch.autocast(device_type=base_state_emb.device.type, enabled=False):
+                    pers_run = self.run_recurrent_norm(
+                        self.run_recurrent_cell(base_state_emb.float(), run_prev_for_durable.float())
+                    )
+                build_emb = (
+                    self._pool_persistent_build(
+                        base_enc,
+                        non_deck_world.zone_ids,
+                        non_deck_world.owner_ids,
+                    )
+                    if self.actor_critic_config.enable_persistent_build_context
+                    else None
+                )
+            else:
+                base_state_emb = pers_enc.state_embedding
+                with torch.autocast(device_type=base_state_emb.device.type, enabled=False):
+                    pers_run = self.run_recurrent_norm(
+                        self.run_recurrent_cell(base_state_emb.float(), run_prev_for_durable.float())
+                    )
+                build_emb = (
+                    self._pool_persistent_build(
+                        pers_enc,
+                        pers_world.zone_ids,
+                        pers_world.owner_ids,
+                        token_weights=token_weights,
+                    )
+                    if self.actor_critic_config.enable_persistent_build_context
+                    else None
+                )
+                if (
+                    build_emb is not None
+                    and card_repr is not None
+                    and draw_prob is not None
+                    and self.actor_critic_config.enable_draw_weighted_durable_value
+                ):
+                    deck_proj = self.persistent_build_deck_proj(card_repr)
+                    build_emb = build_emb + torch.einsum(
+                        "bw,bwd->bd",
+                        draw_prob.to(dtype=deck_proj.dtype),
+                        deck_proj,
+                    ).to(dtype=build_emb.dtype)
+            vitals_emb: Tensor | None = None
+            raw_vitals: Tensor | None = None
+            progress_vitals: Tensor | None = None
+            if self.actor_critic_config.enable_direct_vitals_context:
+                if self.actor_critic_config.enable_balanced_deconfounded_durable_value:
+                    vitals_emb, raw_vitals = self._encode_canonical_neutral_vitals(pers_world)
+                else:
+                    vitals_emb, raw_vitals = self._encode_direct_vitals(pers_world)
+                if (
+                    self.actor_critic_config.enable_deconfounded_durable_value
+                    and not self.actor_critic_config.enable_monotone_deconfounded_durable_value
+                ):
+                    progress_vitals = self._extract_progress_vitals(pers_world)
+            shop_ctx = (
+                self._encode_shop_tokens(world)
+                if self.actor_critic_config.enable_build_conditioned_durable_value
+                else None
+            )
         v1 = self._durable_readout(
             world_state_embedding=base_state_emb,
             build_embedding=build_emb,
@@ -3266,8 +3274,11 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 )
             else:
                 policy_logits = raw_logits.masked_fill(~base.action_mask, 0.0)
+            detach_val = bool(getattr(self, "_detach_value_heads_from_trunk", False))
+            val_joint = joint_state_f.detach() if detach_val else joint_state_f
+            val_rec = rec_state_f.detach() if detach_val else rec_state_f
             value = self.state_value_head(
-                torch.cat([joint_state_f, rec_state_f], dim=-1)
+                torch.cat([val_joint, val_rec], dim=-1)
             ).squeeze(-1)
             if rev_ctx_f is not None:
                 rev_scaled = rev_ctx_f * 4.0
@@ -3288,11 +3299,17 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             else:
                 memory_half = self.config.recurrent_hidden_dim // 2
                 durable_value = self._durable_readout(
-                    world_state_embedding=base.world_state_embedding,
-                    build_embedding=build_emb,
-                    vitals_embedding=vitals_emb,
-                    raw_vitals=raw_vitals,
-                    run_memory=rec_state_f[:, :memory_half],
+                    world_state_embedding=(
+                        base.world_state_embedding.detach() if detach_val else base.world_state_embedding
+                    ),
+                    build_embedding=(
+                        None if build_emb is None else (build_emb.detach() if detach_val else build_emb)
+                    ),
+                    vitals_embedding=(
+                        None if vitals_emb is None else (vitals_emb.detach() if detach_val else vitals_emb)
+                    ),
+                    raw_vitals=None if raw_vitals is None else (raw_vitals.detach() if detach_val else raw_vitals),
+                    run_memory=val_rec[:, :memory_half],
                     revival_context=rev_ctx_f,
                 )
         output = HybridActorCriticOutput(

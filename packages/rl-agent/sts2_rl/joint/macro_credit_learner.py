@@ -141,6 +141,12 @@ class MacroCreditLearnerConfig:
     enable_post_step_kl_line_search: bool = False
     line_search_max_backtracks: int = 4
     line_search_min_scale: float = 0.10
+    detach_value_heads_from_trunk: bool = False
+    minority_only_within_branch_mpo: bool = False
+    within_branch_minority_prob_cap: float = 0.30
+    macro_pg_fallback_scale: float = 1.0
+    mpo_parent_prior_mix: float = 0.0
+    max_parent_macro_kl: float = 0.0
 
     def __post_init__(self) -> None:
         for bool_name in (
@@ -148,6 +154,8 @@ class MacroCreditLearnerConfig:
             "enable_bf16_amp",
             "freeze_trunk_during_durable_warmup",
             "enable_post_step_kl_line_search",
+            "detach_value_heads_from_trunk",
+            "minority_only_within_branch_mpo",
             "separate_value_grad_clip",
             "enable_direct_vitals_context",
             "enable_macro_branch_prior",
@@ -307,11 +315,16 @@ class MacroCreditLearnerConfig:
             "double_mpo_pessimism_coef",
             "target_macro_step_kl",
             "macro_mpo_trust_kl_weight",
+            "max_parent_macro_kl",
         )
         for name in (*positive, *non_negative, "macro_trace_lambda"):
             value = getattr(self, name)
             if isinstance(value, bool) or not math.isfinite(value) or value < 0 or (name in positive and value == 0):
                 raise ValueError(f"macro credit {name} has an invalid finite range")
+        for unit_name in ("within_branch_minority_prob_cap", "macro_pg_fallback_scale", "mpo_parent_prior_mix"):
+            u_val = getattr(self, unit_name)
+            if isinstance(u_val, bool) or not math.isfinite(u_val) or not 0.0 <= u_val <= 1.0:
+                raise ValueError(f"macro credit {unit_name} must be in [0, 1]")
         if self.kickstart_kl_floor > self.kickstart_kl_weight:
             raise ValueError("macro credit kickstart_kl_floor must be <= kickstart_kl_weight")
         if (
@@ -592,6 +605,8 @@ class MacroCreditLearner:
         self.device = parameter.device
         self.dtype = parameter.dtype
         _configure_cuda_tf32(self.device, self.config.allow_tf32)
+        if isinstance(model, HybridDomainActorCriticModel):
+            model._detach_value_heads_from_trunk = bool(self.config.detach_value_heads_from_trunk)
         local_tokens = (
             "macro_stream",
             "combat_stream",
@@ -1408,6 +1423,26 @@ class MacroCreditLearner:
                 )
         return results
 
+    def _blend_parent_prior(
+        self,
+        teacher_logs: Tensor,
+        parent_logs: Tensor | None,
+    ) -> Tensor:
+        mix = float(self.config.mpo_parent_prior_mix)
+        if mix <= 0.0 or parent_logs is None or parent_logs.shape != teacher_logs.shape:
+            return teacher_logs
+        p_logs = parent_logs.to(device=teacher_logs.device)
+        valid_m = torch.isfinite(teacher_logs) & torch.isfinite(p_logs)
+        if not bool(valid_m.any().item()):
+            return teacher_logs
+        blended = torch.where(
+            valid_m,
+            (1.0 - mix) * teacher_logs.double() + mix * p_logs.double(),
+            torch.full_like(teacher_logs, -torch.inf, dtype=torch.float64),
+        )
+        blended = (blended - torch.logsumexp(blended, dim=0)).clamp(max=0.0)
+        return blended.to(dtype=teacher_logs.dtype)
+
     def _project_afterstate_node(
         self,
         *,
@@ -1441,6 +1476,11 @@ class MacroCreditLearner:
                     None if q_after_twin is None else q_after_twin.to(dtype=teacher_logs.dtype)
                 ),
                 pessimism_coef=self.config.double_mpo_pessimism_coef if q_after_twin is not None else 0.0,
+                within_branch_prob_cap=(
+                    self.config.within_branch_minority_prob_cap
+                    if self.config.minority_only_within_branch_mpo
+                    else 1.0
+                ),
             )
         if q_after_twin is not None:
             q_eff = 0.5 * (q_after + q_after_twin) - self.config.double_mpo_pessimism_coef * (
@@ -1472,6 +1512,7 @@ class MacroCreditLearner:
         check_likelihood: bool = True,
         record_all_choice_logs: bool = False,
         packed_cache: dict[tuple[int, int], _CachedEvalGroup] | None = None,
+        parent_teacher_logs: Sequence[Mapping[int, Tensor]] | None = None,
     ) -> tuple[list[_PreparedReference], int, float]:
         if not references:
             return [], 0, 0.0
@@ -1632,8 +1673,17 @@ class MacroCreditLearner:
                 raw_macro_adv = adv_cap * torch.tanh(raw_macro_adv / adv_cap)
             durable_macro_advantages = raw_macro_adv.detach()
             afterstate_targets: dict[int, _AfterstateStepTarget] = {}
+            parent_map = (
+                parent_teacher_logs[ref_idx]
+                if parent_teacher_logs is not None and ref_idx < len(parent_teacher_logs)
+                else None
+            )
             for node, q1_after, q2_after in per_ref_nodes[ref_idx]:
-                teacher_logs = evaluation.step_log_probs[node.step_index]
+                raw_t_logs = evaluation.step_log_probs[node.step_index]
+                teacher_logs = self._blend_parent_prior(
+                    raw_t_logs,
+                    None if parent_map is None else parent_map.get(node.step_index),
+                )
                 step = reference.steps[node.step_index]
                 projection = self._project_afterstate_node(
                     node=node,
@@ -1689,6 +1739,7 @@ class MacroCreditLearner:
         model_override: HybridDomainActorCriticModel | None = None,
         check_likelihood: bool = True,
         record_all_choice_logs: bool = False,
+        parent_step_logs: Mapping[int, Tensor] | None = None,
     ) -> tuple[_PreparedReference, int, float]:
         active_mod = self.model if model_override is None else model_override
         use_rev = self._use_revival_ctx(active_mod)
@@ -1777,7 +1828,11 @@ class MacroCreditLearner:
                 q_mean_after = q1_after
                 q_disagree = None
             calls += 1
-            teacher_logs = evaluation.step_log_probs[node.step_index]
+            raw_t_logs = evaluation.step_log_probs[node.step_index]
+            teacher_logs = self._blend_parent_prior(
+                raw_t_logs,
+                None if parent_step_logs is None else parent_step_logs.get(node.step_index),
+            )
             projection = self._project_afterstate_node(
                 node=node,
                 step=step,
@@ -1826,13 +1881,20 @@ class MacroCreditLearner:
             or self.config.ppo_epochs_per_cohort > 1
             or self.config.ppo_minibatches_per_cohort > 1
             or self.config.target_macro_step_kl > 0.0
+            or self.config.max_parent_macro_kl > 0.0
         )
 
-    def _prepare_natural(self, reference: MacroCreditTrajectory) -> tuple[_PreparedReference, int, float]:
+    def _prepare_natural(
+        self,
+        reference: MacroCreditTrajectory,
+        *,
+        parent_step_logs: Mapping[int, Tensor] | None = None,
+    ) -> tuple[_PreparedReference, int, float]:
         if self.config.target_mode == "durable_afterstate_v2":
             return self._prepare_durable_natural(
                 reference,
                 record_all_choice_logs=self._need_all_choice_logs(),
+                parent_step_logs=parent_step_logs,
             )
         # -1 requests recurrent chunk boundaries, but no artificial macro root.
         step_rev_cpu: Tensor | None = None
@@ -2270,6 +2332,7 @@ class MacroCreditLearner:
                                 actor = -logs[step.action_index] * macro_adv / max(
                                     1, denominators["macro_policy_steps"]
                                 )
+                            actor = cfg.macro_pg_fallback_scale * actor
                             if cfg.enable_macro_branch_prior:
                                 step_mask = torch.tensor(
                                     step.snapshot.action_mask,
@@ -3646,6 +3709,7 @@ class MacroCreditLearner:
                                 torch.where(pg_mask, -chosen_logs * flat_dur_macro_adv[gids_gpu], 0.0).sum()
                                 / denom_macro_pol
                             )
+                        pg_actor = cfg.macro_pg_fallback_scale * pg_actor
                         macro_ent_source = (
                             hierarchical_macro_entropy(
                                 safe_logs,
@@ -4723,10 +4787,11 @@ class MacroCreditLearner:
         denominators: Mapping[str, int],
         *,
         packed_cache: dict[tuple[int, int], _CachedEvalGroup] | None = None,
-    ) -> tuple[float, float, int]:
+        parent_teacher_logs: Sequence[Mapping[int, Tensor]] | None = None,
+    ) -> tuple[float, float, float, int]:
         nat_items = [it for it in prepared_items if it.root is None]
         if not nat_items:
-            return 0.0, 0.0, 0
+            return 0.0, 0.0, 0.0, 0
         refs = [it.reference for it in nat_items]
         want_combat = denominators["combat_policy_steps"] > 0 and any(
             it.evaluation.step_log_probs is not None
@@ -4760,9 +4825,16 @@ class MacroCreditLearner:
         macro_kl_count = 0
         combat_kl_sum = 0.0
         combat_kl_count = 0
-        for it, post_ev in zip(nat_items, post_evals, strict=True):
+        parent_macro_kl_sum = 0.0
+        parent_macro_kl_count = 0
+        for nat_idx, (it, post_ev) in enumerate(zip(nat_items, post_evals, strict=True)):
             old_map = it.evaluation.step_log_probs or {}
             new_map = post_ev.step_log_probs or {}
+            par_map = (
+                parent_teacher_logs[nat_idx]
+                if parent_teacher_logs is not None and nat_idx < len(parent_teacher_logs)
+                else None
+            )
             for s_idx, old_logs in old_map.items():
                 new_logs = new_map.get(s_idx)
                 if new_logs is None:
@@ -4788,12 +4860,35 @@ class MacroCreditLearner:
                 if it.reference.steps[s_idx].control_domain == "macro":
                     macro_kl_sum += kl_val
                     macro_kl_count += 1
+                    if par_map is not None:
+                        par_logs = par_map.get(s_idx)
+                        if par_logs is not None:
+                            n_p = min(int(par_logs.numel()), int(new_logs.numel()))
+                            pr_l = par_logs[:n_p].double()
+                            nw_p = new_logs[:n_p].double()
+                            val_p = torch.isfinite(pr_l) & torch.isfinite(nw_p)
+                            if bool(val_p.any().item()):
+                                p_pr = pr_l.exp().masked_fill(~val_p, 0.0)
+                                p_kl = max(
+                                    0.0,
+                                    float(
+                                        (
+                                            p_pr
+                                            * (pr_l.masked_fill(~val_p, 0.0) - nw_p.masked_fill(~val_p, 0.0))
+                                        )
+                                        .sum()
+                                        .item()
+                                    ),
+                                )
+                                parent_macro_kl_sum += p_kl
+                                parent_macro_kl_count += 1
                 else:
                     combat_kl_sum += kl_val
                     combat_kl_count += 1
         return (
             macro_kl_sum / max(1, macro_kl_count),
             combat_kl_sum / max(1, combat_kl_count),
+            parent_macro_kl_sum / max(1, parent_macro_kl_count),
             calls,
         )
 
@@ -4935,30 +5030,16 @@ class MacroCreditLearner:
                     prepared.append(item)
                     target_calls += calls
                     maximum_error = max(maximum_error, error)
-                if (
-                    self.config.target_mode == "durable_afterstate_v2"
-                    and self.config.eval_batch_size > 1
-                    and len(cohort.natural_only) > 1
-                ):
-                    batch_items, batch_calls, batch_error = self._prepare_durable_natural_batch(
-                        cohort.natural_only,
-                        record_all_choice_logs=self._need_all_choice_logs(),
-                        packed_cache=eval_packed_cache,
+                need_parent_eval = (
+                    (
+                        effective_kickstart_kl_weight > 0.0
+                        or (not warmup_trunk_frozen and self.config.mpo_parent_prior_mix > 0.0)
+                        or (not warmup_trunk_frozen and self.config.max_parent_macro_kl > 0.0)
                     )
-                    prepared.extend(batch_items)
-                    target_calls += batch_calls
-                    maximum_error = max(maximum_error, batch_error)
-                else:
-                    for reference in cohort.natural_only:
-                        item, calls, error = self._prepare_natural(reference)
-                        prepared.append(item)
-                        target_calls += calls
-                        maximum_error = max(maximum_error, error)
-                if (
-                    effective_kickstart_kl_weight > 0.0
                     and self.teacher_model is not None
-                    and cohort.natural_only
-                ):
+                    and bool(cohort.natural_only)
+                )
+                if need_parent_eval:
                     assert self.teacher_model is not None
                     if self.config.eval_batch_size > 1 and len(cohort.natural_only) > 1:
                         t_evals = self._evaluate_durable_batch(
@@ -4985,6 +5066,34 @@ class MacroCreditLearner:
                     kickstart_teacher_logs = [
                         cast(dict[int, Tensor], ev.step_log_probs) for ev in t_evals
                     ]
+                if (
+                    self.config.target_mode == "durable_afterstate_v2"
+                    and self.config.eval_batch_size > 1
+                    and len(cohort.natural_only) > 1
+                ):
+                    batch_items, batch_calls, batch_error = self._prepare_durable_natural_batch(
+                        cohort.natural_only,
+                        record_all_choice_logs=self._need_all_choice_logs(),
+                        packed_cache=eval_packed_cache,
+                        parent_teacher_logs=kickstart_teacher_logs,
+                    )
+                    prepared.extend(batch_items)
+                    target_calls += batch_calls
+                    maximum_error = max(maximum_error, batch_error)
+                else:
+                    for n_idx, reference in enumerate(cohort.natural_only):
+                        p_step_logs = (
+                            kickstart_teacher_logs[n_idx]
+                            if kickstart_teacher_logs is not None and n_idx < len(kickstart_teacher_logs)
+                            else None
+                        )
+                        item, calls, error = self._prepare_natural(
+                            reference,
+                            parent_step_logs=p_step_logs,
+                        )
+                        prepared.append(item)
+                        target_calls += calls
+                        maximum_error = max(maximum_error, error)
         except BaseException:
             eval_packed_cache.clear()
             raise
@@ -5022,6 +5131,7 @@ class MacroCreditLearner:
         executed_forward_steps = 0
         post_macro_kl = 0.0
         post_combat_kl = 0.0
+        post_parent_macro_kl = 0.0
         raw_post_macro_kl = 0.0
         line_search_scale = 1.0
         line_search_backtracks = 0
@@ -5234,18 +5344,72 @@ class MacroCreditLearner:
                     and prepared
                     and not warmup_trunk_frozen
                 ):
-                    post_macro_kl, post_combat_kl, post_kl_calls = self._measure_updated_durable_kl(
+                    pre_parent_kl_sum = 0.0
+                    pre_parent_kl_cnt = 0
+                    if kickstart_teacher_logs is not None:
+                        nat_pre = [it for it in prepared if it.root is None]
+                        for n_i, it_pre in enumerate(nat_pre):
+                            if n_i >= len(kickstart_teacher_logs):
+                                break
+                            o_map = it_pre.evaluation.step_log_probs or {}
+                            p_map = kickstart_teacher_logs[n_i]
+                            for s_i, o_logs in o_map.items():
+                                if it_pre.reference.steps[s_i].control_domain != "macro":
+                                    continue
+                                p_logs = p_map.get(s_i)
+                                if p_logs is None:
+                                    continue
+                                n_k = min(int(p_logs.numel()), int(o_logs.numel()))
+                                pr_d = p_logs[:n_k].double()
+                                ol_d = o_logs[:n_k].double()
+                                v_po = torch.isfinite(pr_d) & torch.isfinite(ol_d)
+                                if bool(v_po.any().item()):
+                                    p_pr = pr_d.exp().masked_fill(~v_po, 0.0)
+                                    pre_parent_kl_sum += max(
+                                        0.0,
+                                        float(
+                                            (
+                                                p_pr
+                                                * (pr_d.masked_fill(~v_po, 0.0) - ol_d.masked_fill(~v_po, 0.0))
+                                            )
+                                            .sum()
+                                            .item()
+                                        ),
+                                    )
+                                    pre_parent_kl_cnt += 1
+                    pre_parent_macro_kl = pre_parent_kl_sum / max(1, pre_parent_kl_cnt)
+                    eff_parent_cap = (
+                        max(self.config.max_parent_macro_kl, pre_parent_macro_kl)
+                        if self.config.max_parent_macro_kl > 0.0
+                        else 0.0
+                    )
+
+                    (
+                        post_macro_kl,
+                        post_combat_kl,
+                        post_parent_macro_kl,
+                        post_kl_calls,
+                    ) = self._measure_updated_durable_kl(
                         prepared,
                         denominators,
                         packed_cache=eval_packed_cache,
+                        parent_teacher_logs=kickstart_teacher_logs,
                     )
                     target_calls += post_kl_calls
                     raw_post_macro_kl = post_macro_kl
+                    step_kl_over = (
+                        self.config.target_macro_step_kl > 0.0
+                        and post_macro_kl > self.config.target_macro_step_kl
+                    )
+                    parent_kl_over = (
+                        eff_parent_cap > 0.0
+                        and kickstart_teacher_logs is not None
+                        and post_parent_macro_kl > eff_parent_cap + 1e-6
+                    )
                     if (
                         self.config.enable_post_step_kl_line_search
                         and self.update >= self.config.durable_warmup_updates
-                        and self.config.target_macro_step_kl > 0.0
-                        and post_macro_kl > self.config.target_macro_step_kl
+                        and (step_kl_over or parent_kl_over)
                         and self.config.line_search_max_backtracks > 0
                     ):
                         policy_trunk_pairs = [
@@ -5259,13 +5423,24 @@ class MacroCreditLearner:
                             if not is_pure_val
                         ]
                         for _ in range(self.config.line_search_max_backtracks):
-                            ratio = min(
-                                0.75,
-                                0.90
-                                * math.sqrt(
-                                    self.config.target_macro_step_kl / max(post_macro_kl, 1e-12)
-                                ),
-                            )
+                            ratio = 0.75
+                            if (
+                                self.config.target_macro_step_kl > 0.0
+                                and post_macro_kl > self.config.target_macro_step_kl
+                            ):
+                                ratio = min(
+                                    ratio,
+                                    0.90
+                                    * math.sqrt(
+                                        self.config.target_macro_step_kl / max(post_macro_kl, 1e-12)
+                                    ),
+                                )
+                            if (
+                                eff_parent_cap > 0.0
+                                and kickstart_teacher_logs is not None
+                                and post_parent_macro_kl > eff_parent_cap + 1e-6
+                            ):
+                                ratio = min(ratio, 0.50)
                             next_scale = max(
                                 self.config.line_search_min_scale,
                                 line_search_scale * ratio,
@@ -5277,14 +5452,29 @@ class MacroCreditLearner:
                             with torch.no_grad():
                                 for p, b, d in policy_trunk_pairs:
                                     p.copy_(b + d * line_search_scale)
-                            post_macro_kl, post_combat_kl, ls_calls = self._measure_updated_durable_kl(
+                            (
+                                post_macro_kl,
+                                post_combat_kl,
+                                post_parent_macro_kl,
+                                ls_calls,
+                            ) = self._measure_updated_durable_kl(
                                 prepared,
                                 denominators,
                                 packed_cache=eval_packed_cache,
+                                parent_teacher_logs=kickstart_teacher_logs,
                             )
                             target_calls += ls_calls
+                            still_step_over = (
+                                self.config.target_macro_step_kl > 0.0
+                                and post_macro_kl > self.config.target_macro_step_kl
+                            )
+                            still_parent_over = (
+                                eff_parent_cap > 0.0
+                                and kickstart_teacher_logs is not None
+                                and post_parent_macro_kl > eff_parent_cap + 1e-6
+                            )
                             if (
-                                post_macro_kl <= self.config.target_macro_step_kl
+                                (not still_step_over and not still_parent_over)
                                 or line_search_scale <= self.config.line_search_min_scale + 1e-9
                             ):
                                 break
@@ -5406,6 +5596,7 @@ class MacroCreditLearner:
             ),
             "mean_updated_macro_policy_kl": post_macro_kl,
             "mean_updated_combat_policy_kl": post_combat_kl,
+            "mean_updated_parent_macro_policy_kl": post_parent_macro_kl,
             "natural_only_games": len(cohort.natural_only),
             "root_targets": root_targets, "mean_root_kl": sum(item.projection.kl for item in prepared if item.projection is not None) / max(1, len(root_targets)),
             "kl_semantics": "mean_root_kl is projection q||teacher; updated_policy_kl_to_teacher is measured after fitting",

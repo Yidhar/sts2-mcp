@@ -325,6 +325,7 @@ def project_hierarchical_macro_policy(
     min_temperature: float = 0.0,
     det_action_values_twin: Tensor | None = None,
     pessimism_coef: float = 0.0,
+    within_branch_prob_cap: float = 1.0,
 ) -> MacroPolicyProjection:
     """Two-level hierarchical MPO matching ``branch_policy_head + within_log_probs``.
 
@@ -348,6 +349,12 @@ def project_hierarchical_macro_policy(
         raise ValueError("min_temperature must be finite and non-negative")
     if isinstance(pessimism_coef, bool) or not math.isfinite(pessimism_coef) or pessimism_coef < 0:
         raise ValueError("pessimism_coef must be finite and non-negative")
+    if (
+        isinstance(within_branch_prob_cap, bool)
+        or not math.isfinite(within_branch_prob_cap)
+        or not 0.0 <= within_branch_prob_cap <= 1.0
+    ):
+        raise ValueError("within_branch_prob_cap must be in [0, 1]")
     if det_action_values_twin is not None:
         if not isinstance(det_action_values_twin, Tensor) or tuple(det_action_values_twin.shape) != tuple(
             det_action_values.shape
@@ -452,7 +459,7 @@ def project_hierarchical_macro_policy(
                 q_branches.append(q_b)
             else:
                 q_branches.append(float((w_star * vals_cons_b).sum().item()))
-            if within_proj.actor_enabled:
+            if within_proj.actor_enabled and math.exp(log_mass_b) <= within_branch_prob_cap + 1e-12:
                 within_targets_out.append((full_pos, w_star.to(dtype=det_action_values.dtype).detach()))
                 if rep_temp is None and within_proj.temperature is not None:
                     rep_temp = within_proj.temperature

@@ -1050,3 +1050,97 @@ def test_v63_ratchet_promotion_gate_enforces_wins_revivals_and_antibloat(
     assert state_json["state"] == "ratchet_complete"
     assert [p["budget"] for p in state_json["promoted_history"]] == [24, 20]
     assert [p["promoted_at_update"] for p in state_json["promoted_history"]] == [10, 5]
+
+
+def test_v64_unfreeze_trunk_detach_and_parent_prior_prevents_skip_collapse() -> None:
+    import copy
+
+    v64_toml = (
+        Path(__file__).resolve().parents[1]
+        / "config/experiments/hybrid_macro_credit_v20_durable_afterstate_v64_ratchet_g4_turbo.toml"
+    )
+    cfg64 = load_macro_training_config(v64_toml)
+    assert cfg64.learner.detach_value_heads_from_trunk is True
+    assert cfg64.learner.minority_only_within_branch_mpo is True
+    assert cfg64.learner.within_branch_minority_prob_cap == 0.30
+    assert cfg64.learner.macro_pg_fallback_scale == 0.20
+    assert cfg64.learner.mpo_parent_prior_mix == 0.25
+    assert cfg64.learner.max_parent_macro_kl == 0.030
+
+    # 1. Minority-only within-branch MPO omits majority reward:take (P=0.60 > 0.30) while keeping minority P=0.20
+    q_vals = torch.tensor([0.10, -0.05, 0.08], dtype=torch.float32)
+    maj_logs = torch.tensor([0.30, 0.30, 0.40], dtype=torch.float32).log()
+    min_logs = torch.tensor([0.10, 0.10, 0.80], dtype=torch.float32).log()
+    b_ids = torch.tensor([0, 0, 1], dtype=torch.long)
+    p_maj = project_hierarchical_macro_policy(
+        det_action_values=q_vals,
+        teacher_log_probs=maj_logs,
+        policy_branch_ids=b_ids,
+        branch_max_kl=0.015,
+        within_max_kl=0.035,
+        min_temperature=0.015,
+        within_branch_prob_cap=0.30,
+    )
+    p_min = project_hierarchical_macro_policy(
+        det_action_values=q_vals,
+        teacher_log_probs=min_logs,
+        policy_branch_ids=b_ids,
+        branch_max_kl=0.015,
+        within_max_kl=0.035,
+        min_temperature=0.015,
+        within_branch_prob_cap=0.30,
+    )
+    assert len(p_maj.within_branch_targets) == 0
+    assert len(p_min.within_branch_targets) == 1
+
+    # 2. When policy weights are zeroed (policy_weight=0, combat_policy_weight=0) at unfrozen update u=5,
+    #    detach_value_heads_from_trunk=True ensures value losses produce ZERO gradient on macro_stream & world_encoder!
+    torch.manual_seed(20261118)
+    cfg = _tiny_model_config()
+    ac_cfg = HybridActorCriticConfig.durable_v11(cfg.to_model_config())
+    model = HybridDomainActorCriticModel(ac_cfg)
+    teacher = copy.deepcopy(model)
+    teacher.eval()
+    encoder = GroundedObservationEncoder(cfg.to_encoding_config())
+    cohort = _build_synthetic_durable_cohort(model, encoder, num_games=3)
+    l_cfg = MacroCreditLearnerConfig(
+        target_mode="durable_afterstate_v2",
+        enable_direct_vitals_context=True,
+        enable_macro_branch_prior=True,
+        enable_persistent_only_durable_value=True,
+        enable_asymmetric_revival_critic=True,
+        enable_draw_weighted_durable_value=True,
+        enable_role_conditioned_candidate_policy=True,
+        enable_deconfounded_durable_value=True,
+        enable_monotone_deconfounded_durable_value=True,
+        enable_balanced_deconfounded_durable_value=True,
+        enable_expressive_synergy_backbone=True,
+        enable_debloated_synergy_durable_value=True,
+        enable_build_conditioned_durable_value=True,
+        enable_twin_durable_value_heads=True,
+        enable_hierarchical_afterstate_mpo=True,
+        durable_warmup_updates=0,
+        combat_actor_warmup_updates=0,
+        freeze_trunk_during_durable_warmup=True,
+        detach_value_heads_from_trunk=True,
+        minority_only_within_branch_mpo=True,
+        within_branch_minority_prob_cap=0.30,
+        mpo_parent_prior_mix=0.25,
+        max_parent_macro_kl=0.030,
+        enable_post_step_kl_line_search=True,
+        target_macro_step_kl=0.010,
+        macro_policy_weight=0.0,
+        combat_policy_weight=0.0,
+        macro_entropy_weight=0.0,
+        combat_entropy_weight=0.0,
+        kickstart_kl_weight=0.0,
+        kickstart_kl_floor=0.0,
+        weight_decay=0.0,
+    )
+    learner = MacroCreditLearner(model=model, config=l_cfg, update=0, teacher_model=teacher)
+    metrics = learner.learn(cohort)
+    assert metrics["warmup_trunk_frozen"] is False
+    assert metrics["shared_gradient_norm"] == 0.0
+    assert metrics["domain_stream_gradient_norm"] == 0.0
+    assert metrics["policy_head_gradient_norm"] == 0.0
+    assert metrics["value_head_gradient_norm"] > 0.0
