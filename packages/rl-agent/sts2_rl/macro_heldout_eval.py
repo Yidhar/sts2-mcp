@@ -417,6 +417,7 @@ def evaluate_heldout_publication(
             device,
             max_batch_size=8,
             allow_tf32=macro_cfg.learner.allow_tf32,
+            enable_bf16_amp=macro_cfg.learner.enable_bf16_amp,
         ) as server:
             shared = HeadlessBackend(exe_path=str(simulator.executable))
             try:
@@ -459,6 +460,7 @@ def evaluate_heldout_publication(
             mp_request_queue=infer_request_queue,
             max_batch_size=max(8, eff_workers),
             allow_tf32=macro_cfg.learner.allow_tf32,
+            enable_bf16_amp=macro_cfg.learner.enable_bf16_amp,
         ) as server:
             try:
                 for wid in range(eff_workers):

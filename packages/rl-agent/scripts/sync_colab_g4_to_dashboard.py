@@ -173,6 +173,17 @@ if heldout_path.is_file():
             except Exception:
                 pass
 
+extra_heldout_files = {}
+for extra_p in sorted(local_dir.glob("heldout_evaluations_b*.jsonl")):
+    rows_e = []
+    for line in extra_p.read_text().splitlines():
+        if line.strip():
+            try:
+                rows_e.append(json.loads(line))
+            except Exception:
+                pass
+    extra_heldout_files[extra_p.name] = rows_e
+
 print("PULLED_JSON_START")
 print(json.dumps({
     "alive": alive,
@@ -183,6 +194,7 @@ print(json.dumps({
     "updates": updates,
     "history": history,
     "heldout_evaluations": heldout_evaluations,
+    "extra_heldout_files": extra_heldout_files,
     "cohort_replays": cohort_replays,
 }, separators=(",", ":")))
 print("PULLED_JSON_END")
@@ -802,20 +814,32 @@ def sync_once(
                 "unix_s": start_ts,
                 "config": {
                     "profile": (
-                        "durable_afterstate_v4"
-                        if "v4" in lineage
-                        else ("durable_afterstate_v3" if "v3" in lineage else "durable_afterstate_v2")
+                        "durable_afterstate_v6"
+                        if "v6" in lineage
+                        else (
+                            "durable_afterstate_v4"
+                            if "v4" in lineage
+                            else ("durable_afterstate_v3" if "v3" in lineage else "durable_afterstate_v2")
+                        )
                     ),
                     "version": (
-                        "sts2-durable-afterstate-v5-wide256"
-                        if "v5" in lineage
+                        "sts2-durable-afterstate-v6.2-ablation"
+                        if "v6-2" in lineage or "v6.2" in lineage
                         else (
-                            "sts2-durable-afterstate-v4"
-                            if "v4" in lineage
+                            "sts2-durable-afterstate-v6-wide256"
+                            if "v6" in lineage
                             else (
-                                "sts2-durable-afterstate-v3"
-                                if "v3" in lineage
-                                else "sts2-durable-afterstate-v2"
+                                "sts2-durable-afterstate-v5-wide256"
+                                if "v5" in lineage
+                                else (
+                                    "sts2-durable-afterstate-v4"
+                                    if "v4" in lineage
+                                    else (
+                                        "sts2-durable-afterstate-v3"
+                                        if "v3" in lineage
+                                        else "sts2-durable-afterstate-v2"
+                                    )
+                                )
                             )
                         )
                     ),
@@ -1080,7 +1104,7 @@ def sync_once(
         h_a3_rate = _finite(hr.get("act3_reach_rate")) or 0.0
         h_win_rate = _finite(hr.get("run_win_rate")) or 0.0
         h_z_wins = int(_finite(hr.get("zero_revival_victories")) or 0)
-        h_env_steps = update_env_steps.get(h_gate, cumulative_env_steps)
+        h_env_steps = 0 if h_gate == 0 else update_env_steps.get(h_gate, cumulative_env_steps)
         events_to_append.append(
             {
                 "event": "evaluation",
@@ -1129,6 +1153,26 @@ def sync_once(
         )
         synced_heldout_gates.add(h_gate)
         new_heldout_synced.append(h_gate)
+
+    extra_files_map = remote_bundle.get("extra_heldout_files")
+    if isinstance(extra_files_map, Mapping):
+        for ef_name, ef_rows in extra_files_map.items():
+            if (
+                isinstance(ef_name, str)
+                and ef_name.startswith("heldout_evaluations_b")
+                and ef_name.endswith(".jsonl")
+                and "/" not in ef_name
+                and "\\" not in ef_name
+                and isinstance(ef_rows, list)
+                and ef_rows
+            ):
+                ef_dst = run_dir / ef_name
+                ef_text = "".join(
+                    json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n"
+                    for row in ef_rows
+                    if isinstance(row, Mapping)
+                )
+                ef_dst.write_text(ef_text, encoding="utf-8")
 
     # Emit live heartbeat when remote Colab G4 daemon is actively running so dashboard badge stays "训练中".
     terminal_emitted = bool(state_data.get("terminal_emitted", False))

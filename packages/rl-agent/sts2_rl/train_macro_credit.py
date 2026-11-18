@@ -322,10 +322,18 @@ def _extract_distillation_teacher_info(
 class InMemoryTeacher:
     """The learner's unchanged model, inference-only for the whole cohort."""
 
-    def __init__(self, model: HybridDomainActorCriticModel, config: TrainingConfig, device: torch.device) -> None:
+    def __init__(
+        self,
+        model: HybridDomainActorCriticModel,
+        config: TrainingConfig,
+        device: torch.device,
+        *,
+        enable_bf16_amp: bool = False,
+    ) -> None:
         self.model = model
         self.encoding_config = config.model.to_encoding_config()
         self.device = device
+        self.enable_bf16_amp = bool(enable_bf16_amp)
         self.hierarchical_branch_greedy = bool(model.actor_critic_config.enable_hierarchical_branch_policy)
         self._lock = threading.Lock()
 
@@ -348,12 +356,14 @@ class InMemoryTeacher:
             )
             with torch.inference_mode():
                 initial = self.model.initial_state(1, device=self.device).detach() if hidden is None else hidden
-                output = self.model(
-                    encoded,
-                    initial,
-                    compute_durable_value=False,
-                    validate=False,
-                )
+                use_bf16 = self.enable_bf16_amp and self.device.type == "cuda"
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                    output = self.model(
+                        encoded,
+                        initial,
+                        compute_durable_value=False,
+                        validate=False,
+                    )
                 return output.policy_logits[0].detach(), output.recurrent_state.detach()
 
 
@@ -964,11 +974,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                             protocol_quarantine_dir=protocol_incidents,
                             artifact_root=root,
                             allow_tf32=config.learner.allow_tf32,
+                            enable_bf16_amp=config.learner.enable_bf16_amp,
                         )
                     )
                     teacher = worker_pool.inference_server
                 else:
-                    teacher = InMemoryTeacher(initial_rollout_model, training, device)
+                    teacher = InMemoryTeacher(
+                        initial_rollout_model,
+                        training,
+                        device,
+                        enable_bf16_amp=config.learner.enable_bf16_amp,
+                    )
                 summary = run_cohorts(
                     config=config, output=output, identity=identity, learner=learner,
                     teacher=teacher,

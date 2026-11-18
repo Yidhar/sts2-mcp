@@ -1479,7 +1479,7 @@ class RecurrentCandidateModel(nn.Module):
         )
         world_tokens = world_tokens * world_mask.unsqueeze(-1).to(dtype=world_tokens.dtype)
 
-        null_token = self.world_null_token.expand(batch_size, -1, -1)
+        null_token = self.world_null_token.expand(batch_size, -1, -1).to(dtype=world_tokens.dtype)
         encoded_tokens = torch.cat([null_token, world_tokens], dim=1)
         null_mask = torch.ones((batch_size, 1), dtype=torch.bool, device=world_tokens.device)
         encoded_mask = torch.cat([null_mask, world_mask], dim=1)
@@ -1490,7 +1490,9 @@ class RecurrentCandidateModel(nn.Module):
         relation_tokens = encoded_tokens[:, 1:] * world_mask.unsqueeze(-1).to(dtype=encoded_tokens.dtype)
 
         domain_context = self.domain_embedding(domain_ids).unsqueeze(1)
-        latent_queries = self.latent_queries.expand(batch_size, -1, -1) + domain_context
+        latent_queries = (self.latent_queries.expand(batch_size, -1, -1) + domain_context).to(
+            dtype=encoded_tokens.dtype
+        )
         latent_delta, _ = self.world_to_latent(
             latent_queries,
             encoded_tokens,
@@ -1707,15 +1709,19 @@ class RecurrentCandidateModel(nn.Module):
         # hundreds of individual card plays therefore cannot overwrite deck,
         # route, shop and resource context.  Tactical memory updates inside a
         # combat and is cleared as soon as the environment leaves that domain.
-        run_update = self.run_recurrent_norm(self.run_recurrent_cell(world.state_embedding, previous_run))
-        next_run = torch.where(combat_domain, previous_run, run_update)
-        combat_update = self.combat_recurrent_norm(self.combat_recurrent_cell(world.state_embedding, previous_combat))
-        next_combat = torch.where(
-            combat_domain,
-            combat_update,
-            torch.zeros_like(combat_update),
-        )
-        next_recurrent_state = torch.cat([next_run, next_combat], dim=-1)
+        with torch.autocast(device_type=batch.world.features.device.type, enabled=False):
+            ws_f = world.state_embedding.float()
+            prev_run_f = previous_run.float()
+            prev_com_f = previous_combat.float()
+            run_update = self.run_recurrent_norm(self.run_recurrent_cell(ws_f, prev_run_f))
+            next_run = torch.where(combat_domain, prev_run_f, run_update)
+            combat_update = self.combat_recurrent_norm(self.combat_recurrent_cell(ws_f, prev_com_f))
+            next_combat = torch.where(
+                combat_domain,
+                combat_update,
+                torch.zeros_like(combat_update),
+            )
+            next_recurrent_state = torch.cat([next_run, next_combat], dim=-1)
         memory_context = self.memory_to_candidate(next_recurrent_state).unsqueeze(1)
         policy_features = self.policy_feature_norm(candidates.embeddings + memory_context)
         policy_features = policy_features * mask.unsqueeze(-1).to(dtype=policy_features.dtype)

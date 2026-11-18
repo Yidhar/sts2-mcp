@@ -9,6 +9,7 @@ saved behavior hidden state, scheduler or EMA state is owned by this learner.
 
 from __future__ import annotations
 
+import contextlib
 import math
 import random
 import sys
@@ -23,7 +24,13 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from sts2_rl.encoding import EncodedDecisionSnapshot, EncodedWorldSnapshot
-from sts2_rl.encoding.snapshot import collate_encoded_snapshots, collate_encoded_worlds
+from sts2_rl.encoding.snapshot import (
+    PackedSnapshotBatch,
+    collate_encoded_snapshots,
+    collate_encoded_worlds,
+    pack_encoded_snapshots_to_device,
+    scatter_packed_snapshots,
+)
 from sts2_rl.models.grounded_candidate import WorldTokenBatch, _safe_valid_mask
 from sts2_rl.models.hybrid_actor_critic import HybridActorCriticOutput, HybridDomainActorCriticModel
 
@@ -46,6 +53,11 @@ from .transitions import HybridVTraceStep
 
 MACRO_CREDIT_LEARNER_VERSION: Final = "sts2-fresh-macro-credit-learner-v1"
 MacroCreditForward: TypeAlias = Callable[[EncodedDecisionSnapshot, Tensor | None], tuple[Tensor, Tensor, Tensor]]
+_PURE_VALUE_PARAM_PREFIXES: Final[tuple[str, ...]] = (
+    "state_value_head.",
+    "state_revival_",
+    "durable_",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,10 +136,18 @@ class MacroCreditLearnerConfig:
     ppo_minibatches_per_cohort: int = 1
     target_macro_step_kl: float = 0.0
     macro_mpo_trust_kl_weight: float = 0.0
+    enable_bf16_amp: bool = False
+    freeze_trunk_during_durable_warmup: bool = False
+    enable_post_step_kl_line_search: bool = False
+    line_search_max_backtracks: int = 4
+    line_search_min_scale: float = 0.10
 
     def __post_init__(self) -> None:
         for bool_name in (
             "allow_tf32",
+            "enable_bf16_amp",
+            "freeze_trunk_during_durable_warmup",
+            "enable_post_step_kl_line_search",
             "separate_value_grad_clip",
             "enable_direct_vitals_context",
             "enable_macro_branch_prior",
@@ -294,6 +314,18 @@ class MacroCreditLearnerConfig:
                 raise ValueError(f"macro credit {name} has an invalid finite range")
         if self.kickstart_kl_floor > self.kickstart_kl_weight:
             raise ValueError("macro credit kickstart_kl_floor must be <= kickstart_kl_weight")
+        if (
+            isinstance(self.line_search_max_backtracks, bool)
+            or not isinstance(self.line_search_max_backtracks, int)
+            or not 0 <= self.line_search_max_backtracks <= 16
+        ):
+            raise ValueError("macro credit line_search_max_backtracks must be an integer in [0, 16]")
+        if (
+            isinstance(self.line_search_min_scale, bool)
+            or not math.isfinite(self.line_search_min_scale)
+            or not 0.0 < self.line_search_min_scale <= 1.0
+        ):
+            raise ValueError("macro credit line_search_min_scale must be in (0, 1]")
         if self.macro_trace_lambda > 1 or self.c_clip > self.rho_clip:
             raise ValueError("macro lambda must be <= 1 and c_clip <= rho_clip")
 
@@ -306,6 +338,14 @@ class _AfterstateStepTarget:
     post_target: Tensor
     has_chosen_post: bool = True
     action_disagreement: Tensor | None = None
+
+
+@dataclass(slots=True)
+class _CachedEvalGroup:
+    step_actives: list[list[int]]
+    step_packed: list[PackedSnapshotBatch]
+    boot_indices: list[int]
+    boot_packed: PackedSnapshotBatch | None
 
 
 @dataclass(slots=True)
@@ -493,6 +533,11 @@ class MacroCreditLearner:
         self._parameters = [p for p in model.parameters() if p.requires_grad]
         if not self._parameters:
             raise ValueError("macro learner requires a non-empty, trainable actor-critic model")
+        self._is_pure_value_param = [
+            name.startswith(_PURE_VALUE_PARAM_PREFIXES)
+            for name, p in model.named_parameters()
+            if p.requires_grad
+        ]
         isolate_stage_clip = bool(
             (
                 self.config.enable_balanced_deconfounded_durable_value
@@ -648,6 +693,19 @@ class MacroCreditLearner:
             and mod.actor_critic_config.enable_monotone_deconfounded_durable_value
         )
 
+    def _autocast_ctx(self) -> Any:
+        if self.config.enable_bf16_amp and self.device.type == "cuda":
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return contextlib.nullcontext()
+
+    def _has_high_vram(self) -> bool:
+        if self.device.type != "cuda":
+            return False
+        try:
+            return int(torch.cuda.get_device_properties(self.device).total_memory) >= 40 * (1024**3)
+        except Exception:
+            return False
+
     def _critic_revival_vector(self, revivals_used: int, cum_revival_penalty: float) -> list[float]:
         budget = self.config.revival_budget
         u = max(0, int(revivals_used))
@@ -708,21 +766,22 @@ class MacroCreditLearner:
                 (snapshot,), expected_config=snapshot.config,
                 expected_fingerprint=snapshot.encoding_fingerprint, device=self.device,
             )
-            if isinstance(active_mod, HybridDomainActorCriticModel):
-                output = cast(
-                    HybridActorCriticOutput,
-                    active_mod(
-                        batch,
-                        hidden,
-                        critic_revival_context=(
-                            critic_revival_context if self._use_revival_ctx(active_mod) else None
+            with self._autocast_ctx():
+                if isinstance(active_mod, HybridDomainActorCriticModel):
+                    output = cast(
+                        HybridActorCriticOutput,
+                        active_mod(
+                            batch,
+                            hidden,
+                            critic_revival_context=(
+                                critic_revival_context if self._use_revival_ctx(active_mod) else None
+                            ),
+                            compute_durable_value=compute_durable_value,
+                            validate=False,
                         ),
-                        compute_durable_value=compute_durable_value,
-                        validate=False,
-                    ),
-                )
-            else:
-                output = cast(HybridActorCriticOutput, active_mod(batch, hidden, validate=False))
+                    )
+                else:
+                    output = cast(HybridActorCriticOutput, active_mod(batch, hidden, validate=False))
             logits, value, next_hidden = output.policy_logits[0], output.value.reshape(()), output.recurrent_state
             if output.durable_value is not None:
                 durable_value = output.durable_value.reshape(())
@@ -772,13 +831,14 @@ class MacroCreditLearner:
             if critic_revival_context is None
             else critic_revival_context.expand(len(worlds), -1).contiguous()
         )
-        durable_vals, _ = active_mod.forward_durable_value(
-            world_batch,
-            domain_ids,
-            expanded_hidden,
-            critic_revival_context=expanded_rev,
-            validate=False,
-        )
+        with self._autocast_ctx():
+            durable_vals, _ = active_mod.forward_durable_value(
+                world_batch,
+                domain_ids,
+                expanded_hidden,
+                critic_revival_context=expanded_rev,
+                validate=False,
+            )
         if durable_vals.ndim != 1 or durable_vals.numel() != len(worlds):
             raise ValueError("forward_durable_value returned invalid batch shape")
         if not bool(torch.isfinite(durable_vals).all().item()):
@@ -814,13 +874,14 @@ class MacroCreditLearner:
             if critic_revival_context is None
             else critic_revival_context.expand(len(worlds), -1).contiguous()
         )
-        v1, v2, _ = active_mod.forward_durable_value_pair(
-            world_batch,
-            domain_ids,
-            expanded_hidden,
-            critic_revival_context=expanded_rev,
-            validate=False,
-        )
+        with self._autocast_ctx():
+            v1, v2, _ = active_mod.forward_durable_value_pair(
+                world_batch,
+                domain_ids,
+                expanded_hidden,
+                critic_revival_context=expanded_rev,
+                validate=False,
+            )
         if v1.ndim != 1 or v1.numel() != len(worlds) or tuple(v2.shape) != tuple(v1.shape):
             raise ValueError("forward_durable_value_pair returned invalid batch shape")
         if not bool((torch.isfinite(v1).all() & torch.isfinite(v2).all()).item()):
@@ -1036,6 +1097,7 @@ class MacroCreditLearner:
         check_likelihood: bool = True,
         record_all_choice_logs: bool = False,
         compute_durable_value: bool = True,
+        packed_cache: dict[tuple[int, int], _CachedEvalGroup] | None = None,
     ) -> list[_Evaluation]:
         _configure_cuda_tf32(self.device, self.config.allow_tf32)
         ac_model = cast(
@@ -1044,14 +1106,19 @@ class MacroCreditLearner:
         )
         use_rev = self._use_revival_ctx(ac_model)
         results: list[_Evaluation] = []
+        high_vram = self._has_high_vram()
         batch_cap = (
-            min(self.config.eval_batch_size, 16)
-            if int(ac_model.config.d_model) >= 256
-            else self.config.eval_batch_size
+            self.config.eval_batch_size
+            if high_vram or int(ac_model.config.d_model) < 256
+            else min(self.config.eval_batch_size, 16)
         )
         for group_start in range(0, len(references), batch_cap):
             group = references[group_start : group_start + batch_cap]
             m = len(group)
+            cache_key = (group_start, m)
+            cached_group = packed_cache.get(cache_key) if packed_cache is not None else None
+            building_cache = packed_cache is not None and cached_group is None
+            new_step_packed: list[PackedSnapshotBatch] = []
             rev_contexts = (
                 [self._trajectory_critic_revival_contexts(traj) for traj in group]
                 if use_rev
@@ -1101,7 +1168,10 @@ class MacroCreditLearner:
 
             for t in range(t_max):
                 self._check_resource()
-                active = [i for i in range(m) if t < len(group[i].steps)]
+                if cached_group is not None:
+                    active = cached_group.step_actives[t]
+                else:
+                    active = [i for i in range(m) if t < len(group[i].steps)]
                 step_actives.append(active)
                 if t % self.config.chunk_steps == 0:
                     step_had_hidden.append([has_hidden[i] for i in active])
@@ -1110,14 +1180,26 @@ class MacroCreditLearner:
                     )
                 else:
                     step_had_hidden.append([])
-                snaps = tuple(group[i].steps[t].snapshot for i in active)
-                batch = collate_encoded_snapshots(
-                    snaps,
-                    expected_config=snaps[0].config,
-                    expected_fingerprint=snaps[0].encoding_fingerprint,
-                    device=self.device,
-                    validate=False,
-                )
+                if cached_group is not None:
+                    batch = scatter_packed_snapshots(cached_group.step_packed[t])
+                elif building_cache:
+                    snaps = tuple(group[i].steps[t].snapshot for i in active)
+                    packed_t = pack_encoded_snapshots_to_device(
+                        snaps,
+                        cfg=snaps[0].config,
+                        dev=self.device,
+                    )
+                    new_step_packed.append(packed_t)
+                    batch = scatter_packed_snapshots(packed_t)
+                else:
+                    snaps = tuple(group[i].steps[t].snapshot for i in active)
+                    batch = collate_encoded_snapshots(
+                        snaps,
+                        expected_config=snaps[0].config,
+                        expected_fingerprint=snaps[0].encoding_fingerprint,
+                        device=self.device,
+                        validate=False,
+                    )
                 rev_t_gpu = (
                     None
                     if rev_contexts is None
@@ -1125,16 +1207,17 @@ class MacroCreditLearner:
                         device=self.device, dtype=self.dtype
                     )
                 )
-                output = cast(
-                    HybridActorCriticOutput,
-                    ac_model(
-                        batch,
-                        hidden[active],
-                        critic_revival_context=rev_t_gpu,
-                        compute_durable_value=compute_durable_value,
-                        validate=False,
-                    ),
-                )
+                with self._autocast_ctx():
+                    output = cast(
+                        HybridActorCriticOutput,
+                        ac_model(
+                            batch,
+                            hidden[active],
+                            critic_revival_context=rev_t_gpu,
+                            compute_durable_value=compute_durable_value,
+                            validate=False,
+                        ),
+                    )
                 if compute_durable_value and output.durable_value is None:
                     raise ValueError("durable_afterstate_v2 requires durable_value on every step")
                 masks = batch.candidates.action_mask
@@ -1226,21 +1309,39 @@ class MacroCreditLearner:
                             step_log_probs_list[i][t] = policy
                         calls[i] += 1
 
-            boot_indices = [i for i, traj in enumerate(group) if traj.bootstrap_snapshot is not None]
+            boot_indices = (
+                cached_group.boot_indices
+                if cached_group is not None
+                else [i for i, traj in enumerate(group) if traj.bootstrap_snapshot is not None]
+            )
             boot_vals: dict[int, Tensor] = {}
             dur_boot_vals: dict[int, Tensor] = {}
+            new_boot_packed: PackedSnapshotBatch | None = None
             if boot_indices:
                 self._check_resource()
-                boot_snaps = tuple(
-                    cast(EncodedDecisionSnapshot, group[i].bootstrap_snapshot) for i in boot_indices
-                )
-                boot_batch = collate_encoded_snapshots(
-                    boot_snaps,
-                    expected_config=boot_snaps[0].config,
-                    expected_fingerprint=boot_snaps[0].encoding_fingerprint,
-                    device=self.device,
-                    validate=False,
-                )
+                if cached_group is not None and cached_group.boot_packed is not None:
+                    boot_batch = scatter_packed_snapshots(cached_group.boot_packed)
+                elif building_cache:
+                    boot_snaps = tuple(
+                        cast(EncodedDecisionSnapshot, group[i].bootstrap_snapshot) for i in boot_indices
+                    )
+                    new_boot_packed = pack_encoded_snapshots_to_device(
+                        boot_snaps,
+                        cfg=boot_snaps[0].config,
+                        dev=self.device,
+                    )
+                    boot_batch = scatter_packed_snapshots(new_boot_packed)
+                else:
+                    boot_snaps = tuple(
+                        cast(EncodedDecisionSnapshot, group[i].bootstrap_snapshot) for i in boot_indices
+                    )
+                    boot_batch = collate_encoded_snapshots(
+                        boot_snaps,
+                        expected_config=boot_snaps[0].config,
+                        expected_fingerprint=boot_snaps[0].encoding_fingerprint,
+                        device=self.device,
+                        validate=False,
+                    )
                 boot_rev_gpu = (
                     None
                     if rev_contexts is None
@@ -1248,16 +1349,17 @@ class MacroCreditLearner:
                         device=self.device, dtype=self.dtype
                     )
                 )
-                boot_out = cast(
-                    HybridActorCriticOutput,
-                    ac_model(
-                        boot_batch,
-                        hidden[boot_indices],
-                        critic_revival_context=boot_rev_gpu,
-                        compute_durable_value=compute_durable_value,
-                        validate=False,
-                    ),
-                )
+                with self._autocast_ctx():
+                    boot_out = cast(
+                        HybridActorCriticOutput,
+                        ac_model(
+                            boot_batch,
+                            hidden[boot_indices],
+                            critic_revival_context=boot_rev_gpu,
+                            compute_durable_value=compute_durable_value,
+                            validate=False,
+                        ),
+                    )
                 if compute_durable_value and boot_out.durable_value is None:
                     raise ValueError("durable_afterstate_v2 requires durable_value on bootstrap snapshot")
                 boot_ok = (
@@ -1281,6 +1383,13 @@ class MacroCreditLearner:
                     if b_dur_cpu is not None:
                         dur_boot_vals[i] = b_dur_cpu[k].clone()
                     calls[i] += 1
+            if building_cache and packed_cache is not None:
+                packed_cache[cache_key] = _CachedEvalGroup(
+                    step_actives=step_actives,
+                    step_packed=new_step_packed,
+                    boot_indices=boot_indices,
+                    boot_packed=new_boot_packed,
+                )
             for i in range(m):
                 results.append(
                     _Evaluation(
@@ -1362,6 +1471,7 @@ class MacroCreditLearner:
         model_override: HybridDomainActorCriticModel | None = None,
         check_likelihood: bool = True,
         record_all_choice_logs: bool = False,
+        packed_cache: dict[tuple[int, int], _CachedEvalGroup] | None = None,
     ) -> tuple[list[_PreparedReference], int, float]:
         if not references:
             return [], 0, 0.0
@@ -1380,6 +1490,7 @@ class MacroCreditLearner:
             model_override=model_override,
             check_likelihood=check_likelihood,
             record_all_choice_logs=record_all_choice_logs,
+            packed_cache=packed_cache,
         )
         flat_worlds: list[EncodedWorldSnapshot] = []
         flat_hiddens: list[Tensor] = []
@@ -1415,9 +1526,13 @@ class MacroCreditLearner:
             stacked_hiddens = torch.cat(flat_hiddens, dim=0)[perm]
             stacked_revs = torch.cat(flat_revs, dim=0)[perm] if rev_all is not None else None
             world_cap = (
-                64
-                if int(ac_model.config.d_model) >= 256
-                else max(128, min(256, self.config.eval_batch_size * 8))
+                192
+                if self._has_high_vram()
+                else (
+                    64
+                    if int(ac_model.config.d_model) >= 256
+                    else max(128, min(256, self.config.eval_batch_size * 8))
+                )
             )
             gpu_q1_chunks: list[Tensor] = []
             gpu_q2_chunks: list[Tensor] = []
@@ -1438,25 +1553,26 @@ class MacroCreditLearner:
                     if stacked_revs is None
                     else stacked_revs[w_start:w_end].to(device=self.device, dtype=self.dtype)
                 )
-                if use_twin_after:
-                    dur_v1, dur_v2, _ = ac_model.forward_durable_value_pair(
-                        world_batch,
-                        domain_ids,
-                        h_gpu,
-                        critic_revival_context=r_gpu,
-                        validate=False,
-                    )
-                    gpu_q1_chunks.append(dur_v1.detach())
-                    gpu_q2_chunks.append(dur_v2.detach())
-                else:
-                    dur_vals, _ = ac_model.forward_durable_value(
-                        world_batch,
-                        domain_ids,
-                        h_gpu,
-                        critic_revival_context=r_gpu,
-                        validate=False,
-                    )
-                    gpu_q1_chunks.append(dur_vals.detach())
+                with self._autocast_ctx():
+                    if use_twin_after:
+                        dur_v1, dur_v2, _ = ac_model.forward_durable_value_pair(
+                            world_batch,
+                            domain_ids,
+                            h_gpu,
+                            critic_revival_context=r_gpu,
+                            validate=False,
+                        )
+                        gpu_q1_chunks.append(dur_v1.detach())
+                        gpu_q2_chunks.append(dur_v2.detach())
+                    else:
+                        dur_vals, _ = ac_model.forward_durable_value(
+                            world_batch,
+                            domain_ids,
+                            h_gpu,
+                            critic_revival_context=r_gpu,
+                            validate=False,
+                        )
+                        gpu_q1_chunks.append(dur_vals.detach())
             sorted_q1_gpu = torch.cat(gpu_q1_chunks, dim=0)
             if not bool(torch.isfinite(sorted_q1_gpu).all().item()):
                 raise FloatingPointError("forward_durable_value output is non-finite")
@@ -2292,9 +2408,18 @@ class MacroCreditLearner:
         cfg = self.config
         d_model = max(128, int(ac_model.config.d_model))
         width_scale = min(1.0, (128.0 / float(d_model)) ** 1.25)
-        world_step_budget = 12_288 if d_model >= 256 else max(16_384, int(49_152 * width_scale))
-        local_step_budget = 24_576 if d_model >= 256 else max(24_576, int(98_304 * width_scale))
-        max_attn_floats = 1_200_000_000
+        high_vram = self._has_high_vram()
+        world_step_budget = (
+            49_152
+            if high_vram
+            else (12_288 if d_model >= 256 else max(16_384, int(49_152 * width_scale)))
+        )
+        local_step_budget = (
+            98_304
+            if high_vram
+            else (24_576 if d_model >= 256 else max(24_576, int(98_304 * width_scale)))
+        )
+        max_attn_floats = 2_400_000_000 if high_vram else 1_200_000_000
         n_heads = max(1, int(ac_model.config.n_heads))
         world_layers = max(1, int(ac_model.config.world_layers))
         limit = min(total_chunks, slice_start + cfg.chunk_batch_size)
@@ -2349,7 +2474,9 @@ class MacroCreditLearner:
             for pos, entry in enumerate(dur_entries)
         ]
         sorted_entries = sorted(indexed_entries, key=lambda row: row[0].world.token_count)
-        max_sub = 32 if int(ac_model.config.d_model) >= 256 else 64
+        high_vram = self._has_high_vram()
+        max_sub = 96 if high_vram else (32 if int(ac_model.config.d_model) >= 256 else 64)
+        tok_cap = 65_536 if high_vram else 24_576
         dur_total = torch.zeros((), device=self.device, dtype=torch.float64)
         stage_total = torch.zeros((), device=self.device, dtype=torch.float64)
 
@@ -2364,7 +2491,7 @@ class MacroCreditLearner:
                 self._check_resource()
                 tentative_end = min(n_total, idx + max_sub)
                 max_w = max(1, sorted_entries[tentative_end - 1][0].world.token_count)
-                step_cap = max(1, min(max_sub, 24_576 // max_w))
+                step_cap = max(1, min(max_sub, tok_cap // max_w))
                 end = min(n_total, idx + step_cap)
                 sub_entries = sorted_entries[idx:end]
                 idx = end
@@ -2382,16 +2509,8 @@ class MacroCreditLearner:
                 sub_terms: list[Tensor] = []
 
                 if has_twin:
-                    if durable_value_weight:
-                        v1, v2, _ = ac_model.forward_durable_value_pair(
-                            wb,
-                            dom,
-                            None,
-                            critic_revival_context=sub_rev,
-                            validate=False,
-                        )
-                    else:
-                        with torch.no_grad():
+                    with self._autocast_ctx():
+                        if durable_value_weight:
                             v1, v2, _ = ac_model.forward_durable_value_pair(
                                 wb,
                                 dom,
@@ -2399,6 +2518,15 @@ class MacroCreditLearner:
                                 critic_revival_context=sub_rev,
                                 validate=False,
                             )
+                        else:
+                            with torch.no_grad():
+                                v1, v2, _ = ac_model.forward_durable_value_pair(
+                                    wb,
+                                    dom,
+                                    None,
+                                    critic_revival_context=sub_rev,
+                                    validate=False,
+                                )
                     if not bool((torch.isfinite(v1).all() & torch.isfinite(v2).all()).item()):
                         raise FloatingPointError("stateless durable_value_pair forward is non-finite")
                     t_sub = flat_dur_target[sub_gids]
@@ -2414,16 +2542,8 @@ class MacroCreditLearner:
                     else:
                         dur_loss = 0.5 * (l1.sum() + l2.sum()) / denom_dur_val
                 else:
-                    if durable_value_weight:
-                        dur_vals, _ = ac_model.forward_durable_value(
-                            wb,
-                            dom,
-                            None,
-                            critic_revival_context=sub_rev,
-                            validate=False,
-                        )
-                    else:
-                        with torch.no_grad():
+                    with self._autocast_ctx():
+                        if durable_value_weight:
                             dur_vals, _ = ac_model.forward_durable_value(
                                 wb,
                                 dom,
@@ -2431,6 +2551,15 @@ class MacroCreditLearner:
                                 critic_revival_context=sub_rev,
                                 validate=False,
                             )
+                        else:
+                            with torch.no_grad():
+                                dur_vals, _ = ac_model.forward_durable_value(
+                                    wb,
+                                    dom,
+                                    None,
+                                    critic_revival_context=sub_rev,
+                                    validate=False,
+                                )
                     if not bool(torch.isfinite(dur_vals).all().item()):
                         raise FloatingPointError("stateless durable_value forward is non-finite")
                     dur_loss = (
@@ -2495,7 +2624,9 @@ class MacroCreditLearner:
             for pos, row in enumerate(post_entries)
         ]
         sorted_entries = sorted(indexed_entries, key=lambda row: row[0].world.token_count)
-        max_sub = 32 if int(ac_model.config.d_model) >= 256 else 64
+        high_vram = self._has_high_vram()
+        max_sub = 96 if high_vram else (32 if int(ac_model.config.d_model) >= 256 else 64)
+        tok_cap = 65_536 if high_vram else 24_576
         post_total = torch.zeros((), device=self.device, dtype=torch.float64)
         stage_total = torch.zeros((), device=self.device, dtype=torch.float64)
 
@@ -2510,7 +2641,7 @@ class MacroCreditLearner:
                 self._check_resource()
                 tentative_end = min(n_total, idx + max_sub)
                 max_w = max(1, sorted_entries[tentative_end - 1][0].world.token_count)
-                step_cap = max(1, min(max_sub, 24_576 // max_w))
+                step_cap = max(1, min(max_sub, tok_cap // max_w))
                 end = min(n_total, idx + step_cap)
                 sub_entries = sorted_entries[idx:end]
                 idx = end
@@ -2532,16 +2663,8 @@ class MacroCreditLearner:
                 sub_terms: list[Tensor] = []
 
                 if has_twin:
-                    if cfg.durable_post_value_weight:
-                        pv1, pv2, _ = ac_model.forward_durable_value_pair(
-                            wb,
-                            dom,
-                            None,
-                            critic_revival_context=stacked_revs,
-                            validate=False,
-                        )
-                    else:
-                        with torch.no_grad():
+                    with self._autocast_ctx():
+                        if cfg.durable_post_value_weight:
                             pv1, pv2, _ = ac_model.forward_durable_value_pair(
                                 wb,
                                 dom,
@@ -2549,6 +2672,15 @@ class MacroCreditLearner:
                                 critic_revival_context=stacked_revs,
                                 validate=False,
                             )
+                        else:
+                            with torch.no_grad():
+                                pv1, pv2, _ = ac_model.forward_durable_value_pair(
+                                    wb,
+                                    dom,
+                                    None,
+                                    critic_revival_context=stacked_revs,
+                                    validate=False,
+                                )
                     if not bool((torch.isfinite(pv1).all() & torch.isfinite(pv2).all()).item()):
                         raise FloatingPointError("stateless post durable_value_pair forward is non-finite")
                     pl1 = F.smooth_l1_loss(pv1, stacked_targets, reduction="none")
@@ -2563,16 +2695,8 @@ class MacroCreditLearner:
                     else:
                         post_loss = 0.5 * (pl1.sum() + pl2.sum()) / denom_afterstate
                 else:
-                    if cfg.durable_post_value_weight:
-                        post_vals, _ = ac_model.forward_durable_value(
-                            wb,
-                            dom,
-                            None,
-                            critic_revival_context=stacked_revs,
-                            validate=False,
-                        )
-                    else:
-                        with torch.no_grad():
+                    with self._autocast_ctx():
+                        if cfg.durable_post_value_weight:
                             post_vals, _ = ac_model.forward_durable_value(
                                 wb,
                                 dom,
@@ -2580,6 +2704,15 @@ class MacroCreditLearner:
                                 critic_revival_context=stacked_revs,
                                 validate=False,
                             )
+                        else:
+                            with torch.no_grad():
+                                post_vals, _ = ac_model.forward_durable_value(
+                                    wb,
+                                    dom,
+                                    None,
+                                    critic_revival_context=stacked_revs,
+                                    validate=False,
+                                )
                     if not bool(torch.isfinite(post_vals).all().item()):
                         raise FloatingPointError("stateless post durable_value forward is non-finite")
                     post_loss = F.smooth_l1_loss(post_vals, stacked_targets, reduction="sum") / denom_afterstate
@@ -2817,8 +2950,11 @@ class MacroCreditLearner:
         cfg = self.config
         has_stage_base = bool(ac_model.actor_critic_config.enable_monotone_deconfounded_durable_value)
         has_twin = bool(ac_model.actor_critic_config.enable_twin_durable_value_heads)
-        durable_actor_active = self.update >= cfg.durable_warmup_updates
-        combat_actor_active = self.update >= cfg.combat_actor_warmup_updates
+        warmup_trunk_frozen = (
+            cfg.freeze_trunk_during_durable_warmup and self.update < cfg.durable_warmup_updates
+        )
+        durable_actor_active = (not warmup_trunk_frozen) and (self.update >= cfg.durable_warmup_updates)
+        combat_actor_active = (not warmup_trunk_frozen) and (self.update >= cfg.combat_actor_warmup_updates)
         totals = {
             key: 0.0
             for key in (
@@ -3130,16 +3266,17 @@ class MacroCreditLearner:
                 )
                 active_hidden = torch.stack([hidden_list[c] for c in active_c], dim=0)
                 active_rev = None if flat_step_rev_gpu is None else flat_step_rev_gpu[gids_gpu]
-                output = cast(
-                    HybridActorCriticOutput,
-                    ac_model(
-                        batch,
-                        active_hidden,
-                        critic_revival_context=active_rev,
-                        compute_durable_value=False,
-                        validate=False,
-                    ),
-                )
+                with self._autocast_ctx():
+                    output = cast(
+                        HybridActorCriticOutput,
+                        ac_model(
+                            batch,
+                            active_hidden,
+                            critic_revival_context=active_rev,
+                            compute_durable_value=False,
+                            validate=False,
+                        ),
+                    )
                 for k, c in enumerate(active_c):
                     hidden_list[c] = output.recurrent_state[k]
 
@@ -3192,30 +3329,42 @@ class MacroCreditLearner:
                     )
                     dur_rev = None if active_rev is None else active_rev[dur_k_gpu]
                     if has_twin:
-                        dv1_s, dv2_s, _ = ac_model.forward_durable_value_pair(
-                            dur_world_batch,
-                            batch.domain_ids[dur_k_gpu],
-                            active_hidden[dur_k_gpu],
-                            critic_revival_context=dur_rev,
-                            validate=False,
-                        )
-                        finite_ok = finite_ok & torch.isfinite(dv1_s).all() & torch.isfinite(dv2_s).all()
-                        durable_loss = (
-                            0.5
-                            * (
-                                F.smooth_l1_loss(dv1_s, flat_dur_target[dur_gids_gpu], reduction="sum")
-                                + F.smooth_l1_loss(dv2_s, flat_dur_target[dur_gids_gpu], reduction="sum")
+                        with self._autocast_ctx():
+                            dv1_s, dv2_s, _ = ac_model.forward_durable_value_pair(
+                                dur_world_batch,
+                                batch.domain_ids[dur_k_gpu],
+                                active_hidden[dur_k_gpu],
+                                critic_revival_context=dur_rev,
+                                validate=False,
                             )
-                            / denom_dur_val
-                        )
+                        finite_ok = finite_ok & torch.isfinite(dv1_s).all() & torch.isfinite(dv2_s).all()
+                        dl1_s = F.smooth_l1_loss(dv1_s, flat_dur_target[dur_gids_gpu], reduction="none")
+                        dl2_s = F.smooth_l1_loss(dv2_s, flat_dur_target[dur_gids_gpu], reduction="none")
+                        if twin_ref_weights is not None:
+                            dur_rids_gpu = torch.tensor(
+                                [chunk_slice[active_c[k]][0] for k in dur_k],
+                                device=self.device,
+                                dtype=torch.long,
+                            )
+                            durable_loss = (
+                                0.5
+                                * (
+                                    (twin_ref_weights[0][dur_rids_gpu] * dl1_s).sum()
+                                    + (twin_ref_weights[1][dur_rids_gpu] * dl2_s).sum()
+                                )
+                                / denom_dur_val
+                            )
+                        else:
+                            durable_loss = 0.5 * (dl1_s.sum() + dl2_s.sum()) / denom_dur_val
                     else:
-                        dur_vals, _ = ac_model.forward_durable_value(
-                            dur_world_batch,
-                            batch.domain_ids[dur_k_gpu],
-                            active_hidden[dur_k_gpu],
-                            critic_revival_context=dur_rev,
-                            validate=False,
-                        )
+                        with self._autocast_ctx():
+                            dur_vals, _ = ac_model.forward_durable_value(
+                                dur_world_batch,
+                                batch.domain_ids[dur_k_gpu],
+                                active_hidden[dur_k_gpu],
+                                critic_revival_context=dur_rev,
+                                validate=False,
+                            )
                         finite_ok = finite_ok & torch.isfinite(dur_vals).all()
                         durable_loss = (
                             F.smooth_l1_loss(
@@ -3269,6 +3418,7 @@ class MacroCreditLearner:
                     as_hiddens: list[Tensor] = []
                     as_revs: list[Tensor] = []
                     as_post_targets: list[Tensor] = []
+                    as_ref_ids: list[int] = []
                     as_act_k: list[int] = []
                     as_act_probs: list[Tensor] = []
                     as_cond_items: list[tuple[int, Tensor, Tensor]] = []
@@ -3295,6 +3445,7 @@ class MacroCreditLearner:
                                 if post_rev_gpu is not None:
                                     as_revs.append(post_rev_gpu)
                                 as_post_targets.append(post_target_gpu)
+                                as_ref_ids.append(ref_idx)
                             if durable_actor_active and as_t.projection.actor_enabled:
                                 if target_prob_gpu is not None:
                                     as_act_k.append(k)
@@ -3317,30 +3468,38 @@ class MacroCreditLearner:
                         stacked_as_revs = torch.stack(as_revs, dim=0) if as_revs else None
                         stacked_post_targets = torch.stack(as_post_targets, dim=0)
                         if has_twin:
-                            pv1_s, pv2_s, _ = ac_model.forward_durable_value_pair(
-                                world_batch,
-                                domain_ids,
-                                torch.stack(as_hiddens, dim=0),
-                                critic_revival_context=stacked_as_revs,
-                                validate=False,
-                            )
-                            finite_ok = finite_ok & torch.isfinite(pv1_s).all() & torch.isfinite(pv2_s).all()
-                            post_loss = (
-                                0.5
-                                * (
-                                    F.smooth_l1_loss(pv1_s, stacked_post_targets, reduction="sum")
-                                    + F.smooth_l1_loss(pv2_s, stacked_post_targets, reduction="sum")
+                            with self._autocast_ctx():
+                                pv1_s, pv2_s, _ = ac_model.forward_durable_value_pair(
+                                    world_batch,
+                                    domain_ids,
+                                    torch.stack(as_hiddens, dim=0),
+                                    critic_revival_context=stacked_as_revs,
+                                    validate=False,
                                 )
-                                / denom_afterstate
-                            )
+                            finite_ok = finite_ok & torch.isfinite(pv1_s).all() & torch.isfinite(pv2_s).all()
+                            pl1_s = F.smooth_l1_loss(pv1_s, stacked_post_targets, reduction="none")
+                            pl2_s = F.smooth_l1_loss(pv2_s, stacked_post_targets, reduction="none")
+                            if twin_ref_weights is not None:
+                                as_rids_gpu = torch.tensor(as_ref_ids, device=self.device, dtype=torch.long)
+                                post_loss = (
+                                    0.5
+                                    * (
+                                        (twin_ref_weights[0][as_rids_gpu] * pl1_s).sum()
+                                        + (twin_ref_weights[1][as_rids_gpu] * pl2_s).sum()
+                                    )
+                                    / denom_afterstate
+                                )
+                            else:
+                                post_loss = 0.5 * (pl1_s.sum() + pl2_s.sum()) / denom_afterstate
                         else:
-                            post_vals, _ = ac_model.forward_durable_value(
-                                world_batch,
-                                domain_ids,
-                                torch.stack(as_hiddens, dim=0),
-                                critic_revival_context=stacked_as_revs,
-                                validate=False,
-                            )
+                            with self._autocast_ctx():
+                                post_vals, _ = ac_model.forward_durable_value(
+                                    world_batch,
+                                    domain_ids,
+                                    torch.stack(as_hiddens, dim=0),
+                                    critic_revival_context=stacked_as_revs,
+                                    validate=False,
+                                )
                             finite_ok = finite_ok & torch.isfinite(post_vals).all()
                             post_loss = (
                                 F.smooth_l1_loss(
@@ -3926,16 +4085,17 @@ class MacroCreditLearner:
                 )
                 active_hidden = torch.stack([hidden_list[c] for c in active_c], dim=0)
                 active_rev = None if flat_step_rev_gpu is None else flat_step_rev_gpu[gids_gpu]
-                output = cast(
-                    HybridActorCriticOutput,
-                    ac_model(
-                        batch,
-                        active_hidden,
-                        critic_revival_context=active_rev,
-                        compute_durable_value=False,
-                        validate=False,
-                    ),
-                )
+                with self._autocast_ctx():
+                    output = cast(
+                        HybridActorCriticOutput,
+                        ac_model(
+                            batch,
+                            active_hidden,
+                            critic_revival_context=active_rev,
+                            compute_durable_value=False,
+                            validate=False,
+                        ),
+                    )
                 for k, c in enumerate(active_c):
                     hidden_list[c] = output.recurrent_state[k]
 
@@ -4561,6 +4721,8 @@ class MacroCreditLearner:
         self,
         prepared_items: Sequence[_PreparedReference],
         denominators: Mapping[str, int],
+        *,
+        packed_cache: dict[tuple[int, int], _CachedEvalGroup] | None = None,
     ) -> tuple[float, float, int]:
         nat_items = [it for it in prepared_items if it.root is None]
         if not nat_items:
@@ -4580,6 +4742,7 @@ class MacroCreditLearner:
                 check_likelihood=False,
                 record_all_choice_logs=want_combat,
                 compute_durable_value=False,
+                packed_cache=packed_cache,
             )
         else:
             post_evals = [
@@ -4650,7 +4813,7 @@ class MacroCreditLearner:
         gen = torch.Generator(device="cpu")
         gen.manual_seed(20261117 + self.update * 997 + epoch_idx * 37 + mb_idx)
         bits = torch.randint(0, 2, (2, count), generator=gen, dtype=torch.long)
-        weights = (0.5 + bits.to(dtype=self.dtype)).to(device=self.device)
+        weights = (0.35 + 1.30 * bits.to(dtype=self.dtype)).to(device=self.device)
         return weights[0], weights[1]
 
     def learn(self, cohort: MacroCreditCohort, *, resource_guard: Callable[[], None] | None = None) -> dict[str, Any]:
@@ -4685,7 +4848,15 @@ class MacroCreditLearner:
             if in_stage_a
             else ("on_policy_kickstart" if in_stage_b else "pure_rl")
         )
-        if in_stage_b:
+        warmup_trunk_frozen = (
+            (not in_stage_a)
+            and self.config.target_mode == "durable_afterstate_v2"
+            and self.config.freeze_trunk_during_durable_warmup
+            and (self.update < self.config.durable_warmup_updates)
+        )
+        if warmup_trunk_frozen:
+            effective_kickstart_kl_weight = 0.0
+        elif in_stage_b:
             ks_span = max(
                 1,
                 self.config.distill_total_updates - self.config.distill_teacher_rollout_updates,
@@ -4732,84 +4903,92 @@ class MacroCreditLearner:
         target_calls = 0
         maximum_error = 0.0
         kickstart_teacher_logs: list[dict[int, Tensor]] | None = None
-        if in_stage_a:
-            assert self.teacher_model is not None
-            if self.config.eval_batch_size > 1 and len(cohort.natural_only) > 1:
-                batch_items, batch_calls, batch_error = self._prepare_durable_natural_batch(
-                    cohort.natural_only,
-                    model_override=self.teacher_model,
-                    check_likelihood=True,
-                    record_all_choice_logs=True,
-                )
-                prepared.extend(batch_items)
-                target_calls += batch_calls
-                maximum_error = max(maximum_error, batch_error)
-            else:
-                for reference in cohort.natural_only:
-                    item, calls, error = self._prepare_durable_natural(
-                        reference,
+        eval_packed_cache: dict[tuple[int, int], _CachedEvalGroup] = {}
+        try:
+            if in_stage_a:
+                assert self.teacher_model is not None
+                if self.config.eval_batch_size > 1 and len(cohort.natural_only) > 1:
+                    batch_items, batch_calls, batch_error = self._prepare_durable_natural_batch(
+                        cohort.natural_only,
                         model_override=self.teacher_model,
                         check_likelihood=True,
                         record_all_choice_logs=True,
+                        packed_cache=eval_packed_cache,
                     )
-                    prepared.append(item)
-                    target_calls += calls
-                    maximum_error = max(maximum_error, error)
-        else:
-            for root in cohort.roots:
-                item, calls, error = self._prepare(root)
-                prepared.append(item)
-                target_calls += calls
-                maximum_error = max(maximum_error, error)
-            if (
-                self.config.target_mode == "durable_afterstate_v2"
-                and self.config.eval_batch_size > 1
-                and len(cohort.natural_only) > 1
-            ):
-                batch_items, batch_calls, batch_error = self._prepare_durable_natural_batch(
-                    cohort.natural_only,
-                    record_all_choice_logs=self._need_all_choice_logs(),
-                )
-                prepared.extend(batch_items)
-                target_calls += batch_calls
-                maximum_error = max(maximum_error, batch_error)
-            else:
-                for reference in cohort.natural_only:
-                    item, calls, error = self._prepare_natural(reference)
-                    prepared.append(item)
-                    target_calls += calls
-                    maximum_error = max(maximum_error, error)
-            if (
-                effective_kickstart_kl_weight > 0.0
-                and self.teacher_model is not None
-                and cohort.natural_only
-            ):
-                assert self.teacher_model is not None
-                if self.config.eval_batch_size > 1 and len(cohort.natural_only) > 1:
-                    t_evals = self._evaluate_durable_batch(
-                        cohort.natural_only,
-                        model_override=self.teacher_model,
-                        check_likelihood=False,
-                        record_all_choice_logs=True,
-                        compute_durable_value=False,
-                    )
+                    prepared.extend(batch_items)
+                    target_calls += batch_calls
+                    maximum_error = max(maximum_error, batch_error)
                 else:
-                    t_evals = [
-                        self._evaluate(
-                            ref,
-                            root_index=-1,
+                    for reference in cohort.natural_only:
+                        item, calls, error = self._prepare_durable_natural(
+                            reference,
+                            model_override=self.teacher_model,
+                            check_likelihood=True,
+                            record_all_choice_logs=True,
+                        )
+                        prepared.append(item)
+                        target_calls += calls
+                        maximum_error = max(maximum_error, error)
+            else:
+                for root in cohort.roots:
+                    item, calls, error = self._prepare(root)
+                    prepared.append(item)
+                    target_calls += calls
+                    maximum_error = max(maximum_error, error)
+                if (
+                    self.config.target_mode == "durable_afterstate_v2"
+                    and self.config.eval_batch_size > 1
+                    and len(cohort.natural_only) > 1
+                ):
+                    batch_items, batch_calls, batch_error = self._prepare_durable_natural_batch(
+                        cohort.natural_only,
+                        record_all_choice_logs=self._need_all_choice_logs(),
+                        packed_cache=eval_packed_cache,
+                    )
+                    prepared.extend(batch_items)
+                    target_calls += batch_calls
+                    maximum_error = max(maximum_error, batch_error)
+                else:
+                    for reference in cohort.natural_only:
+                        item, calls, error = self._prepare_natural(reference)
+                        prepared.append(item)
+                        target_calls += calls
+                        maximum_error = max(maximum_error, error)
+                if (
+                    effective_kickstart_kl_weight > 0.0
+                    and self.teacher_model is not None
+                    and cohort.natural_only
+                ):
+                    assert self.teacher_model is not None
+                    if self.config.eval_batch_size > 1 and len(cohort.natural_only) > 1:
+                        t_evals = self._evaluate_durable_batch(
+                            cohort.natural_only,
                             model_override=self.teacher_model,
                             check_likelihood=False,
                             record_all_choice_logs=True,
                             compute_durable_value=False,
+                            packed_cache=eval_packed_cache,
                         )
-                        for ref in cohort.natural_only
+                    else:
+                        t_evals = [
+                            self._evaluate(
+                                ref,
+                                root_index=-1,
+                                model_override=self.teacher_model,
+                                check_likelihood=False,
+                                record_all_choice_logs=True,
+                                compute_durable_value=False,
+                            )
+                            for ref in cohort.natural_only
+                        ]
+                    target_calls += sum(ev.forward_calls for ev in t_evals)
+                    kickstart_teacher_logs = [
+                        cast(dict[int, Tensor], ev.step_log_probs) for ev in t_evals
                     ]
-                target_calls += sum(ev.forward_calls for ev in t_evals)
-                kickstart_teacher_logs = [
-                    cast(dict[int, Tensor], ev.step_log_probs) for ev in t_evals
-                ]
-        before = [parameter.detach().cpu().clone() for parameter in self._parameters]
+        except BaseException:
+            eval_packed_cache.clear()
+            raise
+        before = [parameter.detach().clone() for parameter in self._parameters]
         totals = {
             key: 0.0
             for key in (
@@ -4843,10 +5022,18 @@ class MacroCreditLearner:
         executed_forward_steps = 0
         post_macro_kl = 0.0
         post_combat_kl = 0.0
+        raw_post_macro_kl = 0.0
+        line_search_scale = 1.0
+        line_search_backtracks = 0
+        saved_req_grads: list[bool] | None = None
         # This remains set through ALL post-step validation/CPU copies/metrics,
         # including BaseException interruptions. Only complete success clears it.
         self._failed = True
         try:
+            if warmup_trunk_frozen:
+                saved_req_grads = [p.requires_grad for p in self._parameters]
+                for p, is_pure_val in zip(self._parameters, self._is_pure_value_param, strict=True):
+                    p.requires_grad_(is_pure_val)
             if in_stage_a:
                 total_bw_chunks = 0.0
                 gradient_norm_val = 0.0
@@ -4863,6 +5050,7 @@ class MacroCreditLearner:
                             check_likelihood=False,
                             record_all_choice_logs=False,
                             compute_durable_value=False,
+                            packed_cache=eval_packed_cache,
                         )
                     else:
                         s_evals = [
@@ -5041,23 +5229,92 @@ class MacroCreditLearner:
                         + denominators["combat_steps"]
                         + (denominators["afterstate_steps"] if self.config.target_mode == "durable_afterstate_v2" else 0)
                     )
-                if self.config.target_mode == "durable_afterstate_v2" and prepared:
+                if (
+                    self.config.target_mode == "durable_afterstate_v2"
+                    and prepared
+                    and not warmup_trunk_frozen
+                ):
                     post_macro_kl, post_combat_kl, post_kl_calls = self._measure_updated_durable_kl(
-                        prepared, denominators
+                        prepared,
+                        denominators,
+                        packed_cache=eval_packed_cache,
                     )
                     target_calls += post_kl_calls
+                    raw_post_macro_kl = post_macro_kl
+                    if (
+                        self.config.enable_post_step_kl_line_search
+                        and self.update >= self.config.durable_warmup_updates
+                        and self.config.target_macro_step_kl > 0.0
+                        and post_macro_kl > self.config.target_macro_step_kl
+                        and self.config.line_search_max_backtracks > 0
+                    ):
+                        policy_trunk_pairs = [
+                            (p, b, (p.detach() - b).clone())
+                            for p, b, is_pure_val in zip(
+                                self._parameters,
+                                before,
+                                self._is_pure_value_param,
+                                strict=True,
+                            )
+                            if not is_pure_val
+                        ]
+                        for _ in range(self.config.line_search_max_backtracks):
+                            ratio = min(
+                                0.75,
+                                0.90
+                                * math.sqrt(
+                                    self.config.target_macro_step_kl / max(post_macro_kl, 1e-12)
+                                ),
+                            )
+                            next_scale = max(
+                                self.config.line_search_min_scale,
+                                line_search_scale * ratio,
+                            )
+                            if next_scale >= line_search_scale - 1e-6:
+                                break
+                            line_search_scale = next_scale
+                            line_search_backtracks += 1
+                            with torch.no_grad():
+                                for p, b, d in policy_trunk_pairs:
+                                    p.copy_(b + d * line_search_scale)
+                            post_macro_kl, post_combat_kl, ls_calls = self._measure_updated_durable_kl(
+                                prepared,
+                                denominators,
+                                packed_cache=eval_packed_cache,
+                            )
+                            target_calls += ls_calls
+                            if (
+                                post_macro_kl <= self.config.target_macro_step_kl
+                                or line_search_scale <= self.config.line_search_min_scale + 1e-9
+                            ):
+                                break
         except BaseException:
             self.optimizer.zero_grad(set_to_none=True)
             self._failed = True
             raise
-        delta_squared = sum(float((parameter.detach().cpu().double() - previous.double()).square().sum().item())
-                            for parameter, previous in zip(self._parameters, before, strict=True))
+        finally:
+            if saved_req_grads is not None:
+                for p, req in zip(self._parameters, saved_req_grads, strict=True):
+                    p.requires_grad_(req)
+            eval_packed_cache.clear()
+        delta_squared = sum(
+            float((parameter.detach().double() - previous.double()).square().sum().item())
+            for parameter, previous in zip(self._parameters, before, strict=True)
+        )
         prior_update = self.update
         self.update += 1
         cfg = self.config
         is_durable_v2 = cfg.target_mode == "durable_afterstate_v2"
-        durable_actor_active = in_stage_a or (not is_durable_v2) or (prior_update >= cfg.durable_warmup_updates)
-        combat_actor_active = in_stage_a or (not is_durable_v2) or (prior_update >= cfg.combat_actor_warmup_updates)
+        durable_actor_active = (
+            in_stage_a
+            or (not is_durable_v2)
+            or ((not warmup_trunk_frozen) and prior_update >= cfg.durable_warmup_updates)
+        )
+        combat_actor_active = (
+            in_stage_a
+            or (not is_durable_v2)
+            or ((not warmup_trunk_frozen) and prior_update >= cfg.combat_actor_warmup_updates)
+        )
         if in_stage_a:
             macro_loss = (
                 cfg.distill_policy_kl_weight * cfg.macro_policy_weight * totals["macro_policy_loss"]
@@ -5124,6 +5381,10 @@ class MacroCreditLearner:
             "distill_epochs_executed": distill_epochs_executed,
             "ppo_optimizer_steps_executed": ppo_optimizer_steps_executed,
             "ppo_kl_early_stopped": ppo_kl_early_stopped,
+            "warmup_trunk_frozen": warmup_trunk_frozen,
+            "raw_updated_macro_policy_kl": raw_post_macro_kl,
+            "line_search_scale": line_search_scale,
+            "line_search_backtracks": line_search_backtracks,
             "effective_kickstart_kl_weight": effective_kickstart_kl_weight,
             "durable_actor_active": durable_actor_active,
             "combat_actor_active": combat_actor_active,

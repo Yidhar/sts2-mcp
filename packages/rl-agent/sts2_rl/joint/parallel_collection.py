@@ -61,6 +61,7 @@ class BatchedPolicyInferenceServer:
         max_batch_size: int = 48,
         linger_seconds: float = 0.0008,
         allow_tf32: bool = False,
+        enable_bf16_amp: bool = False,
     ) -> None:
         if max_batch_size < 1:
             raise ValueError("max_batch_size must be at least 1")
@@ -70,6 +71,7 @@ class BatchedPolicyInferenceServer:
         self.encoding_config = encoding_config
         self.device = device
         self.allow_tf32 = bool(allow_tf32)
+        self.enable_bf16_amp = bool(enable_bf16_amp)
         if self.device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = self.allow_tf32
             torch.backends.cudnn.allow_tf32 = self.allow_tf32
@@ -276,15 +278,21 @@ class BatchedPolicyInferenceServer:
                     )
                 else:
                     hidden_gpu = hid_t.to(device=self.device, dtype=model_dtype)
-                if isinstance(self.model, HybridDomainActorCriticModel):
-                    output = self.model(
-                        encoded,
-                        hidden_gpu,
-                        compute_durable_value=False,
-                        validate=False,
-                    )
-                else:
-                    output = self.model(encoded, hidden_gpu, validate=False)
+                use_bf16 = self.enable_bf16_amp and self.device.type == "cuda"
+                with torch.autocast(
+                    device_type="cuda",
+                    dtype=torch.bfloat16,
+                    enabled=use_bf16,
+                ):
+                    if isinstance(self.model, HybridDomainActorCriticModel):
+                        output = self.model(
+                            encoded,
+                            hidden_gpu,
+                            compute_durable_value=False,
+                            validate=False,
+                        )
+                    else:
+                        output = self.model(encoded, hidden_gpu, validate=False)
                 logits_cpu = output.policy_logits.detach().to(
                     device="cpu", dtype=torch.float32
                 ).numpy()
@@ -467,6 +475,7 @@ class PersistentRolloutWorkerPool:
         max_inference_batch_size: int = 48,
         inference_linger_seconds: float = 0.0008,
         allow_tf32: bool = False,
+        enable_bf16_amp: bool = False,
     ) -> None:
         if num_workers < 1:
             raise ValueError("num_workers must be positive")
@@ -492,6 +501,7 @@ class PersistentRolloutWorkerPool:
             max_batch_size=max(max_inference_batch_size, self.num_workers),
             linger_seconds=inference_linger_seconds,
             allow_tf32=allow_tf32,
+            enable_bf16_amp=enable_bf16_amp,
         )
         self._processes = []
         for worker_id in range(self.num_workers):

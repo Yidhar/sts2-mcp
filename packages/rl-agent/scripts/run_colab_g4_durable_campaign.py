@@ -123,6 +123,7 @@ def sync_campaign_to_drive(
     snapshot_interval: int = 5,
     latest_probe: dict[str, Any] | None = None,
     latest_heldout: dict[str, Any] | None = None,
+    latest_extra_heldout: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Atomically mirror resumable campaign state from local NVMe to Google Drive."""
     checkpoint_src = output_dir / "checkpoint.pt"
@@ -144,6 +145,8 @@ def sync_campaign_to_drive(
         src_file = output_dir / rel_name
         if src_file.is_file():
             _atomic_copy_file(src_file, drive_dir / rel_name, verify_sha256=False)
+    for extra_eval_src in sorted(output_dir.glob("heldout_evaluations_b*.jsonl")):
+        _atomic_copy_file(extra_eval_src, drive_dir / extra_eval_src.name, verify_sha256=False)
 
     cohorts_src = output_dir / "cohorts"
     latest_update_payload: dict[str, Any] | None = None
@@ -182,6 +185,9 @@ def sync_campaign_to_drive(
                 _atomic_write_json(snap_dir / "probe.json", latest_probe)
             if latest_heldout is not None:
                 _atomic_write_json(snap_dir / "heldout.json", latest_heldout)
+            if latest_extra_heldout is not None:
+                eb = latest_extra_heldout.get("revival_budget", "extra")
+                _atomic_write_json(snap_dir / f"heldout_b{eb}.json", latest_extra_heldout)
             snapshot_saved = True
 
     manifest = {
@@ -200,6 +206,7 @@ def sync_campaign_to_drive(
         ),
         "latest_probe": latest_probe,
         "latest_heldout": latest_heldout,
+        "latest_extra_heldout": latest_extra_heldout,
     }
     _atomic_write_json(drive_dir / "sync_manifest.json", manifest)
     return manifest
@@ -234,6 +241,8 @@ def restore_campaign_from_drive(drive_dir: Path, output_dir: Path) -> dict[str, 
         src_file = drive_dir / rel_name
         if src_file.is_file():
             _atomic_copy_file(src_file, output_dir / rel_name, verify_sha256=rel_name == "publication.pt")
+    for extra_eval_src in sorted(drive_dir.glob("heldout_evaluations_b*.jsonl")):
+        _atomic_copy_file(extra_eval_src, output_dir / extra_eval_src.name, verify_sha256=False)
 
     drive_cohorts = drive_dir / "cohorts"
     if drive_cohorts.is_dir():
@@ -297,8 +306,8 @@ def _run_competence_probes(
     return payload
 
 
-def _existing_heldout_gates(output_dir: Path) -> set[int]:
-    path = output_dir / "heldout_evaluations.jsonl"
+def _existing_heldout_gates(output_dir: Path, filename: str = "heldout_evaluations.jsonl") -> set[int]:
+    path = output_dir / filename
     if not path.is_file():
         return set()
     gates: set[int] = set()
@@ -314,6 +323,21 @@ def _existing_heldout_gates(output_dir: Path) -> set[int]:
     return gates
 
 
+def _parse_milestones(raw: str) -> set[int]:
+    if not raw or not raw.strip():
+        return set()
+    out: set[int] = set()
+    for part in raw.split(","):
+        tok = part.strip()
+        if not tok:
+            continue
+        val = int(tok)
+        if val < 0:
+            raise ValueError(f"held-out milestone must be >= 0, got {val}")
+        out.add(val)
+    return out
+
+
 def _run_heldout_evaluation(
     *,
     python_exe: str,
@@ -326,13 +350,15 @@ def _run_heldout_evaluation(
     env: dict[str, str],
     sim_exe: Path | None = None,
     overrides: Sequence[str] = (),
+    publication_override: Path | None = None,
 ) -> dict[str, Any]:
+    pub_path = publication_override if publication_override is not None else (output_dir / "publication.pt")
     cmd = [
         python_exe,
         "-m",
         "sts2_rl.macro_heldout_eval",
         "--publication",
-        str(output_dir / "publication.pt"),
+        str(pub_path),
         "--config",
         str(config_path),
         "--policy-version",
@@ -373,6 +399,8 @@ def _probe_prune_and_sync(
     keep_recent_cohorts: int,
     config_path: Path | None = None,
     heldout_eval_interval: int = 0,
+    heldout_eval_milestones: set[int] | None = None,
+    extra_heldout_revival_budget: int = 0,
     heldout_eval_episodes: int = 48,
     heldout_eval_workers: int = 24,
     sim_exe: Path | None = None,
@@ -391,27 +419,55 @@ def _probe_prune_and_sync(
     }
     _append_jsonl(output_dir / "probe_metrics.jsonl", probe_entry)
 
-    heldout_entry: dict[str, Any] | None = None
-    if (
+    milestone_hit = bool(heldout_eval_milestones and committed_after in heldout_eval_milestones)
+    interval_hit = bool(
         heldout_eval_interval > 0
-        and config_path is not None
         and committed_after > 0
         and (committed_after == 1 or committed_after % heldout_eval_interval == 0)
-        and committed_after not in _existing_heldout_gates(output_dir)
-    ):
-        heldout_entry = _run_heldout_evaluation(
-            python_exe=sys.executable,
-            output_dir=output_dir,
-            config_path=config_path,
-            committed_after=committed_after,
-            episodes=heldout_eval_episodes,
-            workers=heldout_eval_workers,
-            device=device,
-            env=env,
-            sim_exe=sim_exe,
-            overrides=overrides,
-        )
-        _append_jsonl(output_dir / "heldout_evaluations.jsonl", heldout_entry)
+    )
+    should_eval_heldout = (
+        config_path is not None
+        and committed_after > 0
+        and (milestone_hit or interval_hit)
+    )
+    heldout_entry: dict[str, Any] | None = None
+    extra_heldout_entry: dict[str, Any] | None = None
+    if should_eval_heldout and config_path is not None:
+        if committed_after not in _existing_heldout_gates(output_dir):
+            heldout_entry = _run_heldout_evaluation(
+                python_exe=sys.executable,
+                output_dir=output_dir,
+                config_path=config_path,
+                committed_after=committed_after,
+                episodes=heldout_eval_episodes,
+                workers=heldout_eval_workers,
+                device=device,
+                env=env,
+                sim_exe=sim_exe,
+                overrides=overrides,
+            )
+            _append_jsonl(output_dir / "heldout_evaluations.jsonl", heldout_entry)
+        if extra_heldout_revival_budget > 0:
+            extra_fname = f"heldout_evaluations_b{extra_heldout_revival_budget}.jsonl"
+            if committed_after not in _existing_heldout_gates(output_dir, extra_fname):
+                extra_overrides = [
+                    *overrides,
+                    f"learner.revival_budget={extra_heldout_revival_budget}",
+                    f"training.curriculum.revival_budget={extra_heldout_revival_budget}",
+                ]
+                extra_heldout_entry = _run_heldout_evaluation(
+                    python_exe=sys.executable,
+                    output_dir=output_dir,
+                    config_path=config_path,
+                    committed_after=committed_after,
+                    episodes=heldout_eval_episodes,
+                    workers=heldout_eval_workers,
+                    device=device,
+                    env=env,
+                    sim_exe=sim_exe,
+                    overrides=extra_overrides,
+                )
+                _append_jsonl(output_dir / extra_fname, extra_heldout_entry)
 
     pruned_bytes = prune_old_raw_cohort_traces(
         output_dir,
@@ -436,11 +492,23 @@ def _probe_prune_and_sync(
     if heldout_entry is not None:
         history_entry["heldout_evaluation"] = {
             "episodes": heldout_entry["episodes"],
+            "revival_budget": heldout_entry.get("revival_budget"),
             "run_win_rate": heldout_entry["run_win_rate"],
             "act1_clear_rate": heldout_entry["act1_clear_rate"],
             "act3_reach_rate": heldout_entry["act3_reach_rate"],
             "skip_rate": heldout_entry.get("skip_rate"),
             "mean_final_deck_size": heldout_entry.get("mean_final_deck_size"),
+        }
+    if extra_heldout_entry is not None:
+        eb = extra_heldout_entry.get("revival_budget", extra_heldout_revival_budget)
+        history_entry[f"heldout_evaluation_b{eb}"] = {
+            "episodes": extra_heldout_entry["episodes"],
+            "revival_budget": eb,
+            "run_win_rate": extra_heldout_entry["run_win_rate"],
+            "act1_clear_rate": extra_heldout_entry["act1_clear_rate"],
+            "act3_reach_rate": extra_heldout_entry["act3_reach_rate"],
+            "skip_rate": extra_heldout_entry.get("skip_rate"),
+            "mean_final_deck_size": extra_heldout_entry.get("mean_final_deck_size"),
         }
     _append_jsonl(output_dir / "campaign_history.jsonl", history_entry)
 
@@ -451,6 +519,7 @@ def _probe_prune_and_sync(
         snapshot_interval=snapshot_interval,
         latest_probe=probe_entry,
         latest_heldout=heldout_entry,
+        latest_extra_heldout=extra_heldout_entry,
     )
     log_payload: dict[str, Any] = {
         "event": "chunk_committed_and_synced",
@@ -468,6 +537,11 @@ def _probe_prune_and_sync(
         log_payload["heldout_win_rate"] = heldout_entry["run_win_rate"]
         log_payload["heldout_skip_rate"] = heldout_entry.get("skip_rate")
         log_payload["heldout_mean_deck_size"] = heldout_entry.get("mean_final_deck_size")
+    if extra_heldout_entry is not None:
+        eb = extra_heldout_entry.get("revival_budget", extra_heldout_revival_budget)
+        log_payload[f"heldout_b{eb}_win_rate"] = extra_heldout_entry["run_win_rate"]
+        log_payload[f"heldout_b{eb}_skip_rate"] = extra_heldout_entry.get("skip_rate")
+        log_payload[f"heldout_b{eb}_mean_deck_size"] = extra_heldout_entry.get("mean_final_deck_size")
     print(json.dumps(log_payload, sort_keys=True), flush=True)
     return sync_manifest
 
@@ -518,6 +592,27 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--snapshot-interval", type=int, default=5)
     parser.add_argument("--keep-raw-trace-cohorts", type=int, default=2)
     parser.add_argument("--heldout-eval-interval", type=int, default=0)
+    parser.add_argument(
+        "--heldout-eval-milestones",
+        default="",
+        help="optional comma-separated update milestones for held-out evaluation (e.g. '0,5,10,20,30,40')",
+    )
+    parser.add_argument(
+        "--extra-heldout-revival-budget",
+        type=int,
+        default=0,
+        help="optional secondary revival_budget (e.g. 16) to evaluate alongside primary held-out gates",
+    )
+    parser.add_argument(
+        "--seed-heldout-json",
+        type=Path,
+        help="optional pre-verified u=0 held-out JSON summary to seed into heldout_evaluations.jsonl",
+    )
+    parser.add_argument(
+        "--seed-extra-heldout-json",
+        type=Path,
+        help="optional pre-verified u=0 secondary held-out JSON summary to seed into heldout_evaluations_bN.jsonl",
+    )
     parser.add_argument("--heldout-eval-episodes", type=int, default=48)
     parser.add_argument("--heldout-eval-workers", type=int, default=24)
     parser.add_argument("--set", action="append", default=[], dest="overrides", metavar="KEY=TOML_VALUE")
@@ -637,6 +732,11 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
                 env["PATH"] = f"{candidate_dotnet}{os.pathsep}{env.get('PATH', '')}"
                 break
 
+    heldout_milestones = _parse_milestones(args.heldout_eval_milestones)
+    extra_heldout_budget = int(args.extra_heldout_revival_budget)
+    if extra_heldout_budget < 0:
+        raise ValueError("--extra-heldout-revival-budget must be >= 0")
+
     drive_synced_update = (
         int(json.loads((drive_dir / "sync_manifest.json").read_text(encoding="utf-8")).get("committed_update", 0))
         if (drive_dir / "sync_manifest.json").is_file()
@@ -656,11 +756,93 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
             keep_recent_cohorts=args.keep_raw_trace_cohorts,
             config_path=config_path,
             heldout_eval_interval=args.heldout_eval_interval,
+            heldout_eval_milestones=heldout_milestones,
+            extra_heldout_revival_budget=extra_heldout_budget,
             heldout_eval_episodes=args.heldout_eval_episodes,
             heldout_eval_workers=args.heldout_eval_workers,
             sim_exe=args.sim_exe,
             overrides=args.overrides,
         )
+
+    pending_u0_primary: dict[str, Any] | None = None
+    pending_u0_extra: dict[str, Any] | None = None
+    if args.seed_heldout_json is not None and 0 not in _existing_heldout_gates(output_dir):
+        seed_p_path = resolve_external_input_path(args.seed_heldout_json, root=root)
+        pending_u0_primary = json.loads(seed_p_path.read_text(encoding="utf-8"))
+        if output_dir.is_dir():
+            _append_jsonl(output_dir / "heldout_evaluations.jsonl", pending_u0_primary)
+            pending_u0_primary = None
+    if (
+        args.seed_extra_heldout_json is not None
+        and extra_heldout_budget > 0
+        and 0 not in _existing_heldout_gates(output_dir, f"heldout_evaluations_b{extra_heldout_budget}.jsonl")
+    ):
+        seed_e_path = resolve_external_input_path(args.seed_extra_heldout_json, root=root)
+        pending_u0_extra = json.loads(seed_e_path.read_text(encoding="utf-8"))
+        if output_dir.is_dir():
+            _append_jsonl(
+                output_dir / f"heldout_evaluations_b{extra_heldout_budget}.jsonl",
+                pending_u0_extra,
+            )
+            pending_u0_extra = None
+
+    u0_pub_source = (
+        macro_source
+        if macro_source is not None
+        else (output_dir / "publication.pt" if (output_dir / "publication.pt").is_file() else explicit_teacher)
+    )
+    if (
+        0 in heldout_milestones
+        and local_initial_update == 0
+        and u0_pub_source is not None
+        and u0_pub_source.is_file()
+    ):
+        need_u0_primary = (pending_u0_primary is None) and (0 not in _existing_heldout_gates(output_dir))
+        extra_u0_fname = f"heldout_evaluations_b{extra_heldout_budget}.jsonl"
+        need_u0_extra = (
+            extra_heldout_budget > 0
+            and (pending_u0_extra is None)
+            and (0 not in _existing_heldout_gates(output_dir, extra_u0_fname))
+        )
+        if need_u0_primary:
+            pending_u0_primary = _run_heldout_evaluation(
+                python_exe=sys.executable,
+                output_dir=output_dir,
+                config_path=config_path,
+                committed_after=0,
+                episodes=args.heldout_eval_episodes,
+                workers=args.heldout_eval_workers,
+                device=args.device,
+                env=env,
+                sim_exe=args.sim_exe,
+                overrides=args.overrides,
+                publication_override=u0_pub_source,
+            )
+            if output_dir.is_dir():
+                _append_jsonl(output_dir / "heldout_evaluations.jsonl", pending_u0_primary)
+                pending_u0_primary = None
+        if need_u0_extra:
+            extra_u0_overrides = [
+                *args.overrides,
+                f"learner.revival_budget={extra_heldout_budget}",
+                f"training.curriculum.revival_budget={extra_heldout_budget}",
+            ]
+            pending_u0_extra = _run_heldout_evaluation(
+                python_exe=sys.executable,
+                output_dir=output_dir,
+                config_path=config_path,
+                committed_after=0,
+                episodes=args.heldout_eval_episodes,
+                workers=args.heldout_eval_workers,
+                device=args.device,
+                env=env,
+                sim_exe=args.sim_exe,
+                overrides=extra_u0_overrides,
+                publication_override=u0_pub_source,
+            )
+            if output_dir.is_dir():
+                _append_jsonl(output_dir / extra_u0_fname, pending_u0_extra)
+                pending_u0_extra = None
 
     while True:
         if local_ckpt.is_file():
@@ -705,6 +887,9 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
                     if current_update == 0
                     else ((current_update // args.heldout_eval_interval) + 1) * args.heldout_eval_interval
                 )
+            for hm in heldout_milestones:
+                if hm > current_update:
+                    milestones.append(hm)
             if milestones:
                 chunk_updates = min(chunk_updates, max(1, min(milestones) - current_update))
         cmd = [
@@ -783,6 +968,15 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
         train_lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
         train_summary = json.loads(train_lines[-1]) if train_lines else {}
         committed_after = _read_committed_update(output_dir)
+        if pending_u0_primary is not None:
+            _append_jsonl(output_dir / "heldout_evaluations.jsonl", pending_u0_primary)
+            pending_u0_primary = None
+        if pending_u0_extra is not None and extra_heldout_budget > 0:
+            _append_jsonl(
+                output_dir / f"heldout_evaluations_b{extra_heldout_budget}.jsonl",
+                pending_u0_extra,
+            )
+            pending_u0_extra = None
 
         _probe_prune_and_sync(
             output_dir=output_dir,
@@ -796,6 +990,8 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
             keep_recent_cohorts=args.keep_raw_trace_cohorts,
             config_path=config_path,
             heldout_eval_interval=args.heldout_eval_interval,
+            heldout_eval_milestones=heldout_milestones,
+            extra_heldout_revival_budget=extra_heldout_budget,
             heldout_eval_episodes=args.heldout_eval_episodes,
             heldout_eval_workers=args.heldout_eval_workers,
             sim_exe=args.sim_exe,

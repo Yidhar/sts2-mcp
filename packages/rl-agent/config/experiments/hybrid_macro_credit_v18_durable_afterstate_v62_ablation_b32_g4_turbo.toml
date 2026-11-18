@@ -1,0 +1,156 @@
+# Durable Afterstate Macro Credit v6.2-ablation (b32) — Controlled Ablation from v5.2 u=125
+# Build-Conditioned Monotone & Shop-Aware Twin Critic (durable_v11, d_model=256)
+# + Strict Lossless 5-Update Frozen-Trunk Value Warmup + Single Full-Cohort Exact Backward
+# + Post-Step Macro KL Backtracking Line Search (target_macro_step_kl = 0.012)
+# + Blackwell bfloat16 Tensor Core AMP (revival_budget = 32):
+# 1. Isolates algorithm & architecture upgrades against v5.2's u=125 -> u=160 collapse window on b32
+#    (u=125 held-out baseline: 62.5% [30/48] on b32, 22.9% [11/48] on b16, 38.8% card skip rate).
+# 2. Freezes trunk + both actors (requires_grad=False on all non-pure-value params) for u=1..5 so
+#    u=5 policy logits remain bit-for-bit identical to u=0 while Twin/Shop/Build-Conditioned value heads calibrate.
+# 3. Replaces stale-boundary 4-minibatch splitting with exact single full-cohort backward + GPU post-step
+#    macro KL backtracking line search (D_KL <= 0.012) + moderate u=125 teacher KL floor (0.035).
+# 4. Enables Blackwell bfloat16 autocast on Transformer attention/FFNs while keeping GRU cells,
+#    monotone/shop value readouts, log_softmax, and MPO projections in exact FP32/FP64.
+version = "sts2-synchronous-macro-credit-course-v1"
+
+[course]
+roots_per_cohort = 48
+seed_index_offset = 500000
+parallel_collectors = 48
+macro_branch_epsilon = 0.04
+maximum_root_snapshot_bytes = 536870912
+maximum_cohort_snapshot_bytes = 8589934592
+maximum_root_seconds = 3600.0
+maximum_cohort_seconds = 7200.0
+maximum_output_bytes = 68719476736
+minimum_free_disk_bytes = 2147483648
+
+[branches]
+root_surface = "reward"
+root_occurrence = 1
+continuation_macro_decisions = 0
+terminal_only = true
+max_native_steps = 8192
+max_candidates = 128
+timeout_seconds = 1200.0
+max_trace_bytes = 536870912
+policy_atol = 0.000001
+policy_rtol = 0.00001
+
+[learner]
+target_mode = "durable_afterstate_v2"
+domain_layers = 2
+joint_layers = 3
+enable_direct_vitals_context = true
+enable_macro_branch_prior = true
+enable_persistent_only_durable_value = true
+enable_asymmetric_revival_critic = true
+enable_draw_weighted_durable_value = true
+enable_role_conditioned_candidate_policy = true
+enable_deconfounded_durable_value = true
+enable_monotone_deconfounded_durable_value = true
+enable_balanced_deconfounded_durable_value = true
+enable_expressive_synergy_backbone = true
+enable_debloated_synergy_durable_value = true
+enable_build_conditioned_durable_value = true
+enable_twin_durable_value_heads = true
+double_mpo_pessimism_coef = 0.35
+ppo_epochs_per_cohort = 1
+ppo_minibatches_per_cohort = 1
+freeze_trunk_during_durable_warmup = true
+durable_warmup_updates = 5
+combat_actor_warmup_updates = 5
+enable_post_step_kl_line_search = true
+target_macro_step_kl = 0.012
+line_search_max_backtracks = 4
+line_search_min_scale = 0.10
+macro_mpo_trust_kl_weight = 0.0
+enable_partial_afterstates = true
+enable_partial_afterstate_conditional_mpo = true
+enable_manual_confirm_selection_afterstates = true
+durable_stage_baseline_weight = 0.0
+enable_hierarchical_afterstate_mpo = true
+macro_mpo_min_temperature = 0.015
+macro_within_branch_kl = 0.035
+macro_within_branch_mpo_weight = 0.60
+revival_budget = 32
+zero_macro_pace_penalty = true
+clip_macro_pg_fallback = true
+macro_pg_clip_eps = 0.20
+macro_pg_adv_clip = 0.25
+macro_pg_kl_weight = 0.05
+macro_pg_within_branch_entropy_only = true
+clip_combat_pg = true
+combat_pg_clip_eps = 0.15
+combat_pg_adv_clip = 0.25
+combat_pg_kl_weight = 0.05
+separate_value_grad_clip = true
+learning_rate = 0.000045
+shared_learning_rate_scale = 0.25
+weight_decay = 0.01
+macro_trace_lambda = 0.95
+macro_kl = 0.015
+distill_teacher_rollout_updates = 0
+distill_total_updates = 12
+distill_epochs_per_cohort = 2
+distill_policy_kl_weight = 1.0
+distill_value_weight = 0.5
+distill_afterstate_margin_weight = 1.0
+kickstart_kl_weight = 0.050
+kickstart_kl_floor = 0.035
+macro_entropy_weight = 0.002
+durable_post_value_weight = 0.5
+chunk_steps = 16
+combat_unroll_steps = 16
+eval_batch_size = 48
+chunk_batch_size = 48
+allow_tf32 = true
+enable_bf16_amp = true
+macro_policy_weight = 1.0
+macro_value_weight = 0.5
+combat_policy_weight = 0.25
+combat_value_weight = 0.5
+combat_entropy_weight = 0.0004
+rho_clip = 1.1
+c_clip = 1.0
+policy_rho_clip = 1.1
+gradient_clip_norm = 1.0
+likelihood_tolerance = 0.08
+
+[training.model]
+d_model = 256
+n_heads = 8
+ffn_dim = 1024
+world_layers = 4
+latent_slots = 24
+latent_layers = 3
+local_layers = 2
+candidate_layers = 2
+recurrent_hidden_dim = 512
+max_world_tokens = 4096
+
+[training.transaction_learning]
+enabled = false
+
+[training.failure_credit]
+mode = "disabled"
+
+[training.episodic_learning]
+enabled = false
+
+[training.rollout]
+deterministic_probe_interval_episodes = 0
+deterministic_probe_environment_steps = []
+
+[training.curriculum]
+revival_budget = 32
+epsilon_start = 0.0
+epsilon_end = 0.0
+
+[training.runtime]
+rocm_sdpa_backend = "math"
+seed = 6700000
+evaluation_steps = []
+early_evaluation_steps = []
+final_audit_steps = []
+evaluation_liveness_guard_enabled = false

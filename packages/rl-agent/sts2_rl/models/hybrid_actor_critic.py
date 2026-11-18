@@ -1271,9 +1271,11 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
     ) -> Tensor:
         batch_size = int(world.tokens.shape[0])
         build_mask = self._persistent_token_mask(zone_ids, owner_ids, world.world_mask)
-        null_token = self.world_null_token.expand(batch_size, -1, -1)
+        null_token = self.world_null_token.expand(batch_size, -1, -1).to(dtype=world.tokens.dtype)
         keys = torch.cat([null_token, world.tokens], dim=1)
-        queries = self.persistent_build_queries.expand(batch_size, -1, -1)
+        queries = self.persistent_build_queries.expand(batch_size, -1, -1).to(
+            dtype=world.tokens.dtype
+        )
         if token_weights is None:
             null_mask = torch.ones((batch_size, 1), dtype=torch.bool, device=world.tokens.device)
             key_mask = torch.cat([null_mask, build_mask], dim=1)
@@ -1694,7 +1696,9 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         )
         world_tokens = raw_world_tokens * world_mask.unsqueeze(-1).to(dtype=raw_world_tokens.dtype)
 
-        null_token = self.world_null_token.expand(batch_size, -1, -1)
+        null_token = self.world_null_token.expand(batch_size, -1, -1).to(
+            dtype=raw_world_tokens.dtype
+        )
         encoded_tokens = torch.cat([null_token, world_tokens], dim=1)
         null_weight = torch.ones(
             (batch_size, 1),
@@ -1721,7 +1725,9 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         )
 
         domain_context = self.domain_embedding(domain_ids).unsqueeze(1)
-        latent_queries = self.latent_queries.expand(batch_size, -1, -1) + domain_context
+        latent_queries = (self.latent_queries.expand(batch_size, -1, -1) + domain_context).to(
+            dtype=encoded_tokens.dtype
+        )
         latent_delta = self._weighted_multihead_attention(
             self.world_to_latent,
             latent_queries,
@@ -2146,6 +2152,64 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         return shop_tokens, shop_valid, in_shop
 
     def _durable_readout(
+        self,
+        *,
+        world_state_embedding: Tensor,
+        build_embedding: Tensor | None,
+        vitals_embedding: Tensor | None = None,
+        raw_vitals: Tensor | None = None,
+        progress_vitals: Tensor | None = None,
+        monotone_parts: tuple[Tensor, Tensor, Tensor] | None = None,
+        run_memory: Tensor,
+        revival_context: Tensor | None = None,
+        card_repr: Tensor | None = None,
+        card_raw_feats: Tensor | None = None,
+        deck_card_mask: Tensor | None = None,
+        draw_prob: Tensor | None = None,
+        deck_size: Tensor | None = None,
+        has_deck: Tensor | None = None,
+        shop_context: tuple[Tensor | None, Tensor | None, Tensor] | None = None,
+        use_twin: bool = False,
+    ) -> Tensor:
+        with torch.autocast(device_type=world_state_embedding.device.type, enabled=False):
+            mp_f = (
+                (
+                    monotone_parts[0].float(),
+                    monotone_parts[1].float(),
+                    monotone_parts[2].float(),
+                )
+                if monotone_parts is not None
+                else None
+            )
+            shop_f = (
+                (
+                    None if shop_context[0] is None else shop_context[0].float(),
+                    shop_context[1],
+                    shop_context[2],
+                )
+                if shop_context is not None
+                else None
+            )
+            return self._durable_readout_fp32(
+                world_state_embedding=world_state_embedding.float(),
+                build_embedding=None if build_embedding is None else build_embedding.float(),
+                vitals_embedding=None if vitals_embedding is None else vitals_embedding.float(),
+                raw_vitals=None if raw_vitals is None else raw_vitals.float(),
+                progress_vitals=None if progress_vitals is None else progress_vitals.float(),
+                monotone_parts=mp_f,
+                run_memory=run_memory.float(),
+                revival_context=None if revival_context is None else revival_context.float(),
+                card_repr=None if card_repr is None else card_repr.float(),
+                card_raw_feats=None if card_raw_feats is None else card_raw_feats.float(),
+                deck_card_mask=deck_card_mask,
+                draw_prob=None if draw_prob is None else draw_prob.float(),
+                deck_size=None if deck_size is None else deck_size.float(),
+                has_deck=has_deck,
+                shop_context=shop_f,
+                use_twin=use_twin,
+            )
+
+    def _durable_readout_fp32(
         self,
         *,
         world_state_embedding: Tensor,
@@ -2620,7 +2684,14 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             child_feat_sum = torch.einsum("buv,buf->bvf", per_card_child_w, scaled_feats)
             card_mask_f = prep.deck_card_mask.unsqueeze(-1).to(dtype=pers_enc.tokens.dtype)
             card_repr = (
-                torch.cat([pers_enc.tokens, raw_world_tokens, child_tok_sum], dim=-1)
+                torch.cat(
+                    [
+                        pers_enc.tokens,
+                        raw_world_tokens.to(dtype=pers_enc.tokens.dtype),
+                        child_tok_sum,
+                    ],
+                    dim=-1,
+                )
                 * card_mask_f
             )
             card_raw_feats = (
@@ -2669,9 +2740,10 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 _validated=not validate,
             )
             base_state_emb = base_enc.state_embedding
-            pers_run = self.run_recurrent_norm(
-                self.run_recurrent_cell(base_state_emb, run_prev_for_durable)
-            )
+            with torch.autocast(device_type=base_state_emb.device.type, enabled=False):
+                pers_run = self.run_recurrent_norm(
+                    self.run_recurrent_cell(base_state_emb.float(), run_prev_for_durable.float())
+                )
             build_emb = (
                 self._pool_persistent_build(
                     base_enc,
@@ -2683,9 +2755,10 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             )
         else:
             base_state_emb = pers_enc.state_embedding
-            pers_run = self.run_recurrent_norm(
-                self.run_recurrent_cell(base_state_emb, run_prev_for_durable)
-            )
+            with torch.autocast(device_type=base_state_emb.device.type, enabled=False):
+                pers_run = self.run_recurrent_norm(
+                    self.run_recurrent_cell(base_state_emb.float(), run_prev_for_durable.float())
+                )
             build_emb = (
                 self._pool_persistent_build(
                     pers_enc,
@@ -2702,11 +2775,12 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 and draw_prob is not None
                 and self.actor_critic_config.enable_draw_weighted_durable_value
             ):
+                deck_proj = self.persistent_build_deck_proj(card_repr)
                 build_emb = build_emb + torch.einsum(
                     "bw,bwd->bd",
-                    draw_prob.to(dtype=build_emb.dtype),
-                    self.persistent_build_deck_proj(card_repr),
-                )
+                    draw_prob.to(dtype=deck_proj.dtype),
+                    deck_proj,
+                ).to(dtype=build_emb.dtype)
         vitals_emb: Tensor | None = None
         raw_vitals: Tensor | None = None
         progress_vitals: Tensor | None = None
@@ -2857,10 +2931,12 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         )
         world_enc = self.encode_world(world, domain_ids, _validated=not validate)
         combat_domain = domain_ids.eq(COMBAT_DOMAIN_ID).unsqueeze(-1)
-        run_update = self.run_recurrent_norm(
-            self.run_recurrent_cell(world_enc.state_embedding, previous_run)
-        )
-        next_run = torch.where(combat_domain, previous_run, run_update)
+        with torch.autocast(device_type=world.features.device.type, enabled=False):
+            prev_run_f = previous_run.float()
+            run_update = self.run_recurrent_norm(
+                self.run_recurrent_cell(world_enc.state_embedding.float(), prev_run_f)
+            )
+            next_run = torch.where(combat_domain, prev_run_f, run_update)
         build_emb = (
             self._pool_persistent_build(world_enc, world.zone_ids, world.owner_ids)
             if self.actor_critic_config.enable_persistent_build_context
@@ -3033,19 +3109,23 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         previous_combat = recurrent_state[:, memory_half:]
         combat_domain = batch.domain_ids.eq(COMBAT_DOMAIN_ID).unsqueeze(-1)
 
-        run_update = self.run_recurrent_norm(
-            self.run_recurrent_cell(world.state_embedding, previous_run)
-        )
-        next_run = torch.where(combat_domain, previous_run, run_update)
-        combat_update = self.combat_recurrent_norm(
-            self.combat_recurrent_cell(world.state_embedding, previous_combat)
-        )
-        next_combat = torch.where(
-            combat_domain,
-            combat_update,
-            torch.zeros_like(combat_update),
-        )
-        next_recurrent_state = torch.cat([next_run, next_combat], dim=-1)
+        with torch.autocast(device_type=world.state_embedding.device.type, enabled=False):
+            ws_f = world.state_embedding.float()
+            prev_run_f = previous_run.float()
+            prev_com_f = previous_combat.float()
+            run_update = self.run_recurrent_norm(
+                self.run_recurrent_cell(ws_f, prev_run_f)
+            )
+            next_run = torch.where(combat_domain, prev_run_f, run_update)
+            combat_update = self.combat_recurrent_norm(
+                self.combat_recurrent_cell(ws_f, prev_com_f)
+            )
+            next_combat = torch.where(
+                combat_domain,
+                combat_update,
+                torch.zeros_like(combat_update),
+            )
+            next_recurrent_state = torch.cat([next_run, next_combat], dim=-1)
 
         memory_context = self.memory_to_candidate(next_recurrent_state)
         state_token = world.state_embedding + memory_context
@@ -3083,15 +3163,17 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         macro_rows = ~combat_rows
         selected = torch.empty_like(stream_tokens)
         if bool(macro_rows.any().item()):
-            selected[macro_rows] = self.macro_stream(
+            macro_out = self.macro_stream(
                 self.macro_stream_norm(stream_tokens[macro_rows]),
                 src_key_padding_mask=padding_mask[macro_rows],
             )
+            selected[macro_rows] = macro_out.to(dtype=selected.dtype)
         if bool(combat_rows.any().item()):
-            selected[combat_rows] = self.combat_stream(
+            combat_out = self.combat_stream(
                 self.combat_stream_norm(stream_tokens[combat_rows]),
                 src_key_padding_mask=padding_mask[combat_rows],
             )
+            selected[combat_rows] = combat_out.to(dtype=selected.dtype)
         joint = self.joint_stream(
             selected,
             src_key_padding_mask=padding_mask,
@@ -3133,59 +3215,67 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             device=batch.world.features.device,
             dtype=batch.world.features.dtype,
         )
-        state = base.joint_state_embedding.unsqueeze(1).expand(-1, int(action_count), -1)
-        memory = base.recurrent_state.unsqueeze(1).expand(-1, int(action_count), -1)
-        raw_logits = self.candidate_policy_head(
-            torch.cat([base.candidate_embeddings, state, memory], dim=-1)
-        ).squeeze(-1)
-        if self.actor_critic_config.enable_role_conditioned_candidate_policy:
-            bounded_roles = batch.candidates.role_ids.long().clamp(
-                min=0,
-                max=self.config.role_vocab_size - 1,
-            )
-            role_emb = self.token_embedder.role_embedding(bounded_roles)
-            cand_modulated = base.candidate_embeddings * torch.tanh(
-                self.candidate_role_gate(role_emb)
-            )
-            role_delta = self.candidate_role_policy_head(
-                torch.cat(
-                    [cand_modulated, base.candidate_embeddings, role_emb, state],
-                    dim=-1,
-                )
+        with torch.autocast(device_type=batch.world.features.device.type, enabled=False):
+            joint_state_f = base.joint_state_embedding.float()
+            cand_emb_f = base.candidate_embeddings.float()
+            rec_state_f = base.recurrent_state.float()
+            vitals_emb_f = None if vitals_emb is None else vitals_emb.float()
+            raw_vitals_f = None if raw_vitals is None else raw_vitals.float()
+            rev_ctx_f = None if rev_ctx is None else rev_ctx.float()
+
+            state = joint_state_f.unsqueeze(1).expand(-1, int(action_count), -1)
+            memory = rec_state_f.unsqueeze(1).expand(-1, int(action_count), -1)
+            raw_logits = self.candidate_policy_head(
+                torch.cat([cand_emb_f, state, memory], dim=-1)
             ).squeeze(-1)
-            raw_logits = raw_logits + role_delta
-        if self.actor_critic_config.enable_hierarchical_branch_policy:
-            salient_for_actor = (
-                raw_vitals[:, -SALIENT_VITALS_DIM:]
-                if (
-                    raw_vitals is not None
-                    and self.actor_critic_config.enable_persistent_only_durable_value
+            if self.actor_critic_config.enable_role_conditioned_candidate_policy:
+                bounded_roles = batch.candidates.role_ids.long().clamp(
+                    min=0,
+                    max=self.config.role_vocab_size - 1,
                 )
-                else None
-            )
-            policy_logits = self._hierarchical_policy_logits(
-                raw_candidate_logits=raw_logits,
-                candidate_embeddings=base.candidate_embeddings,
-                joint_state_embedding=base.joint_state_embedding,
-                vitals_embedding=vitals_emb,
-                salient_vitals=salient_for_actor,
-                recurrent_state=base.recurrent_state,
-                policy_branch_ids=batch.candidates.policy_branch_ids,
-                action_mask=base.action_mask,
-                domain_ids=batch.domain_ids,
-            )
-        else:
-            policy_logits = raw_logits.masked_fill(~base.action_mask, 0.0)
-        value = self.state_value_head(
-            torch.cat([base.joint_state_embedding, base.recurrent_state], dim=-1)
-        ).squeeze(-1)
-        if rev_ctx is not None:
-            rev_scaled = rev_ctx * 4.0
-            value = (
-                value
-                + self.state_revival_linear(rev_scaled).squeeze(-1)
-                + self.state_revival_head(rev_scaled).squeeze(-1)
-            )
+                role_emb = self.token_embedder.role_embedding(bounded_roles).float()
+                cand_modulated = cand_emb_f * torch.tanh(
+                    self.candidate_role_gate(role_emb)
+                )
+                role_delta = self.candidate_role_policy_head(
+                    torch.cat(
+                        [cand_modulated, cand_emb_f, role_emb, state],
+                        dim=-1,
+                    )
+                ).squeeze(-1)
+                raw_logits = raw_logits + role_delta
+            if self.actor_critic_config.enable_hierarchical_branch_policy:
+                salient_for_actor = (
+                    raw_vitals_f[:, -SALIENT_VITALS_DIM:]
+                    if (
+                        raw_vitals_f is not None
+                        and self.actor_critic_config.enable_persistent_only_durable_value
+                    )
+                    else None
+                )
+                policy_logits = self._hierarchical_policy_logits(
+                    raw_candidate_logits=raw_logits,
+                    candidate_embeddings=cand_emb_f,
+                    joint_state_embedding=joint_state_f,
+                    vitals_embedding=vitals_emb_f,
+                    salient_vitals=salient_for_actor,
+                    recurrent_state=rec_state_f,
+                    policy_branch_ids=batch.candidates.policy_branch_ids,
+                    action_mask=base.action_mask,
+                    domain_ids=batch.domain_ids,
+                )
+            else:
+                policy_logits = raw_logits.masked_fill(~base.action_mask, 0.0)
+            value = self.state_value_head(
+                torch.cat([joint_state_f, rec_state_f], dim=-1)
+            ).squeeze(-1)
+            if rev_ctx_f is not None:
+                rev_scaled = rev_ctx_f * 4.0
+                value = (
+                    value
+                    + self.state_revival_linear(rev_scaled).squeeze(-1)
+                    + self.state_revival_head(rev_scaled).squeeze(-1)
+                )
         durable_value: Tensor | None = None
         if compute_durable_value and self.actor_critic_config.enable_durable_value_head:
             if self.actor_critic_config.enable_persistent_only_durable_value:
@@ -3202,16 +3292,16 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                     build_embedding=build_emb,
                     vitals_embedding=vitals_emb,
                     raw_vitals=raw_vitals,
-                    run_memory=base.recurrent_state[:, :memory_half],
-                    revival_context=rev_ctx,
+                    run_memory=rec_state_f[:, :memory_half],
+                    revival_context=rev_ctx_f,
                 )
         output = HybridActorCriticOutput(
             policy_logits=policy_logits,
             value=value,
-            recurrent_state=base.recurrent_state,
-            joint_state_embedding=base.joint_state_embedding,
-            world_state_embedding=base.world_state_embedding,
-            candidate_embeddings=base.candidate_embeddings,
+            recurrent_state=rec_state_f,
+            joint_state_embedding=joint_state_f,
+            world_state_embedding=base.world_state_embedding.float(),
+            candidate_embeddings=cand_emb_f,
             action_mask=base.action_mask,
             durable_value=durable_value,
         )
@@ -3363,7 +3453,21 @@ def initialize_actor_critic_from_macro_publication(
                         if src_param is not None and src_param.shape == dst_param.shape:
                             dst_param.copy_(src_param)
                             if dst_param.ndim == 2:
-                                scale = float(src_param.detach().std().clamp_min(1e-3).item()) * 0.015
+                                noise_mult = (
+                                    0.05
+                                    if dst_name.startswith(
+                                        (
+                                            "durable_twin_value_head.",
+                                            "durable_twin_deck_out.",
+                                            "durable_twin_deck_tilted_out.",
+                                        )
+                                    )
+                                    else 0.02
+                                )
+                                scale = (
+                                    float(src_param.detach().std().clamp_min(1e-3).item())
+                                    * noise_mult
+                                )
                                 noise = torch.randn(
                                     dst_param.shape, generator=gen, dtype=torch.float32
                                 ).to(device=dst_param.device, dtype=dst_param.dtype)

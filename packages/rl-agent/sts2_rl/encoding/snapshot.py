@@ -567,13 +567,32 @@ def _transfer_packed(
     return t_i32.to(device=dev), torch.from_numpy(packed_f32).to(device=dev)
 
 
-def _collate_encoded_snapshots_scatter(
+@dataclass(frozen=True, slots=True)
+class PackedSnapshotBatch:
+    """Compact device-resident sparse buffers (~150 KB/step) ready for instant GPU scatter."""
+
+    bsz: int
+    w_cap: int
+    c_cap: int
+    l_cap: int
+    total_w: int
+    total_c: int
+    total_l: int
+    total_nnz_w: int
+    total_nnz_c: int
+    total_nnz_l: int
+    feature_dim: int
+    i32_dev: torch.Tensor
+    f32_dev: torch.Tensor
+
+
+def pack_encoded_snapshots_to_device(
     snapshots: tuple[EncodedDecisionSnapshot, ...],
     *,
     cfg: GroundedEncodingConfig,
     dev: torch.device,
-) -> GroundedCandidateBatch:
-    """Pack flat sparse arrays into two pinned buffers and scatter on the target device."""
+) -> PackedSnapshotBatch:
+    """Pack flat sparse arrays into two pinned buffers and transfer to ``dev``."""
 
     bsz = len(snapshots)
     w_counts_list = [s.world.token_count for s in snapshots]
@@ -656,6 +675,40 @@ def _collate_encoded_snapshots_scatter(
         else np.empty((0,), dtype=np.float32)
     )
     i32_dev, f32_dev = _transfer_packed(packed_i32, packed_f32, dev=dev)
+    return PackedSnapshotBatch(
+        bsz=bsz,
+        w_cap=w_cap,
+        c_cap=c_cap,
+        l_cap=l_cap,
+        total_w=total_w,
+        total_c=total_c,
+        total_l=total_l,
+        total_nnz_w=total_nnz_w,
+        total_nnz_c=total_nnz_c,
+        total_nnz_l=total_nnz_l,
+        feature_dim=cfg.feature_dim,
+        i32_dev=i32_dev,
+        f32_dev=f32_dev,
+    )
+
+
+def scatter_packed_snapshots(packed: PackedSnapshotBatch) -> GroundedCandidateBatch:
+    """Materialize a dense ``GroundedCandidateBatch`` from device-resident ``packed`` buffers."""
+
+    bsz = packed.bsz
+    w_cap = packed.w_cap
+    c_cap = packed.c_cap
+    l_cap = packed.l_cap
+    total_w = packed.total_w
+    total_c = packed.total_c
+    total_l = packed.total_l
+    total_nnz_w = packed.total_nnz_w
+    total_nnz_c = packed.total_nnz_c
+    total_nnz_l = packed.total_nnz_l
+    feature_dim = packed.feature_dim
+    i32_dev = packed.i32_dev
+    f32_dev = packed.f32_dev
+    dev = i32_dev.device
 
     cursor = 0
     w_counts_t = i32_dev[cursor : cursor + bsz].long()
@@ -698,7 +751,7 @@ def _collate_encoded_snapshots_scatter(
     # Scatter World
     world_mask = torch.arange(w_cap, device=dev, dtype=torch.long).unsqueeze(0) < w_counts_t.unsqueeze(1)
     world_ids_tensor = torch.zeros((bsz, w_cap, _WORLD_ID_WIDTH), device=dev, dtype=torch.long)
-    world_features = torch.zeros((bsz, w_cap, cfg.feature_dim), device=dev, dtype=torch.float32)
+    world_features = torch.zeros((bsz, w_cap, feature_dim), device=dev, dtype=torch.float32)
     if total_w > 0:
         b_of_w = torch.repeat_interleave(arange_b, w_counts_t, output_size=total_w)
         cum_w = w_counts_t.cumsum(0) - w_counts_t
@@ -715,10 +768,10 @@ def _collate_encoded_snapshots_scatter(
     # Scatter Candidates & Locals
     candidate_ids_tensor = torch.zeros((bsz, c_cap, _CANDIDATE_ID_WIDTH), device=dev, dtype=torch.long)
     action_mask = torch.zeros((bsz, c_cap), device=dev, dtype=torch.bool)
-    candidate_features = torch.zeros((bsz, c_cap, cfg.feature_dim), device=dev, dtype=torch.float32)
+    candidate_features = torch.zeros((bsz, c_cap, feature_dim), device=dev, dtype=torch.float32)
     local_mask = torch.zeros((bsz, c_cap, l_cap), device=dev, dtype=torch.bool)
     local_ids_tensor = torch.zeros((bsz, c_cap, l_cap, _LOCAL_ID_WIDTH), device=dev, dtype=torch.long)
-    local_features = torch.zeros((bsz, c_cap, l_cap, cfg.feature_dim), device=dev, dtype=torch.float32)
+    local_features = torch.zeros((bsz, c_cap, l_cap, feature_dim), device=dev, dtype=torch.float32)
 
     if total_c > 0:
         b_of_c = torch.repeat_interleave(arange_b, c_counts_t, output_size=total_c)
@@ -813,6 +866,19 @@ def _collate_encoded_snapshots_scatter(
         ),
         domain_ids=domain_ids_t,
         macro_economic_surface_ids=surface_ids_t,
+    )
+
+
+def _collate_encoded_snapshots_scatter(
+    snapshots: tuple[EncodedDecisionSnapshot, ...],
+    *,
+    cfg: GroundedEncodingConfig,
+    dev: torch.device,
+) -> GroundedCandidateBatch:
+    """Pack flat sparse arrays into two pinned buffers and scatter on the target device."""
+
+    return scatter_packed_snapshots(
+        pack_encoded_snapshots_to_device(snapshots, cfg=cfg, dev=dev)
     )
 
 
@@ -1140,8 +1206,11 @@ __all__ = [
     "EncodedDecisionSnapshot",
     "EncodedWorldSnapshot",
     "GroundedEncodingConfig",
+    "PackedSnapshotBatch",
     "SparseTokenTable",
     "collate_encoded_snapshots",
     "collate_encoded_worlds",
+    "pack_encoded_snapshots_to_device",
+    "scatter_packed_snapshots",
     "sparse_token_table",
 ]
