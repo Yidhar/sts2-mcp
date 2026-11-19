@@ -173,7 +173,11 @@ def _run_one_heldout_seed(
 ) -> dict[str, Any]:
     if seed % 2 != EVALUATION_SEED_PARITY:
         raise ValueError(f"held-out evaluation refuses even training seed {seed}")
-    revival_budget = validate_course(training_config)
+    revival_budget = validate_course(
+        training_config,
+        allow_zero_budget=True,
+        allow_act_objectives=True,
+    )
     started = time.monotonic()
 
     def remaining_ms(cap_ms: int) -> int:
@@ -218,6 +222,8 @@ def _run_one_heldout_seed(
         player_hp_lost = 0.0
         native_steps = 0
         stalled = False
+        last_task_outcome: str | None = None
+        last_act = 1
         recorded_actions: list[list[Any]] = []
 
         while not (state.terminated or state.truncated):
@@ -283,6 +289,9 @@ def _run_one_heldout_seed(
             elif state.transition is not None and not state.truncated:
                 revivals_used += int(getattr(state.transition, "revivals_used_delta", 0))
                 player_hp_lost += float(getattr(state.transition, "player_hp_lost", 0.0))
+            run_map = state.observation.get("run")
+            if isinstance(run_map, Mapping) and isinstance(run_map.get("act"), int) and not isinstance(run_map.get("act"), bool):
+                last_act = max(last_act, int(run_map["act"]))
             if state.transition is not None and not state.truncated:
                 step_r = reward_calc.evaluate(
                     before=prev_state,
@@ -291,16 +300,23 @@ def _run_one_heldout_seed(
                     horizon_exhausted=False,
                 )
                 total_return += float(step_r.reward)
+                last_task_outcome = step_r.outcome
                 if step_r.task_terminal:
                     break
 
-        won = (not stalled) and (not state.truncated) and _is_victory(state)
+        won = (not stalled) and (not state.truncated) and (last_task_outcome == "success" or _is_victory(state))
+        act1_cleared = bool(
+            won
+            if training_config.curriculum.reward_objective == "act1"
+            else (_is_victory(state) or max_floor >= 17 or last_act >= 2)
+        )
         return {
             "seed": seed,
             "won": won,
-            "act1_cleared": bool(won or max_floor >= 17),
-            "act3_reached": bool(won or max_floor >= 34),
+            "act1_cleared": act1_cleared,
+            "act3_reached": bool(_is_victory(state) or max_floor >= 34 or last_act >= 3),
             "zero_revival_victory": bool(won and revivals_used == 0),
+            "zero_revival_act1_success": bool(act1_cleared and revivals_used == 0),
             "max_floor": max_floor,
             "revivals_used": revivals_used,
             "player_hp_lost": player_hp_lost,
@@ -406,7 +422,11 @@ def evaluate_heldout_publication(
     if workers < 1:
         raise ValueError("held-out workers must be >= 1")
     macro_cfg = load_macro_training_config(config_path, overrides)
-    revival_budget = validate_course(macro_cfg.training)
+    revival_budget = validate_course(
+        macro_cfg.training,
+        allow_zero_budget=True,
+        allow_act_objectives=True,
+    )
     root = artifact_root()
     pub_resolved = resolve_external_input_path(publication_path, root=root)
     pub_sha256 = hashlib.sha256(pub_resolved.read_bytes()).hexdigest()
@@ -571,6 +591,7 @@ def evaluate_heldout_publication(
     a1 = sum(1 for r in rows if r["act1_cleared"])
     a3 = sum(1 for r in rows if r["act3_reached"])
     z_wins = sum(1 for r in rows if r["zero_revival_victory"])
+    z_a1 = sum(1 for r in rows if r["zero_revival_act1_success"])
     stalls = sum(1 for r in rows if r["stalled"])
     deck_vals = [int(r["final_deck_size"]) for r in rows if r["final_deck_size"] is not None]
     tot_rew_dec = sum(int(r["reward_decisions"]) for r in rows)
@@ -611,6 +632,7 @@ def evaluate_heldout_publication(
         "policy_version": int(policy_version),
         "data_partition": "validation",
         "seed_parity": "odd_held_out",
+        "reward_objective": macro_cfg.training.curriculum.reward_objective,
         "revival_budget": int(revival_budget),
         "publication_sha256": pub_sha256,
         "episodes": n,
@@ -621,8 +643,8 @@ def evaluate_heldout_publication(
         "act3_reach_count": a3,
         "act3_reach_rate": a3 / n,
         "zero_revival_victories": z_wins,
-        "zero_revival_act1_successes": z_wins,
-        "revival_free_act1_clear_rate": z_wins / n,
+        "zero_revival_act1_successes": z_a1,
+        "revival_free_act1_clear_rate": z_a1 / n,
         "mean_revivals_used": sum(float(r["revivals_used"]) for r in rows) / n,
         "mean_player_hp_lost": sum(float(r["player_hp_lost"]) for r in rows) / n,
         "mean_max_floor": sum(float(r["max_floor"]) for r in rows) / n,

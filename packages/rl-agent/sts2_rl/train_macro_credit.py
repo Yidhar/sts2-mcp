@@ -113,7 +113,11 @@ class MacroTrainingConfig:
     learner: MacroCreditLearnerConfig
 
     def __post_init__(self) -> None:
-        course_budget = validate_course(self.training)
+        course_budget = validate_course(
+            self.training,
+            allow_zero_budget=True,
+            allow_act_objectives=True,
+        )
         if (
             self.learner.enable_asymmetric_revival_critic
             and self.learner.revival_budget != course_budget
@@ -284,11 +288,15 @@ def _actor_critic_config(config: MacroTrainingConfig) -> HybridActorCriticConfig
             enable_twin_durable_value_heads=(
                 config.learner.enable_twin_durable_value_heads
             ),
+            enable_local_combat_value_head=(
+                config.learner.enable_local_combat_critic
+            ),
         )
     return HybridActorCriticConfig(
         grounded,
         domain_layers=config.learner.domain_layers,
         joint_layers=config.learner.joint_layers,
+        enable_local_combat_value_head=config.learner.enable_local_combat_critic,
     )
 
 
@@ -782,9 +790,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                            "decision_clock": DECISION_CLOCK_CONTRACT_VERSION, "data": MACRO_CREDIT_DATA_VERSION,
                            "source_identity": sources["identity"]}
         identity = MacroCheckpointIdentity(
-            course_config=course_identity, model_config=ac_config.as_mapping(),
-            reward_identity=act_frontloaded_death_reward_identity(revival_budget=validate_course(training)),
-            lineage_id=args.lineage_id, learner_version=MACRO_CREDIT_LEARNER_VERSION,
+            course_config=course_identity,
+            model_config=ac_config.as_mapping(),
+            reward_identity=act_frontloaded_death_reward_identity(
+                revival_budget=validate_course(
+                    training,
+                    allow_zero_budget=True,
+                    allow_act_objectives=True,
+                )
+            ),
+            lineage_id=args.lineage_id,
+            learner_version=MACRO_CREDIT_LEARNER_VERSION,
         )
         identity.as_mapping()
         if args.dry_run:

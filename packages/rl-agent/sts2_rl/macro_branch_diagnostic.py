@@ -333,6 +333,8 @@ def run_branch_pass(
     forced_candidate: int | None = None,
     authority: BranchAuthority | None = None,
     allow_zero_budget: bool = False,
+    allow_zero_budget_training: bool = False,
+    allow_act_objectives: bool = False,
 ) -> dict[str, Any]:
     """One fresh full-prefix execution. The caller must close its backend.
 
@@ -344,7 +346,13 @@ def run_branch_pass(
     validate_seed(seed)
     if allow_zero_budget and (not limits.terminal_only or authority is not None or forced_candidate is not None):
         raise ValueError("zero-budget override is only for natural terminal-only evaluation")
-    budget = validate_course(config, allow_zero_budget=allow_zero_budget)
+    if allow_zero_budget_training and (not limits.terminal_only or forced_candidate is not None):
+        raise ValueError("zero-budget training requires natural terminal-only episode collection")
+    budget = validate_course(
+        config,
+        allow_zero_budget=(allow_zero_budget or allow_zero_budget_training),
+        allow_act_objectives=allow_act_objectives,
+    )
     started = time.monotonic()
 
     def remaining_ms(cap: int = 20_000) -> int:

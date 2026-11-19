@@ -86,6 +86,7 @@ V2_FRESH_TENSOR_PREFIXES: Final[tuple[str, ...]] = (
     "durable_value_head.",
     "durable_vitals_",
     "latent_slot_readout.",
+    "local_combat_value_head.",
     "persistent_build_",
     "persistent_vitals_",
     "state_revival_",
@@ -123,6 +124,7 @@ class HybridActorCriticConfig:
     enable_debloated_synergy_durable_value: bool = False
     enable_build_conditioned_durable_value: bool = False
     enable_twin_durable_value_heads: bool = False
+    enable_local_combat_value_head: bool = False
 
     def __post_init__(self) -> None:
         HybridCandidateQConfig(
@@ -147,6 +149,7 @@ class HybridActorCriticConfig:
             "enable_debloated_synergy_durable_value",
             "enable_build_conditioned_durable_value",
             "enable_twin_durable_value_heads",
+            "enable_local_combat_value_head",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"hybrid actor-critic {name} must be boolean")
@@ -219,6 +222,7 @@ class HybridActorCriticConfig:
             or self.enable_debloated_synergy_durable_value
             or self.enable_build_conditioned_durable_value
             or self.enable_twin_durable_value_heads
+            or self.enable_local_combat_value_head
         )
 
     @classmethod
@@ -534,6 +538,9 @@ class HybridActorCriticConfig:
                 enable_twin_durable_value_heads=bool(
                     mapping.get("enable_twin_durable_value_heads", False)
                 ),
+                enable_local_combat_value_head=bool(
+                    mapping.get("enable_local_combat_value_head", False)
+                ),
             )
         raise ValueError(f"unsupported hybrid actor-critic model_config version: {version!r}")
 
@@ -623,6 +630,12 @@ class HybridActorCriticConfig:
                         self.enable_twin_durable_value_heads
                     ),
                 )
+            if self.enable_local_combat_value_head:
+                base.update(
+                    enable_local_combat_value_head=(
+                        self.enable_local_combat_value_head
+                    ),
+                )
         return base
 
     def candidate_q_config(self) -> HybridCandidateQConfig:
@@ -643,6 +656,7 @@ class HybridActorCriticOutput:
     candidate_embeddings: Tensor  # [B, A, D]
     action_mask: Tensor  # [B, A]
     durable_value: Tensor | None = None  # [B], candidate-independent when enabled
+    combat_value: Tensor | None = None  # [B], encounter-local critic when enabled
 
     def validate(
         self,
@@ -687,6 +701,15 @@ class HybridActorCriticOutput:
                 torch.isfinite(self.durable_value).all().item()
             ):
                 raise ValueError("hybrid actor durable_value must be finite floating point")
+        if config.enable_local_combat_value_head:
+            if self.combat_value is None:
+                raise ValueError("hybrid actor combat_value is required when enabled")
+            if tuple(self.combat_value.shape) != (batch_size,):
+                raise ValueError("hybrid actor combat_value has the wrong shape")
+            if not torch.is_floating_point(self.combat_value) or not bool(
+                torch.isfinite(self.combat_value).all().item()
+            ):
+                raise ValueError("hybrid actor combat_value must be finite floating point")
         return batch_size, action_count
 
 
@@ -781,6 +804,20 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             nn.SiLU(),
             nn.Linear(cfg.ffn_dim, 1),
         )
+        if actor_critic.enable_local_combat_value_head:
+            lc_in_dim = cfg.d_model + cfg.recurrent_hidden_dim
+            lc_fc1 = nn.Linear(lc_in_dim, cfg.ffn_dim)
+            nn.init.normal_(lc_fc1.weight, mean=0.0, std=0.05)
+            nn.init.zeros_(lc_fc1.bias)
+            lc_out = nn.Linear(cfg.ffn_dim, 1)
+            nn.init.zeros_(lc_out.weight)
+            nn.init.zeros_(lc_out.bias)
+            self.local_combat_value_head = nn.Sequential(
+                nn.LayerNorm(lc_in_dim),
+                lc_fc1,
+                nn.SiLU(),
+                lc_out,
+            )
         if actor_critic.enable_expressive_synergy_backbone:
             slot_in_dim = cfg.latent_slots * cfg.d_model
             slot_out = nn.Linear(cfg.d_model, cfg.d_model)
@@ -3313,6 +3350,11 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             value = self.state_value_head(
                 torch.cat([val_joint, val_rec], dim=-1)
             ).squeeze(-1)
+            combat_value: Tensor | None = None
+            if self.actor_critic_config.enable_local_combat_value_head:
+                combat_value = self.local_combat_value_head(
+                    torch.cat([val_joint, val_rec], dim=-1)
+                ).squeeze(-1)
             if rev_ctx_f is not None:
                 rev_scaled = rev_ctx_f * 4.0
                 value = (
@@ -3354,6 +3396,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             candidate_embeddings=cand_emb_f,
             action_mask=base.action_mask,
             durable_value=durable_value,
+            combat_value=combat_value,
         )
         if validate:
             output.validate(

@@ -99,8 +99,9 @@ class FrozenMacroRootPolicy:
         self.device = torch.device(resolved_device)
         self.encoding_config = config.model.to_encoding_config()
         revival_budget = config.curriculum.revival_budget
+        allow_zero = bool(evaluation_only_allow_zero or initialize_from_macro_publication)
         if (isinstance(revival_budget, bool) or not isinstance(revival_budget, int)
-                or revival_budget < 0 or (revival_budget == 0 and not evaluation_only_allow_zero)):
+                or revival_budget < 0 or (revival_budget == 0 and not allow_zero)):
             raise ValueError("frozen macro policy diagnostic requires a positive revival budget")
         reward_identity = act_frontloaded_death_reward_identity(revival_budget=revival_budget)
         payload = torch.load(source_path, map_location="cpu", weights_only=True)
@@ -173,6 +174,9 @@ class FrozenMacroRootPolicy:
                 "enable_balanced_deconfounded_durable_value",
                 "enable_expressive_synergy_backbone",
                 "enable_debloated_synergy_durable_value",
+                "enable_build_conditioned_durable_value",
+                "enable_twin_durable_value_heads",
+                "enable_local_combat_value_head",
             ):
                 if getattr(parsed_macro_source_cfg, flag_name) and not getattr(model_config, flag_name):
                     raise ValueError(
@@ -192,8 +196,8 @@ class FrozenMacroRootPolicy:
             if not isinstance(pub_reward, Mapping) or pub_reward.get("version") != ACT_FRONTLOADED_DEATH_REWARD_SPEC.version:
                 raise ValueError("frozen macro policy publication reward_identity is not reward-v9")
             budget = pub_reward.get("revival_budget")
-            if isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
-                raise ValueError("frozen macro policy publication requires a positive revival budget")
+            if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
+                raise ValueError("frozen macro policy publication requires a non-negative revival budget")
             if pub_reward != act_frontloaded_death_reward_identity(revival_budget=budget):
                 raise ValueError("frozen macro policy source reward_identity differs from its declared course")
             source_reward_identity = dict(pub_reward)
@@ -389,8 +393,8 @@ def load_frozen_macro_teacher(
     ):
         raise ValueError("frozen macro teacher reward_identity is not reward-v9")
     budget = pub_reward.get("revival_budget")
-    if isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0:
-        raise ValueError("frozen macro teacher requires a positive revival budget")
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
+        raise ValueError("frozen macro teacher requires a non-negative revival budget")
     if pub_reward != act_frontloaded_death_reward_identity(revival_budget=budget):
         raise ValueError("frozen macro teacher reward_identity differs from its declared course")
     policy_version = payload.get("policy_version")

@@ -57,6 +57,7 @@ _PURE_VALUE_PARAM_PREFIXES: Final[tuple[str, ...]] = (
     "state_value_head.",
     "state_revival_",
     "durable_",
+    "local_combat_value_head.",
 )
 
 
@@ -149,6 +150,16 @@ class MacroCreditLearnerConfig:
     max_parent_macro_kl: float = 0.0
     detach_macro_branch_prior_lse: bool = False
     isolate_nonreward_macro_trunk_grads: bool = False
+    macro_actor_warmup_updates: int = 0
+    linear_hp_loss_weight: float = 0.0
+    hp_loss_reference: float = 80.0
+    enable_local_combat_critic: bool = False
+    local_combat_win_reward: float = 1.0
+    local_combat_loss_reward: float = -1.0
+    local_combat_hp_weight: float = 1.5
+    local_combat_step_penalty: float = 0.004
+    local_combat_discount: float = 0.99
+    local_combat_trace_lambda: float = 0.95
 
     def __post_init__(self) -> None:
         for bool_name in (
@@ -160,6 +171,7 @@ class MacroCreditLearnerConfig:
             "minority_only_within_branch_mpo",
             "detach_macro_branch_prior_lse",
             "isolate_nonreward_macro_trunk_grads",
+            "enable_local_combat_critic",
             "separate_value_grad_clip",
             "enable_direct_vitals_context",
             "enable_macro_branch_prior",
@@ -267,6 +279,7 @@ class MacroCreditLearnerConfig:
         for name in (
             "durable_warmup_updates",
             "combat_actor_warmup_updates",
+            "macro_actor_warmup_updates",
             "revival_budget",
             "distill_teacher_rollout_updates",
             "distill_total_updates",
@@ -294,6 +307,7 @@ class MacroCreditLearnerConfig:
             "macro_pg_adv_clip",
             "combat_pg_clip_eps",
             "combat_pg_adv_clip",
+            "hp_loss_reference",
         )
         non_negative = (
             "weight_decay",
@@ -320,11 +334,29 @@ class MacroCreditLearnerConfig:
             "target_macro_step_kl",
             "macro_mpo_trust_kl_weight",
             "max_parent_macro_kl",
+            "linear_hp_loss_weight",
+            "local_combat_win_reward",
+            "local_combat_hp_weight",
+            "local_combat_step_penalty",
         )
-        for name in (*positive, *non_negative, "macro_trace_lambda"):
+        for name in (*positive, *non_negative, "macro_trace_lambda", "local_combat_trace_lambda"):
             value = getattr(self, name)
             if isinstance(value, bool) or not math.isfinite(value) or value < 0 or (name in positive and value == 0):
                 raise ValueError(f"macro credit {name} has an invalid finite range")
+        if (
+            isinstance(self.local_combat_loss_reward, bool)
+            or not math.isfinite(self.local_combat_loss_reward)
+            or self.local_combat_loss_reward > 0.0
+        ):
+            raise ValueError("macro credit local_combat_loss_reward must be finite and <= 0")
+        if (
+            isinstance(self.local_combat_discount, bool)
+            or not math.isfinite(self.local_combat_discount)
+            or not 0.0 < self.local_combat_discount <= 1.0
+        ):
+            raise ValueError("macro credit local_combat_discount must be in (0, 1]")
+        if self.local_combat_trace_lambda > 1.0:
+            raise ValueError("macro credit local_combat_trace_lambda must be <= 1")
         for unit_name in ("within_branch_minority_prob_cap", "macro_pg_fallback_scale", "mpo_parent_prior_mix"):
             u_val = getattr(self, unit_name)
             if isinstance(u_val, bool) or not math.isfinite(u_val) or not 0.0 <= u_val <= 1.0:
@@ -380,6 +412,8 @@ class _Evaluation:
     durable_bootstrap_value: Tensor | None = None
     step_log_probs: dict[int, Tensor] | None = None
     post_step_hidden: dict[int, Tensor] | None = None
+    combat_values: Tensor | None = None
+    combat_bootstrap_value: Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -518,6 +552,14 @@ class MacroCreditLearner:
                 raise ValueError(
                     "durable_afterstate_v2 requires HybridDomainActorCriticModel with enable_durable_value_head=True"
                 )
+        if self.config.enable_local_combat_critic:
+            if (
+                not isinstance(model, HybridDomainActorCriticModel)
+                or not model.actor_critic_config.enable_local_combat_value_head
+            ):
+                raise ValueError(
+                    "enable_local_combat_critic requires HybridDomainActorCriticModel with enable_local_combat_value_head=True"
+                )
         if self.config.trainable_scope == "macro_only":
             macro_tokens = (
                 "macro_stream",
@@ -568,6 +610,7 @@ class MacroCreditLearner:
         base_value_prefixes = (
             "state_value_head",
             "state_revival_",
+            "local_combat_value_head",
             "durable_cycle_",
             "durable_deck_",
             "durable_hp_",
@@ -621,6 +664,7 @@ class MacroCreditLearner:
             "candidate_role_",
             "state_value_head",
             "state_revival_",
+            "local_combat_value_head",
             "branch_policy_head",
             "branch_vitals_",
             "durable_cycle_",
@@ -761,13 +805,25 @@ class MacroCreditLearner:
             torch.tensor([boot_row], dtype=torch.float32),
         )
 
+    def _macro_actor_active_threshold(self) -> int:
+        return max(self.config.durable_warmup_updates, self.config.macro_actor_warmup_updates)
+
     def _effective_step_reward(self, trajectory: MacroCreditTrajectory, index: int) -> float:
         step = trajectory.steps[index]
+        facts = trajectory.reward_facts[index]
+        r = float(step.reward)
         if self.config.zero_macro_pace_penalty and step.control_domain == "macro":
-            return float(step.reward - trajectory.reward_facts[index].pace_penalty)
-        return float(step.reward)
+            r -= float(facts.pace_penalty)
+        if self.config.linear_hp_loss_weight > 0.0:
+            r = (
+                r
+                - float(facts.hp_loss_penalty)
+                - float(self.config.linear_hp_loss_weight)
+                * (float(facts.player_hp_lost_delta) / float(self.config.hp_loss_reference))
+            )
+        return r
 
-    def _forward_full(
+    def _forward_full_v2(
         self,
         snapshot: EncodedDecisionSnapshot,
         hidden: Tensor | None,
@@ -776,9 +832,10 @@ class MacroCreditLearner:
         model_override: HybridDomainActorCriticModel | None = None,
         compute_durable_value: bool = True,
         policy_detach_trunk_mask: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None, Tensor]:
         self._check_resource()
         durable_value: Tensor | None = None
+        combat_value: Tensor | None = None
         active_mod = self.model if model_override is None else model_override
         if self._forward_override is not None and model_override is None:
             logits, value, next_hidden = self._forward_override(snapshot, hidden)
@@ -807,18 +864,40 @@ class MacroCreditLearner:
             logits, value, next_hidden = output.policy_logits[0], output.value.reshape(()), output.recurrent_state
             if output.durable_value is not None:
                 durable_value = output.durable_value.reshape(())
+            if output.combat_value is not None:
+                combat_value = output.combat_value.reshape(())
         if logits.ndim != 1 or logits.numel() < snapshot.candidate_count or value.numel() != 1:
             raise ValueError("macro actor-critic forward has invalid logits/value shapes")
         if next_hidden.ndim != 2 or next_hidden.shape[0] != 1:
             raise ValueError("macro actor-critic forward must return one recurrent state")
-        checked: tuple[Tensor, ...] = (
-            (logits, value, next_hidden, durable_value)
-            if durable_value is not None
-            else (logits, value, next_hidden)
-        )
-        if not all(bool(torch.isfinite(item).all().item()) for item in checked):
+        checked_list: list[Tensor] = [logits, value, next_hidden]
+        if durable_value is not None:
+            checked_list.append(durable_value)
+        if combat_value is not None:
+            checked_list.append(combat_value)
+        if not all(bool(torch.isfinite(item).all().item()) for item in checked_list):
             raise FloatingPointError("macro actor-critic forward is non-finite")
-        return logits, value.reshape(()), durable_value, next_hidden
+        return logits, value.reshape(()), durable_value, combat_value, next_hidden
+
+    def _forward_full(
+        self,
+        snapshot: EncodedDecisionSnapshot,
+        hidden: Tensor | None,
+        *,
+        critic_revival_context: Tensor | None = None,
+        model_override: HybridDomainActorCriticModel | None = None,
+        compute_durable_value: bool = True,
+        policy_detach_trunk_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor]:
+        logits, value, durable_value, _, next_hidden = self._forward_full_v2(
+            snapshot,
+            hidden,
+            critic_revival_context=critic_revival_context,
+            model_override=model_override,
+            compute_durable_value=compute_durable_value,
+            policy_detach_trunk_mask=policy_detach_trunk_mask,
+        )
+        return logits, value, durable_value, next_hidden
 
     def _forward(self, snapshot: EncodedDecisionSnapshot, hidden: Tensor | None) -> tuple[Tensor, Tensor, Tensor]:
         logits, value, _, next_hidden = self._forward_full(snapshot, hidden)
@@ -970,6 +1049,7 @@ class MacroCreditLearner:
         boundaries: dict[int, Tensor | None] = {}
         values: list[Tensor] = []
         durable_values: list[Tensor] = []
+        combat_values: list[Tensor] = []
         logs: list[Tensor] = []
         step_log_probs: dict[int, Tensor] = {}
         post_step_hidden: dict[int, Tensor] = {}
@@ -983,7 +1063,7 @@ class MacroCreditLearner:
                 if step_rev_cpu is None
                 else step_rev_cpu[index : index + 1].to(device=self.device, dtype=self.dtype)
             )
-            logits, value, durable_val, hidden = self._forward_full(
+            logits, value, durable_val, combat_val, hidden = self._forward_full_v2(
                 step.snapshot,
                 hidden,
                 critic_revival_context=rev_step_gpu,
@@ -1023,18 +1103,21 @@ class MacroCreditLearner:
                     step_log_probs[index] = policy.detach().cpu().clone()
             elif record_all_choice_logs and int(step.snapshot.action_mask.sum()) > 1:
                 step_log_probs[index] = policy.detach().cpu().clone()
+            if combat_val is not None:
+                combat_values.append(combat_val.detach().cpu().clone())
             values.append(value.detach().cpu().clone())
             logs.append(selected.detach().cpu().clone())
             calls += 1
         bootstrap = None
         durable_bootstrap = None
+        combat_bootstrap = None
         if trajectory.bootstrap_snapshot is not None:
             boot_rev_gpu = (
                 None
                 if boot_rev_cpu is None
                 else boot_rev_cpu.to(device=self.device, dtype=self.dtype)
             )
-            _, bootstrap_val, durable_boot, _ = self._forward_full(
+            _, bootstrap_val, durable_boot, combat_boot, _ = self._forward_full_v2(
                 trajectory.bootstrap_snapshot,
                 hidden,
                 critic_revival_context=boot_rev_gpu,
@@ -1046,6 +1129,8 @@ class MacroCreditLearner:
                 if durable_boot is None:
                     raise ValueError("durable_afterstate_v2 requires durable_value on bootstrap snapshot")
                 durable_bootstrap = durable_boot.detach().cpu().clone()
+            if combat_boot is not None:
+                combat_bootstrap = combat_boot.detach().cpu().clone()
             calls += 1
         return _Evaluation(
             torch.stack(values),
@@ -1059,6 +1144,8 @@ class MacroCreditLearner:
             durable_bootstrap_value=durable_bootstrap,
             step_log_probs=step_log_probs if (is_durable_v2 or record_all_choice_logs) else None,
             post_step_hidden=post_step_hidden if is_durable_v2 else None,
+            combat_values=torch.stack(combat_values) if combat_values else None,
+            combat_bootstrap_value=combat_bootstrap,
         )
 
     def _targets(
@@ -1127,6 +1214,7 @@ class MacroCreditLearner:
             self.model if model_override is None else model_override,
         )
         use_rev = self._use_revival_ctx(ac_model)
+        has_local_combat = bool(ac_model.actor_critic_config.enable_local_combat_value_head)
         results: list[_Evaluation] = []
         high_vram = self._has_high_vram()
         batch_cap = (
@@ -1173,6 +1261,7 @@ class MacroCreditLearner:
             boundaries_list: list[dict[int, Tensor | None]] = [{} for _ in range(m)]
             values_list: list[list[Tensor]] = [[] for _ in range(m)]
             durable_values_list: list[list[Tensor]] = [[] for _ in range(m)]
+            combat_values_list: list[list[Tensor]] = [[] for _ in range(m)]
             logs_list: list[list[Tensor]] = [[] for _ in range(m)]
             step_log_probs_list: list[dict[int, Tensor]] = [{} for _ in range(m)]
             post_step_hidden_list: list[dict[int, Tensor]] = [{} for _ in range(m)]
@@ -1184,6 +1273,7 @@ class MacroCreditLearner:
             step_logs_gpu: list[Tensor] = []
             step_vals_gpu: list[Tensor] = []
             step_durs_gpu: list[Tensor] = []
+            step_cvals_gpu: list[Tensor] = []
             boundary_hids_gpu: dict[int, Tensor | None] = {}
             post_hids_gpu: dict[int, Tensor] = {}
             finite_ok = torch.ones((), device=self.device, dtype=torch.bool)
@@ -1255,6 +1345,9 @@ class MacroCreditLearner:
                 if compute_durable_value:
                     assert output.durable_value is not None
                     finite_ok = finite_ok & torch.isfinite(output.durable_value).all()
+                if has_local_combat:
+                    assert output.combat_value is not None
+                    finite_ok = finite_ok & torch.isfinite(output.combat_value).all()
                 hidden[active] = output.recurrent_state.detach()
                 for i in active:
                     has_hidden[i] = True
@@ -1263,6 +1356,9 @@ class MacroCreditLearner:
                 if compute_durable_value:
                     assert output.durable_value is not None
                     step_durs_gpu.append(output.durable_value.detach())
+                if has_local_combat:
+                    assert output.combat_value is not None
+                    step_cvals_gpu.append(output.combat_value.detach())
                 if any(t in afterstate_sets[i] for i in active):
                     post_hids_gpu[t] = output.recurrent_state.detach().clone()
 
@@ -1272,6 +1368,7 @@ class MacroCreditLearner:
             if t_max > 0:
                 flat_vals_cpu = torch.cat(step_vals_gpu, dim=0).cpu()
                 flat_durs_cpu = torch.cat(step_durs_gpu, dim=0).cpu() if compute_durable_value else None
+                flat_cvals_cpu = torch.cat(step_cvals_gpu, dim=0).cpu() if has_local_combat else None
                 flat_logs_cpu = torch.cat([lg.reshape(-1) for lg in step_logs_gpu], dim=0).cpu()
                 boundary_hids_cpu = {
                     t: (None if h is None else h.cpu()) for t, h in boundary_hids_gpu.items()
@@ -1289,6 +1386,11 @@ class MacroCreditLearner:
                     durs_t_cpu = (
                         flat_durs_cpu[v_offset : v_offset + k_len]
                         if flat_durs_cpu is not None
+                        else None
+                    )
+                    cvals_t_cpu = (
+                        flat_cvals_cpu[v_offset : v_offset + k_len]
+                        if flat_cvals_cpu is not None
                         else None
                     )
                     v_offset += k_len
@@ -1319,6 +1421,8 @@ class MacroCreditLearner:
                                 )
                         if durs_t_cpu is not None:
                             durable_values_list[i].append(durs_t_cpu[k].clone())
+                        if cvals_t_cpu is not None:
+                            combat_values_list[i].append(cvals_t_cpu[k].clone())
                         values_list[i].append(vals_t_cpu[k].clone())
                         logs_list[i].append(selected.clone())
                         if t in afterstate_sets[i]:
@@ -1338,6 +1442,7 @@ class MacroCreditLearner:
             )
             boot_vals: dict[int, Tensor] = {}
             dur_boot_vals: dict[int, Tensor] = {}
+            combat_boot_vals: dict[int, Tensor] = {}
             new_boot_packed: PackedSnapshotBatch | None = None
             if boot_indices:
                 self._check_resource()
@@ -1392,6 +1497,9 @@ class MacroCreditLearner:
                 if compute_durable_value:
                     assert boot_out.durable_value is not None
                     boot_ok = boot_ok & torch.isfinite(boot_out.durable_value).all()
+                if has_local_combat:
+                    assert boot_out.combat_value is not None
+                    boot_ok = boot_ok & torch.isfinite(boot_out.combat_value).all()
                 if not bool(boot_ok.item()):
                     raise FloatingPointError("macro actor-critic bootstrap forward is non-finite")
                 b_val_cpu = boot_out.value.detach().cpu()
@@ -1400,10 +1508,17 @@ class MacroCreditLearner:
                     if compute_durable_value and boot_out.durable_value is not None
                     else None
                 )
+                b_cval_cpu = (
+                    boot_out.combat_value.detach().cpu()
+                    if has_local_combat and boot_out.combat_value is not None
+                    else None
+                )
                 for k, i in enumerate(boot_indices):
                     boot_vals[i] = b_val_cpu[k].clone()
                     if b_dur_cpu is not None:
                         dur_boot_vals[i] = b_dur_cpu[k].clone()
+                    if b_cval_cpu is not None:
+                        combat_boot_vals[i] = b_cval_cpu[k].clone()
                     calls[i] += 1
             if building_cache and packed_cache is not None:
                 packed_cache[cache_key] = _CachedEvalGroup(
@@ -1426,6 +1541,12 @@ class MacroCreditLearner:
                         durable_bootstrap_value=dur_boot_vals.get(i) if compute_durable_value else None,
                         step_log_probs=step_log_probs_list[i],
                         post_step_hidden=post_step_hidden_list[i],
+                        combat_values=(
+                            torch.stack(combat_values_list[i])
+                            if has_local_combat and combat_values_list[i]
+                            else None
+                        ),
+                        combat_bootstrap_value=combat_boot_vals.get(i) if has_local_combat else None,
                     )
                 )
         return results
@@ -1463,7 +1584,7 @@ class MacroCreditLearner:
         if self.config.enable_hierarchical_afterstate_mpo:
             effective_within_kl = (
                 self.config.macro_within_branch_kl
-                if self.update >= self.config.durable_warmup_updates
+                if self.update >= self._macro_actor_active_threshold()
                 else 0.0
             )
             branch_ids = torch.tensor(
@@ -1653,7 +1774,7 @@ class MacroCreditLearner:
             )
 
         effective_macro_kl = (
-            self.config.macro_kl if self.update >= self.config.durable_warmup_updates else 0.0
+            self.config.macro_kl if self.update >= self._macro_actor_active_threshold() else 0.0
         )
         prepared_out: list[_PreparedReference] = []
         for ref_idx, (reference, evaluation) in enumerate(zip(references, evaluations, strict=True)):
@@ -1786,7 +1907,7 @@ class MacroCreditLearner:
             raw_macro_adv = adv_cap * torch.tanh(raw_macro_adv / adv_cap)
         durable_macro_advantages = raw_macro_adv.detach()
         effective_macro_kl = (
-            self.config.macro_kl if self.update >= self.config.durable_warmup_updates else 0.0
+            self.config.macro_kl if self.update >= self._macro_actor_active_threshold() else 0.0
         )
         afterstate_targets: dict[int, _AfterstateStepTarget] = {}
         calls = evaluation.forward_calls
@@ -1932,7 +2053,114 @@ class MacroCreditLearner:
             evaluation.maximum_likelihood_error,
         )
 
+    def _local_combat_targets(
+        self,
+        reference: MacroCreditTrajectory,
+        evaluation: _Evaluation,
+    ) -> tuple[Tensor, Tensor]:
+        if evaluation.combat_values is None:
+            raise ValueError(
+                "enable_local_combat_critic requires evaluation.combat_values from HybridDomainActorCriticModel"
+            )
+        cfg = self.config
+        combat_preds = evaluation.combat_values
+        n_steps = len(reference.steps)
+        combat_targets = torch.zeros_like(combat_preds)
+        combat_advantages = torch.zeros_like(combat_preds)
+
+        log_rho_clip = math.log(cfg.rho_clip)
+        log_c_clip = math.log(cfg.c_clip)
+        log_pol_clip = math.log(cfg.policy_rho_clip)
+        lam = float(cfg.local_combat_trace_lambda)
+        gamma = float(cfg.local_combat_discount)
+
+        idx = 0
+        while idx < n_steps:
+            if reference.steps[idx].control_domain != "combat":
+                idx += 1
+                continue
+            seg_start = idx
+            seg_end = idx
+            while seg_end < n_steps:
+                step_i = reference.steps[seg_end]
+                facts_i = reference.reward_facts[seg_end]
+                encounter_done = (
+                    seg_end == n_steps - 1
+                    or reference.steps[seg_end + 1].control_domain != "combat"
+                    or facts_i.revivals_used_delta > 0
+                    or step_i.terminal
+                    or facts_i.floor_after > facts_i.floor_before
+                )
+                if encounter_done:
+                    break
+                seg_end += 1
+
+            k_len = seg_end - seg_start + 1
+            seg_rewards_list: list[float] = []
+            for s_i in range(seg_start, seg_end + 1):
+                f_s = reference.reward_facts[s_i]
+                r_s = (
+                    -cfg.local_combat_hp_weight
+                    * (float(f_s.player_hp_lost_delta) / cfg.hp_loss_reference)
+                    - cfg.local_combat_step_penalty
+                )
+                if s_i == seg_end:
+                    st_end = reference.steps[seg_end]
+                    died_in_combat = f_s.revivals_used_delta > 0 or (
+                        st_end.terminal and f_s.terminal_reward <= 0.0
+                    )
+                    r_s += (
+                        cfg.local_combat_loss_reward
+                        if died_in_combat
+                        else cfg.local_combat_win_reward
+                    )
+                seg_rewards_list.append(r_s)
+
+            seg_preds = combat_preds[seg_start : seg_end + 1]
+            seg_rewards = seg_preds.new_tensor(seg_rewards_list)
+            seg_discounts = seg_preds.new_full((k_len,), gamma)
+            seg_discounts[-1] = 0.0
+
+            behavior = seg_preds.new_tensor(
+                [reference.steps[s_i].behavior_log_probability for s_i in range(seg_start, seg_end + 1)]
+            )
+            log_diff = evaluation.selected_logs[seg_start : seg_end + 1] - behavior
+            rhos = torch.exp(log_diff.clamp(max=log_rho_clip))
+            cs = torch.exp(log_diff.clamp(max=log_c_clip))
+            policy_rho = torch.exp(log_diff.clamp(max=log_pol_clip))
+
+            v_seg = torch.empty_like(seg_preds)
+            q_seg = torch.empty_like(seg_preds)
+            v_next = seg_preds.new_zeros(())
+            v_pred_next = seg_preds.new_zeros(())
+            for k in range(k_len - 1, -1, -1):
+                r_k = seg_rewards[k]
+                d_k = seg_discounts[k]
+                q_k = r_k + d_k * (v_pred_next + lam * (v_next - v_pred_next))
+                v_k = (
+                    seg_preds[k]
+                    + rhos[k] * (r_k + d_k * v_pred_next - seg_preds[k])
+                    + d_k * lam * cs[k] * (v_next - v_pred_next)
+                )
+                q_seg[k] = q_k
+                v_seg[k] = v_k
+                v_next = v_k
+                v_pred_next = seg_preds[k]
+
+            raw_adv = policy_rho * (q_seg - seg_preds)
+            if cfg.clip_combat_pg:
+                c_adv_cap = cfg.combat_pg_adv_clip
+                raw_adv = c_adv_cap * torch.tanh(raw_adv / c_adv_cap)
+
+            combat_targets[seg_start : seg_end + 1] = v_seg
+            combat_advantages[seg_start : seg_end + 1] = raw_adv
+            idx = seg_end + 1
+
+        return combat_targets, combat_advantages
+
     def _combat_targets(self, reference: MacroCreditTrajectory, evaluation: _Evaluation) -> tuple[Tensor, Tensor]:
+        if self.config.enable_local_combat_critic:
+            return self._local_combat_targets(reference, evaluation)
         combat_values = torch.empty_like(evaluation.values)
         combat_advantages = torch.empty_like(evaluation.values)
         for start in range(0, len(reference.steps), self.config.combat_unroll_steps):
@@ -2068,7 +2296,7 @@ class MacroCreditLearner:
             and isinstance(self.model, HybridDomainActorCriticModel)
             and self.model.actor_critic_config.enable_twin_durable_value_heads
         )
-        durable_actor_active = (not is_durable_v2) or (self.update >= cfg.durable_warmup_updates)
+        durable_actor_active = (not is_durable_v2) or (self.update >= self._macro_actor_active_threshold())
         combat_actor_active = (not is_durable_v2) or (self.update >= cfg.combat_actor_warmup_updates)
         for index in range(start, stop):
             step = prepared.reference.steps[index]
@@ -2081,7 +2309,7 @@ class MacroCreditLearner:
             single_detach_mask: Tensor | None = None
             if cfg.isolate_nonreward_macro_trunk_grads and step.control_domain == "macro" and step.surface != "reward":
                 single_detach_mask = torch.ones((1,), device=self.device, dtype=torch.bool)
-            logits, value, durable_value, hidden = self._forward_full(
+            logits, value, durable_value, combat_value, hidden = self._forward_full_v2(
                 step.snapshot,
                 hidden,
                 critic_revival_context=step_rev_gpu,
@@ -2379,8 +2607,9 @@ class MacroCreditLearner:
                     if cfg.macro_policy_weight:
                         terms.append(0.5 * cfg.macro_policy_weight * actor)
             else:
-                target = prepared.combat_values[index].to(device=self.device, dtype=value.dtype)
-                value_loss = F.smooth_l1_loss(value, target) / denominators["combat_steps"]
+                c_pred = value if combat_value is None else combat_value
+                target = prepared.combat_values[index].to(device=self.device, dtype=c_pred.dtype)
+                value_loss = F.smooth_l1_loss(c_pred, target) / denominators["combat_steps"]
                 totals["combat_value_loss"] += float(value_loss.detach().item())
                 if cfg.combat_value_weight:
                     terms.append(0.5 * cfg.combat_value_weight * value_loss)
@@ -3027,7 +3256,7 @@ class MacroCreditLearner:
         warmup_trunk_frozen = (
             cfg.freeze_trunk_during_durable_warmup and self.update < cfg.durable_warmup_updates
         )
-        durable_actor_active = (not warmup_trunk_frozen) and (self.update >= cfg.durable_warmup_updates)
+        durable_actor_active = (not warmup_trunk_frozen) and (self.update >= self._macro_actor_active_threshold())
         combat_actor_active = (not warmup_trunk_frozen) and (self.update >= cfg.combat_actor_warmup_updates)
         totals = {
             key: 0.0
@@ -3379,6 +3608,8 @@ class MacroCreditLearner:
                     & torch.isfinite(output.recurrent_state).all()
                     & torch.isfinite(safe_logs).all()
                 )
+                if output.combat_value is not None:
+                    finite_ok = finite_ok & torch.isfinite(output.combat_value).all()
                 probs = all_logs.exp().masked_fill(~masks, 0.0)
                 all_entropies = -(probs * safe_logs).sum(dim=-1)
                 act_idx_k = flat_action_idx_gpu[gids_gpu]
@@ -3764,8 +3995,9 @@ class MacroCreditLearner:
 
                 if any_combat:
                     is_combat_k = ~is_macro_k
+                    c_pred_vec = output.value if output.combat_value is None else output.combat_value
                     combat_huber = F.smooth_l1_loss(
-                        output.value, flat_combat_val[gids_gpu], reduction="none"
+                        c_pred_vec, flat_combat_val[gids_gpu], reduction="none"
                     )
                     c_val_loss = torch.where(is_combat_k, combat_huber, 0.0).sum() / denom_combat_steps
                     slice_totals_gpu["combat_value_loss"] = (
@@ -4199,6 +4431,8 @@ class MacroCreditLearner:
                     & torch.isfinite(output.recurrent_state).all()
                     & torch.isfinite(safe_logs).all()
                 )
+                if output.combat_value is not None:
+                    finite_ok = finite_ok & torch.isfinite(output.combat_value).all()
                 probs = all_logs.exp().masked_fill(~masks, 0.0)
                 all_entropies = -(probs * safe_logs).sum(dim=-1)
 
@@ -4460,8 +4694,9 @@ class MacroCreditLearner:
 
                 if any_combat:
                     is_combat_k = ~is_macro_k
+                    c_pred_vec = output.value if output.combat_value is None else output.combat_value
                     combat_huber = F.smooth_l1_loss(
-                        output.value, flat_combat_val[gids_gpu], reduction="none"
+                        c_pred_vec, flat_combat_val[gids_gpu], reduction="none"
                     )
                     c_val_loss = torch.where(is_combat_k, combat_huber, 0.0).sum() / denom_combat_steps
                     slice_totals_gpu["combat_value_loss"] = (
@@ -4680,6 +4915,7 @@ class MacroCreditLearner:
                     (
                         "state_value_head",
                         "state_revival_",
+                        "local_combat_value_head",
                         "durable_cycle_",
                         "durable_deck_",
                         "durable_hp_",

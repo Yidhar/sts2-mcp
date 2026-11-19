@@ -706,7 +706,7 @@ class CurriculumConfig:
     """Task horizon and exploration schedule without mechanics rules."""
 
     mode: Literal["standard", "native-revival-preheat"] = "standard"
-    reward_objective: Literal["combat", "act1", "run"] = "run"
+    reward_objective: Literal["combat", "act1", "act2", "run"] = "run"
     revival_mechanism: Literal["engine-bailout-v1"] | None = None
     revival_budget: int | None = None
     epsilon_start: float = 0.30
@@ -716,8 +716,8 @@ class CurriculumConfig:
     def __post_init__(self) -> None:
         if self.mode not in {"standard", "native-revival-preheat"}:
             raise ValueError("unsupported curriculum mode")
-        if self.reward_objective not in {"combat", "act1", "run"}:
-            raise ValueError("reward_objective must be combat, act1, or run")
+        if self.reward_objective not in {"combat", "act1", "act2", "run"}:
+            raise ValueError("reward_objective must be combat, act1, act2, or run")
         _require_optional_text(
             self.revival_mechanism,
             label="curriculum.revival_mechanism",

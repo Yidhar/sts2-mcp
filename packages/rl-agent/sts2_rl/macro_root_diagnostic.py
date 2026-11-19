@@ -255,10 +255,16 @@ def _floor(state: EnvironmentResult) -> int:
     return floor
 
 
-def validate_course(config: TrainingConfig, *, allow_zero_budget: bool = False) -> int:
+def validate_course(
+    config: TrainingConfig,
+    *,
+    allow_zero_budget: bool = False,
+    allow_act_objectives: bool = False,
+) -> int:
     if config.environment.backend != "headless" or config.environment.scenario != "full-run":
         raise ValueError("B0 requires the isolated headless full-run course")
-    if config.curriculum.mode != "native-revival-preheat" or config.curriculum.reward_objective != "run":
+    allowed_objectives = {"act1", "act2", "run"} if allow_act_objectives else {"run"}
+    if config.curriculum.mode != "native-revival-preheat" or config.curriculum.reward_objective not in allowed_objectives:
         raise ValueError("B0 requires the native-revival-preheat run objective")
     budget = config.curriculum.revival_budget
     if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0 or (budget == 0 and not allow_zero_budget):

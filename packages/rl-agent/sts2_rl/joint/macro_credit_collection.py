@@ -299,6 +299,8 @@ class TrainingEvidenceTrace(_GuardedEvidenceTrace):
         self.max_floor = 0
         self.previous_run: dict[str, Any] = {}
         self.last_combat_run: dict[str, Any] = {}
+        self.last_task_terminal: bool = False
+        self.last_task_outcome: str | None = None
 
     def _close_edge(self, floor: int, terminal: bool) -> None:
         if self.pending is None:
@@ -349,10 +351,14 @@ class TrainingEvidenceTrace(_GuardedEvidenceTrace):
             current_run = (self.last_state.get("observation") or {}).get("run") or {}
             self.max_floor = max(self.max_floor, int(current_run.get("floor") or 0))
         if kind == "transition":
-            self.episode_return += self.episode_weight * sum(float(facts["reward_breakdown"][key]) for key in COMPONENTS)
+            rb = facts["reward_breakdown"]
+            self.last_task_terminal = bool(rb.get("task_terminal"))
+            raw_out = rb.get("outcome")
+            self.last_task_outcome = str(raw_out) if isinstance(raw_out, str) else None
+            self.episode_return += self.episode_weight * sum(float(rb[key]) for key in COMPONENTS)
             self.episode_weight *= float(facts["native_discount"]["discount"])
             self.episode_native_steps += 1
-            deaths = int(facts["reward_breakdown"].get("revivals_used_delta", 0))
+            deaths = int(rb.get("revivals_used_delta", 0))
             if deaths:
                 counters = facts["state"]["observation"].get("_training", {})
                 self.revival_events.append({
@@ -483,9 +489,22 @@ class TrainingEvidenceTrace(_GuardedEvidenceTrace):
             final_deck_size = raw_deck
         elif isinstance(raw_deck, Sequence) and not isinstance(raw_deck, str | bytes):
             final_deck_size = len(raw_deck)
-        outcome = (state.get("transition") or {}).get("facts", {}).get("run_result")
-        complete = (ending == "factual_terminal" and state.get("terminated") is True
-                    and state.get("truncated") is False and outcome in {"victory", "defeat"})
+        raw_outcome = (state.get("transition") or {}).get("facts", {}).get("run_result")
+        act_clear_victory = (
+            ending == "factual_terminal"
+            and state.get("truncated") is False
+            and self.last_task_terminal
+            and self.last_task_outcome == "success"
+        )
+        outcome = "victory" if act_clear_victory else raw_outcome
+        complete = (
+            ending == "factual_terminal"
+            and state.get("truncated") is False
+            and (
+                act_clear_victory
+                or (state.get("terminated") is True and outcome in {"victory", "defeat"})
+            )
+        )
         return {"seed": seed, "status": "complete" if complete else "incomplete", "ending": ending,
                 "scope": "natural stochastic training episode; reused for gradient update, not held-out evaluation",
                 "teacher_version": self.authority.teacher_version, "run_result": outcome,
@@ -787,7 +806,11 @@ def collect_durable_afterstate_episode(
 ) -> tuple[MacroCreditTrajectory, dict[str, Any]]:
     """Collect one complete full-run episode with multi-node deterministic afterstate synthesis."""
     training_seed(seed)
-    validate_course(config)
+    validate_course(
+        config,
+        allow_zero_budget=True,
+        allow_act_objectives=True,
+    )
     if not limits.terminal_only:
         raise ValueError("durable_afterstate_v2 episode collection requires limits.terminal_only=True")
     if isinstance(teacher_version, bool) or not isinstance(teacher_version, int) or teacher_version < 0:
@@ -865,6 +888,8 @@ def collect_durable_afterstate_episode(
                 ),
                 forced_candidate=None,
                 authority=authority,
+                allow_zero_budget_training=(config.curriculum.revival_budget == 0),
+                allow_act_objectives=True,
             )
             episode_stats = capture.episode_statistics(seed=seed, ending=result["ending"])
             report["training_episode"] = episode_stats

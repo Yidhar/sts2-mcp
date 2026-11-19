@@ -78,13 +78,21 @@ if wrapper_stage_f.is_file():
     except Exception:
         pass
 remote_revival_budget = None
+remote_reward_objective = None
 course_file = local_dir / "course.json"
 if course_file.is_file():
     try:
         course_raw = json.loads(course_file.read_text())
         rb = (course_raw.get("reward_identity") or {}).get("revival_budget")
-        if isinstance(rb, int) and not isinstance(rb, bool) and rb > 0:
+        if isinstance(rb, int) and not isinstance(rb, bool) and rb >= 0:
             remote_revival_budget = int(rb)
+        ro = (
+            ((course_raw.get("course_config") or {}).get("training") or {})
+            .get("curriculum", {})
+            .get("reward_objective")
+        )
+        if isinstance(ro, str) and ro in {"act1", "act2", "run"}:
+            remote_reward_objective = ro
     except Exception:
         pass
 
@@ -199,6 +207,7 @@ print(json.dumps({
     "sim_workers": sim_workers,
     "status": status,
     "revival_budget": remote_revival_budget,
+    "reward_objective": remote_reward_objective,
     "updates": updates,
     "history": history,
     "heldout_evaluations": heldout_evaluations,
@@ -866,8 +875,14 @@ def sync_once(
 
     effective_revival_budget = int(revival_budget)
     rb_remote = remote_bundle.get("revival_budget")
-    if isinstance(rb_remote, int) and not isinstance(rb_remote, bool) and rb_remote > 0:
+    if isinstance(rb_remote, int) and not isinstance(rb_remote, bool) and rb_remote >= 0:
         effective_revival_budget = int(rb_remote)
+    ro_remote = remote_bundle.get("reward_objective")
+    effective_reward_objective = (
+        str(ro_remote)
+        if isinstance(ro_remote, str) and ro_remote in {"act1", "act2", "run"}
+        else ("act1" if "act1" in lineage else ("act2" if "act2" in lineage else "run"))
+    )
 
     if not metrics_path.is_file() or metrics_path.stat().st_size == 0:
         earliest_mtime = _finite(updates_by_num[min(updates_by_num)].get("_mtime")) if updates_by_num else None
@@ -881,7 +896,9 @@ def sync_once(
                 "unix_s": start_ts,
                 "config": {
                     "profile": (
-                        "durable_afterstate_v6"
+                        "durable_afterstate_v7"
+                        if "v7" in lineage
+                        else "durable_afterstate_v6"
                         if "v6" in lineage
                         else (
                             "durable_afterstate_v4"
@@ -890,7 +907,11 @@ def sync_once(
                         )
                     ),
                     "version": (
-                        "sts2-durable-afterstate-v6.4-ratchet"
+                        "sts2-durable-afterstate-v7.0-act-b0"
+                        if ("v7-0" in lineage or "v7.0" in lineage or "v7" in lineage)
+                        else "sts2-durable-afterstate-v6.6-ratchet"
+                        if ("v6-6" in lineage or "v6.6" in lineage)
+                        else "sts2-durable-afterstate-v6.4-ratchet"
                         if ("v6-4" in lineage or "v6.4" in lineage)
                         else "sts2-durable-afterstate-v6.3-ratchet"
                         if ("v6-3" in lineage or "v6.3" in lineage or "ratchet" in lineage)
@@ -908,7 +929,7 @@ def sync_once(
                     ),
                     "curriculum": {
                         "mode": "native-revival-preheat",
-                        "reward_objective": "run",
+                        "reward_objective": effective_reward_objective,
                         "revival_budget": effective_revival_budget,
                     },
                     "model": {
@@ -1397,7 +1418,12 @@ def _sync_ratchet_tick(
     max_stage_updates = int(ratchet_info.get("max_updates_per_stage") or 80)
     cur_lineage = str(ratchet_info["current_lineage"]).strip().replace("_", "-")
     cur_local_dir = str(ratchet_info["current_local_dir"])
-    cur_budget = int(ratchet_info.get("current_budget") or 24)
+    raw_cur_budget = ratchet_info.get("current_budget")
+    cur_budget = (
+        int(raw_cur_budget)
+        if isinstance(raw_cur_budget, int) and not isinstance(raw_cur_budget, bool)
+        else 24
+    )
     cur_state = str(ratchet_info.get("state") or "")
     campaigns_parent = str(Path(cur_local_dir).parent).replace("\\", "/")
 
@@ -1408,7 +1434,12 @@ def _sync_ratchet_tick(
             if not isinstance(entry, Mapping):
                 continue
             p_lin = str(entry.get("lineage_id") or "").strip().replace("_", "-")
-            p_bud = int(entry.get("budget") or 24)
+            raw_p_bud = entry.get("budget")
+            p_bud = (
+                int(raw_p_bud)
+                if isinstance(raw_p_bud, int) and not isinstance(raw_p_bud, bool)
+                else 24
+            )
             p_upd = int(entry.get("promoted_at_update") or max_stage_updates)
             if not p_lin or p_lin == cur_lineage or _is_local_stage_terminal(root, p_lin):
                 continue

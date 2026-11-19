@@ -19,7 +19,7 @@ from typing import Any, Final, Literal
 
 from sts2_rl.contracts import EnvironmentResult
 
-TaskObjective = Literal["combat", "act1", "run"]
+TaskObjective = Literal["combat", "act1", "act2", "run"]
 TaskOutcome = Literal["ongoing", "success", "failure", "deadlock", "horizon"]
 
 
@@ -358,8 +358,8 @@ class TaskRewardCalculator:
         discount: float = 0.997,
         spec: TaskRewardSpec | AbsoluteDeathPriceTaskRewardSpec = TASK_REWARD_SPEC,
     ) -> None:
-        if objective not in {"combat", "act1", "run"}:
-            raise ValueError("objective must be combat, act1, or run")
+        if objective not in {"combat", "act1", "act2", "run"}:
+            raise ValueError("objective must be combat, act1, act2, or run")
         normalized_discount = float(discount)
         if not math.isfinite(normalized_discount) or not 0.0 < normalized_discount <= 1.0:
             raise ValueError("discount must be finite and in (0, 1]")
@@ -381,9 +381,11 @@ class TaskRewardCalculator:
         act, _, _ = _run_position(after.observation)
         if self.objective == "act1" and act >= self.spec.act1_success_act:
             return "success"
+        if self.objective == "act2" and act >= self.spec.act1_success_act + 1:
+            return "success"
         if not after.terminated:
             return "ongoing"
-        if self.objective == "act1":
+        if self.objective in {"act1", "act2"}:
             return "failure"
         terminal_result = _typed_terminal_result(after, objective=self.objective)
         return "success" if terminal_result == "victory" else "failure"
@@ -412,7 +414,7 @@ class TaskRewardCalculator:
             "horizon": self.spec.horizon_reward,
         }[outcome]
         progress_reward = 0.0
-        if self.objective in {"act1", "run"}:
+        if self.objective in {"act1", "act2", "run"}:
             before_progress = _run_position(before.observation)[2]
             after_progress = _run_position(after.observation)[2]
             progress_reward = self.spec.run_progress_reward_weight * max(0.0, after_progress - before_progress)
@@ -437,8 +439,8 @@ class RevivalEfficiencyRewardCalculator:
         objective: TaskObjective = "combat",
         discount: float = 1.0,
     ) -> None:
-        if objective not in {"combat", "act1", "run"}:
-            raise ValueError("objective must be combat, act1, or run")
+        if objective not in {"combat", "act1", "act2", "run"}:
+            raise ValueError("objective must be combat, act1, act2, or run")
         if isinstance(maximum_episode_steps, bool) or maximum_episode_steps <= 0:
             raise ValueError("maximum_episode_steps must be a positive integer")
         if float(discount) != REVIVAL_EFFICIENCY_REWARD_SPEC.required_discount:
@@ -526,8 +528,8 @@ class AbsoluteDeathPriceRewardCalculator:
         objective: TaskObjective = "combat",
         discount: float = 1.0,
     ) -> None:
-        if objective not in {"combat", "act1", "run"}:
-            raise ValueError("objective must be combat, act1, or run")
+        if objective not in {"combat", "act1", "act2", "run"}:
+            raise ValueError("objective must be combat, act1, act2, or run")
         if isinstance(maximum_episode_steps, bool) or maximum_episode_steps <= 0:
             raise ValueError("maximum_episode_steps must be a positive integer")
         if float(discount) != ABSOLUTE_DEATH_PRICE_REWARD_SPEC.required_discount:
@@ -615,8 +617,8 @@ class ActFrontloadedDeathRewardCalculator:
         objective: TaskObjective = "combat",
         discount: float = 1.0,
     ) -> None:
-        if objective not in {"combat", "act1", "run"}:
-            raise ValueError("objective must be combat, act1, or run")
+        if objective not in {"combat", "act1", "act2", "run"}:
+            raise ValueError("objective must be combat, act1, act2, or run")
         if isinstance(maximum_episode_steps, bool) or maximum_episode_steps <= 0:
             raise ValueError("maximum_episode_steps must be a positive integer")
         if isinstance(revival_budget, bool) or not isinstance(revival_budget, int):

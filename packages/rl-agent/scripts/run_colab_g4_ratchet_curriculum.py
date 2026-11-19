@@ -50,6 +50,12 @@ class RatchetStageSpec:
     seed_index_offset: int
     min_skip_rate: float = 0.08
     max_mean_deck_size: float = 35.0
+    reward_objective: str = "run"
+    stage_tag: str = ""
+
+    @property
+    def stage_key(self) -> str:
+        return self.stage_tag if self.stage_tag else f"b{self.budget}"
 
 
 DEFAULT_SMOOTH_LADDER: tuple[RatchetStageSpec, ...] = (
@@ -63,6 +69,39 @@ DEFAULT_SMOOTH_LADDER: tuple[RatchetStageSpec, ...] = (
     RatchetStageSpec(budget=3, wins_required=10, mean_revivals_limit=2.6, seed_index_offset=950_000),
     RatchetStageSpec(budget=2, wins_required=10, mean_revivals_limit=1.75, seed_index_offset=1_000_000),
     RatchetStageSpec(budget=1, wins_required=9, mean_revivals_limit=0.88, seed_index_offset=1_050_000),
+)
+
+ZERO_REVIVAL_ACT_LADDER: tuple[RatchetStageSpec, ...] = (
+    RatchetStageSpec(
+        budget=0,
+        reward_objective="act1",
+        stage_tag="b0-act1",
+        wins_required=28,
+        mean_revivals_limit=0.0,
+        seed_index_offset=700_000,
+        min_skip_rate=0.08,
+        max_mean_deck_size=21.0,
+    ),
+    RatchetStageSpec(
+        budget=0,
+        reward_objective="act2",
+        stage_tag="b0-act2",
+        wins_required=18,
+        mean_revivals_limit=0.0,
+        seed_index_offset=800_000,
+        min_skip_rate=0.10,
+        max_mean_deck_size=28.0,
+    ),
+    RatchetStageSpec(
+        budget=0,
+        reward_objective="run",
+        stage_tag="b0-act3",
+        wins_required=12,
+        mean_revivals_limit=0.0,
+        seed_index_offset=900_000,
+        min_skip_rate=0.12,
+        max_mean_deck_size=33.0,
+    ),
 )
 
 
@@ -123,10 +162,13 @@ def evaluate_stage_promotion_gate(
     deck_size = row.get("mean_final_deck_size")
     deadlocks = row.get("deadlock_count", 0)
 
+    row_objective = row.get("reward_objective")
+
     checks = {
         "policy_version_ready": isinstance(pv, int) and not isinstance(pv, bool) and pv >= min_policy_version,
         "episodes_match": episodes == expected_episodes,
         "budget_match": budget == stage.budget,
+        "objective_match": row_objective is None or row_objective == stage.reward_objective,
         "zero_deadlocks": deadlocks == 0,
         "wins_ok": isinstance(wins, int) and not isinstance(wins, bool) and wins >= stage.wins_required,
         "revivals_ok": (
@@ -289,9 +331,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--heldout-workers", type=int, default=32)
     parser.add_argument("--keep-raw-trace-cohorts", type=int, default=2)
     parser.add_argument(
+        "--curriculum-mode",
+        choices=("revival-ratchet", "act-b0"),
+        default="revival-ratchet",
+        help="'revival-ratchet' decreases revival budget on full runs; 'act-b0' trains B=0 across act1 -> act2 -> run",
+    )
+    parser.add_argument(
         "--budgets",
         default="",
         help="optional comma-separated subset of budgets from DEFAULT_SMOOTH_LADDER (e.g. '24,20,16')",
+    )
+    parser.add_argument(
+        "--stages",
+        default="",
+        help="optional comma-separated subset of stage_key values (e.g. 'b0-act1,b0-act2,b0-act3')",
     )
     return parser
 
@@ -327,24 +380,45 @@ def run_ratchet(argv: Sequence[str] | None = None) -> int:
     promotions_dir = root / "ratchet_promotions" / ratchet_id
     promotions_dir.mkdir(parents=True, exist_ok=True)
 
-    by_budget = {spec.budget: spec for spec in DEFAULT_SMOOTH_LADDER}
-    if args.budgets.strip():
-        wanted = [int(tok.strip()) for tok in args.budgets.split(",") if tok.strip()]
-        stages = tuple(by_budget[b] for b in wanted)
+    if args.curriculum_mode == "act-b0":
+        base_ladder = ZERO_REVIVAL_ACT_LADDER
+        by_key = {spec.stage_key: spec for spec in base_ladder}
+        if args.stages.strip():
+            wanted_keys = [tok.strip() for tok in args.stages.split(",") if tok.strip()]
+            stages = tuple(by_key[k] for k in wanted_keys)
+        else:
+            stages = base_ladder
     else:
-        stages = DEFAULT_SMOOTH_LADDER
-    if any(b.budget >= a.budget for a, b in zip(stages, stages[1:])):
-        raise ValueError("ratchet budgets must strictly decrease")
+        by_budget = {spec.budget: spec for spec in DEFAULT_SMOOTH_LADDER}
+        if args.budgets.strip():
+            wanted = [int(tok.strip()) for tok in args.budgets.split(",") if tok.strip()]
+            stages = tuple(by_budget[b] for b in wanted)
+        elif args.stages.strip():
+            by_key = {spec.stage_key: spec for spec in DEFAULT_SMOOTH_LADDER}
+            wanted_keys = [tok.strip() for tok in args.stages.split(",") if tok.strip()]
+            stages = tuple(by_key[k] for k in wanted_keys)
+        else:
+            stages = DEFAULT_SMOOTH_LADDER
+        if any(b.budget >= a.budget for a, b in zip(stages, stages[1:])):
+            raise ValueError("ratchet budgets must strictly decrease")
 
-    # Load prior ratchet state if resuming across restarts
+    # Load prior ratchet state if resuming across restarts (only if ratchet_id matches!)
     prior_state: dict[str, Any] = {}
     if active_state_path.is_file():
-        prior_state = json.loads(active_state_path.read_text(encoding="utf-8"))
-    elif drive_state_path.is_file():
-        prior_state = json.loads(drive_state_path.read_text(encoding="utf-8"))
+        cand_active = json.loads(active_state_path.read_text(encoding="utf-8"))
+        if isinstance(cand_active, dict) and cand_active.get("ratchet_id") == ratchet_id:
+            prior_state = cand_active
+    if not prior_state and drive_state_path.is_file():
+        cand_drive = json.loads(drive_state_path.read_text(encoding="utf-8"))
+        if isinstance(cand_drive, dict) and cand_drive.get("ratchet_id") == ratchet_id:
+            prior_state = cand_drive
 
     promoted_history: list[dict[str, Any]] = list(prior_state.get("promoted_history") or [])
-    completed_budgets = {int(item["budget"]) for item in promoted_history if "budget" in item}
+    completed_stage_keys = {
+        str(item["stage_key"]) if "stage_key" in item else f"b{int(item['budget'])}"
+        for item in promoted_history
+        if "stage_key" in item or "budget" in item
+    }
 
     # Cache initial seed publication locally + on Drive
     seed_cache = promotions_dir / "stage0_seed_publication.pt"
@@ -389,6 +463,8 @@ def run_ratchet(argv: Sequence[str] | None = None) -> int:
             "pid": os.getpid(),
             "stage_index": stage_idx,
             "total_stages": len(stages),
+            "current_stage_key": stage_spec.stage_key,
+            "current_reward_objective": stage_spec.reward_objective,
             "current_budget": stage_spec.budget,
             "current_lineage": stage_lineage,
             "current_local_dir": str(stage_local_dir),
@@ -406,15 +482,16 @@ def run_ratchet(argv: Sequence[str] | None = None) -> int:
         _atomic_write_json(drive_state_path, payload)
 
     for stage_idx, stage in enumerate(stages):
-        stage_lineage = f"{prefix}-b{stage.budget}-{suffix}"
+        stage_lineage = f"{prefix}-{stage.stage_key}-{suffix}"
         stage_local_dir = root / "campaigns" / stage_lineage
         stage_drive_dir = drive_root / stage_lineage
-        if stage.budget in completed_budgets:
+        if stage.stage_key in completed_stage_keys:
             continue
 
         overrides = [
             f"learner.revival_budget={stage.budget}",
             f"training.curriculum.revival_budget={stage.budget}",
+            f'training.curriculum.reward_objective="{stage.reward_objective}"',
             f"course.seed_index_offset={stage.seed_index_offset}",
         ]
         print(
@@ -422,6 +499,8 @@ def run_ratchet(argv: Sequence[str] | None = None) -> int:
                 {
                     "event": "ratchet_stage_begin",
                     "stage_index": stage_idx,
+                    "stage_key": stage.stage_key,
+                    "reward_objective": stage.reward_objective,
                     "budget": stage.budget,
                     "lineage_id": stage_lineage,
                     "parent_sha256": current_parent_sha,
@@ -454,13 +533,16 @@ def run_ratchet(argv: Sequence[str] | None = None) -> int:
                 win_u = int(passing_row["policy_version"])
                 snap_pub = stage_drive_dir / "snapshots" / f"update-{win_u:06d}" / "publication.pt"
                 src_pub = snap_pub if snap_pub.is_file() else (stage_local_dir / "publication.pt")
-                local_prom = promotions_dir / f"b{stage.budget}_u{win_u:04d}_publication.pt"
-                drive_prom = drive_ratchet_dir / f"b{stage.budget}_u{win_u:04d}_publication.pt"
+                safe_key = stage.stage_key.replace("-", "_")
+                local_prom = promotions_dir / f"{safe_key}_u{win_u:04d}_publication.pt"
+                drive_prom = drive_ratchet_dir / f"{safe_key}_u{win_u:04d}_publication.pt"
                 prom_sha = _atomic_copy_verified(src_pub, local_prom)
                 _atomic_copy_verified(local_prom, drive_prom)
 
                 prom_entry = {
                     "stage_index": stage_idx,
+                    "stage_key": stage.stage_key,
+                    "reward_objective": stage.reward_objective,
                     "budget": stage.budget,
                     "lineage_id": stage_lineage,
                     "promoted_at_update": win_u,
@@ -471,7 +553,7 @@ def run_ratchet(argv: Sequence[str] | None = None) -> int:
                     "gate_report": passing_report,
                 }
                 promoted_history.append(prom_entry)
-                completed_budgets.add(stage.budget)
+                completed_stage_keys.add(stage.stage_key)
                 current_parent_pub = local_prom
                 current_parent_sha = prom_sha
                 write_state(
@@ -530,7 +612,8 @@ def run_ratchet(argv: Sequence[str] | None = None) -> int:
             if reanchor_u is not None:
                 cand_reanchor = stage_drive_dir / "snapshots" / f"update-{reanchor_u:06d}" / "publication.pt"
                 if cand_reanchor.is_file():
-                    local_reanchor = promotions_dir / f"reanchor_b{stage.budget}_u{reanchor_u:04d}_publication.pt"
+                    safe_key = stage.stage_key.replace("-", "_")
+                    local_reanchor = promotions_dir / f"reanchor_{safe_key}_u{reanchor_u:04d}_publication.pt"
                     _atomic_copy_verified(cand_reanchor, local_reanchor)
                     effective_teacher_pub = local_reanchor
                     reanchored = True
@@ -642,7 +725,7 @@ def run_ratchet(argv: Sequence[str] | None = None) -> int:
                 _atomic_write_json(drive_ratchet_dir / "final_b1_zero_revival_audit.json", b1_final)
 
     last_stage = stages[-1]
-    last_lineage = f"{prefix}-b{last_stage.budget}-{suffix}"
+    last_lineage = f"{prefix}-{last_stage.stage_key}-{suffix}"
     write_state(
         stage_idx=len(stages) - 1,
         stage_spec=last_stage,
