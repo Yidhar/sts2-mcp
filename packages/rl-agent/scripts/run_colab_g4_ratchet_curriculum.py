@@ -52,6 +52,7 @@ class RatchetStageSpec:
     max_mean_deck_size: float = 35.0
     reward_objective: str = "run"
     stage_tag: str = ""
+    extra_overrides: tuple[str, ...] = ()
 
     @property
     def stage_key(self) -> str:
@@ -71,26 +72,61 @@ DEFAULT_SMOOTH_LADDER: tuple[RatchetStageSpec, ...] = (
     RatchetStageSpec(budget=1, wins_required=9, mean_revivals_limit=0.88, seed_index_offset=1_050_000),
 )
 
+_JOINT_B0_STAGE_OVERRIDES: tuple[str, ...] = (
+    "learner.macro_actor_warmup_updates=5",
+    "learner.enable_post_step_kl_line_search=true",
+    "learner.max_parent_macro_kl=0.0",
+    "learner.target_macro_step_kl=0.015",
+    "learner.kickstart_kl_weight=0.02",
+    "learner.kickstart_kl_floor=0.005",
+    "learner.kickstart_combat_kl_scale=0.0",
+    "learner.ppo_epochs_per_cohort=2",
+    "learner.ppo_minibatches_per_cohort=2",
+)
+
 ZERO_REVIVAL_ACT_LADDER: tuple[RatchetStageSpec, ...] = (
     RatchetStageSpec(
         budget=0,
         reward_objective="act1",
-        stage_tag="b0-act1",
-        wins_required=28,
+        stage_tag="b0-act1-combat",
+        wins_required=20,
         mean_revivals_limit=0.0,
-        seed_index_offset=700_000,
+        seed_index_offset=720_000,
+        min_skip_rate=0.0,
+        max_mean_deck_size=30.0,
+        extra_overrides=(
+            "learner.macro_actor_warmup_updates=999",
+            "learner.enable_post_step_kl_line_search=false",
+            "learner.max_parent_macro_kl=0.0",
+            "learner.kickstart_kl_weight=0.05",
+            "learner.kickstart_kl_floor=0.05",
+            "learner.kickstart_combat_kl_scale=0.0",
+            "learner.combat_policy_weight=1.0",
+            "learner.ppo_epochs_per_cohort=3",
+            "learner.ppo_minibatches_per_cohort=4",
+        ),
+    ),
+    RatchetStageSpec(
+        budget=0,
+        reward_objective="act1",
+        stage_tag="b0-act1",
+        wins_required=30,
+        mean_revivals_limit=0.0,
+        seed_index_offset=760_000,
         min_skip_rate=0.08,
         max_mean_deck_size=21.0,
+        extra_overrides=_JOINT_B0_STAGE_OVERRIDES,
     ),
     RatchetStageSpec(
         budget=0,
         reward_objective="act2",
         stage_tag="b0-act2",
-        wins_required=18,
+        wins_required=20,
         mean_revivals_limit=0.0,
-        seed_index_offset=800_000,
+        seed_index_offset=820_000,
         min_skip_rate=0.10,
         max_mean_deck_size=28.0,
+        extra_overrides=_JOINT_B0_STAGE_OVERRIDES,
     ),
     RatchetStageSpec(
         budget=0,
@@ -98,9 +134,10 @@ ZERO_REVIVAL_ACT_LADDER: tuple[RatchetStageSpec, ...] = (
         stage_tag="b0-act3",
         wins_required=12,
         mean_revivals_limit=0.0,
-        seed_index_offset=900_000,
+        seed_index_offset=920_000,
         min_skip_rate=0.12,
         max_mean_deck_size=33.0,
+        extra_overrides=_JOINT_B0_STAGE_OVERRIDES,
     ),
 )
 
@@ -493,6 +530,7 @@ def run_ratchet(argv: Sequence[str] | None = None) -> int:
             f"training.curriculum.revival_budget={stage.budget}",
             f'training.curriculum.reward_objective="{stage.reward_objective}"',
             f"course.seed_index_offset={stage.seed_index_offset}",
+            *stage.extra_overrides,
         ]
         print(
             json.dumps(

@@ -907,7 +907,9 @@ def sync_once(
                         )
                     ),
                     "version": (
-                        "sts2-durable-afterstate-v7.0-act-b0"
+                        "sts2-durable-afterstate-v7.1-combat-first-b0"
+                        if ("v7-1" in lineage or "v7.1" in lineage)
+                        else "sts2-durable-afterstate-v7.0-act-b0"
                         if ("v7-0" in lineage or "v7.0" in lineage or "v7" in lineage)
                         else "sts2-durable-afterstate-v6.6-ratchet"
                         if ("v6-6" in lineage or "v6.6" in lineage)

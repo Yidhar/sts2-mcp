@@ -480,11 +480,32 @@ def test_zero_revival_act_ladder_promotion_gates() -> None:
     spec.loader.exec_module(mod)
 
     ladder = mod.ZERO_REVIVAL_ACT_LADDER
-    assert [s.stage_key for s in ladder] == ["b0-act1", "b0-act2", "b0-act3"]
-    assert [s.reward_objective for s in ladder] == ["act1", "act2", "run"]
+    assert [s.stage_key for s in ladder] == ["b0-act1-combat", "b0-act1", "b0-act2", "b0-act3"]
+    assert [s.reward_objective for s in ladder] == ["act1", "act1", "act2", "run"]
     assert all(s.budget == 0 for s in ladder)
+    assert ladder[0].min_skip_rate == pytest.approx(0.0)
+    assert "learner.kickstart_combat_kl_scale=0.0" in ladder[0].extra_overrides
 
-    s1 = ladder[0]
+    s1_combat = ladder[0]
+    ok_combat_pass, _ = mod.evaluate_stage_promotion_gate(
+        {
+            "policy_version": 20,
+            "episodes": 48,
+            "revival_budget": 0,
+            "reward_objective": "act1",
+            "deadlock_count": 0,
+            "successful_run_count": 22,
+            "mean_revivals_used": 0.0,
+            "skip_rate": 0.01,
+            "mean_final_deck_size": 24.0,
+        },
+        s1_combat,
+        expected_episodes=48,
+        min_policy_version=5,
+    )
+    assert ok_combat_pass is True
+
+    s1 = ladder[1]
     ok_pass, _ = mod.evaluate_stage_promotion_gate(
         {
             "policy_version": 20,
@@ -515,9 +536,93 @@ def test_zero_revival_act_ladder_promotion_gates() -> None:
             "skip_rate": 0.11,
             "mean_final_deck_size": 19.4,
         },
-        ladder[1],  # b0-act2 expects objective="act2"!
+        ladder[2],  # b0-act2 expects objective="act2"!
         expected_episodes=48,
         min_policy_version=5,
     )
     assert ok_wrong_obj is False
     assert rep_wrong["checks"]["objective_match"] is False
+
+
+def test_v71_combat_first_decoupling_normalization_and_lr_groups() -> None:
+    torch.manual_seed(99)
+    repo_root = Path(__file__).resolve().parents[1]
+    v24_toml = (
+        repo_root
+        / "config"
+        / "experiments"
+        / "hybrid_macro_credit_v24_durable_afterstate_v71_combat_first_b0_g4_turbo.toml"
+    )
+    v24 = load_macro_training_config(v24_toml)
+    assert v24.learner.kickstart_combat_kl_scale == pytest.approx(0.0)
+    assert v24.learner.normalize_combat_advantages is True
+    assert v24.learner.local_combat_value_lr_scale == pytest.approx(4.0)
+    assert v24.learner.target_combat_step_kl == pytest.approx(0.025)
+    assert v24.learner.ppo_epochs_per_cohort == 3
+    assert v24.learner.ppo_minibatches_per_cohort == 4
+
+    tiny = _tiny_model_config()
+    ac_cfg = replace(
+        HybridActorCriticConfig.durable_v11(tiny.to_model_config()),
+        enable_local_combat_value_head=True,
+    )
+    model = HybridDomainActorCriticModel(ac_cfg)
+    teacher = HybridDomainActorCriticModel(ac_cfg)
+    teacher.load_state_dict(model.state_dict())
+    teacher.eval()
+    teacher.requires_grad_(False)
+    encoder = GroundedObservationEncoder(tiny.to_encoding_config())
+
+    l_cfg = MacroCreditLearnerConfig(
+        target_mode="durable_afterstate_v2",
+        enable_direct_vitals_context=True,
+        enable_macro_branch_prior=True,
+        enable_persistent_only_durable_value=True,
+        enable_asymmetric_revival_critic=True,
+        enable_draw_weighted_durable_value=True,
+        enable_role_conditioned_candidate_policy=True,
+        enable_deconfounded_durable_value=True,
+        enable_monotone_deconfounded_durable_value=True,
+        enable_balanced_deconfounded_durable_value=True,
+        enable_expressive_synergy_backbone=True,
+        enable_debloated_synergy_durable_value=True,
+        enable_build_conditioned_durable_value=True,
+        enable_twin_durable_value_heads=True,
+        enable_hierarchical_afterstate_mpo=True,
+        freeze_trunk_during_durable_warmup=False,
+        durable_warmup_updates=0,
+        combat_actor_warmup_updates=0,
+        macro_actor_warmup_updates=999,
+        linear_hp_loss_weight=0.50,
+        hp_loss_reference=80.0,
+        enable_local_combat_critic=True,
+        local_combat_value_lr_scale=4.0,
+        normalize_combat_advantages=True,
+        kickstart_combat_kl_scale=0.0,
+        target_combat_step_kl=0.025,
+        clip_combat_pg=True,
+        combat_pg_adv_clip=2.5,
+        ppo_epochs_per_cohort=2,
+        ppo_minibatches_per_cohort=2,
+        learning_rate=1e-4,
+        shared_learning_rate_scale=0.35,
+        revival_budget=0,
+        eval_batch_size=4,
+        chunk_batch_size=4,
+        distill_total_updates=10,
+        kickstart_kl_weight=0.05,
+        kickstart_kl_floor=0.05,
+    )
+    learner = MacroCreditLearner(model=model, config=l_cfg, teacher_model=teacher)
+    # 3 optimizer param groups: local_combat_value_head (4e-4), local (1e-4), shared (3.5e-5)
+    lrs = [float(g["lr"]) for g in learner.optimizer.param_groups]
+    assert len(lrs) == 3
+    assert lrs[0] == pytest.approx(4e-4)
+    assert lrs[1] == pytest.approx(1e-4)
+    assert lrs[2] == pytest.approx(3.5e-5)
+
+    cohort = _build_two_encounter_cohort(model, encoder, num_trajs=4)
+    metrics = learner.learn(cohort)
+    assert metrics["macro_mpo_policy_loss"] == pytest.approx(0.0)
+    assert metrics["ppo_optimizer_steps_executed"] >= 1
+    assert metrics["combat_value_loss"] > 0.0

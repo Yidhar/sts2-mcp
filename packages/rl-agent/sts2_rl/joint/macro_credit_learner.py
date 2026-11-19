@@ -160,6 +160,10 @@ class MacroCreditLearnerConfig:
     local_combat_step_penalty: float = 0.004
     local_combat_discount: float = 0.99
     local_combat_trace_lambda: float = 0.95
+    kickstart_combat_kl_scale: float = 1.0
+    normalize_combat_advantages: bool = False
+    local_combat_value_lr_scale: float = 1.0
+    target_combat_step_kl: float = 0.0
 
     def __post_init__(self) -> None:
         for bool_name in (
@@ -172,6 +176,7 @@ class MacroCreditLearnerConfig:
             "detach_macro_branch_prior_lse",
             "isolate_nonreward_macro_trunk_grads",
             "enable_local_combat_critic",
+            "normalize_combat_advantages",
             "separate_value_grad_clip",
             "enable_direct_vitals_context",
             "enable_macro_branch_prior",
@@ -308,6 +313,7 @@ class MacroCreditLearnerConfig:
             "combat_pg_clip_eps",
             "combat_pg_adv_clip",
             "hp_loss_reference",
+            "local_combat_value_lr_scale",
         )
         non_negative = (
             "weight_decay",
@@ -330,8 +336,10 @@ class MacroCreditLearnerConfig:
             "distill_afterstate_margin_weight",
             "kickstart_kl_weight",
             "kickstart_kl_floor",
+            "kickstart_combat_kl_scale",
             "double_mpo_pessimism_coef",
             "target_macro_step_kl",
+            "target_combat_step_kl",
             "macro_mpo_trust_kl_weight",
             "max_parent_macro_kl",
             "linear_hp_loss_weight",
@@ -681,14 +689,29 @@ class MacroCreditLearner:
             "persistent_build_",
             "persistent_vitals_",
         )
+        local_combat_val: list[nn.Parameter] = []
         local: list[nn.Parameter] = []
         shared: list[nn.Parameter] = []
+        use_custom_combat_val_lr = (
+            self.config.local_combat_value_lr_scale != 1.0
+            and self.config.enable_local_combat_critic
+        )
         for name, item in model.named_parameters():
             if not item.requires_grad:
+                continue
+            if use_custom_combat_val_lr and name.startswith("local_combat_value_head."):
+                local_combat_val.append(item)
                 continue
             is_local = name.startswith(local_tokens) and not name.startswith("durable_deck_synergy_")
             (local if is_local else shared).append(item)
         groups: list[dict[str, Any]] = []
+        if local_combat_val:
+            groups.append(
+                {
+                    "params": local_combat_val,
+                    "lr": self.config.learning_rate * self.config.local_combat_value_lr_scale,
+                }
+            )
         if local:
             groups.append({"params": local, "lr": self.config.learning_rate})
         if shared:
@@ -2009,6 +2032,7 @@ class MacroCreditLearner:
             or self.config.ppo_epochs_per_cohort > 1
             or self.config.ppo_minibatches_per_cohort > 1
             or self.config.target_macro_step_kl > 0.0
+            or self.config.target_combat_step_kl > 0.0
             or self.config.max_parent_macro_kl > 0.0
         )
 
@@ -2148,7 +2172,7 @@ class MacroCreditLearner:
                 v_pred_next = seg_preds[k]
 
             raw_adv = policy_rho * (q_seg - seg_preds)
-            if cfg.clip_combat_pg:
+            if cfg.clip_combat_pg and not cfg.normalize_combat_advantages:
                 c_adv_cap = cfg.combat_pg_adv_clip
                 raw_adv = c_adv_cap * torch.tanh(raw_adv / c_adv_cap)
 
@@ -2169,7 +2193,7 @@ class MacroCreditLearner:
             behavior = evaluation.values.new_tensor([step.behavior_log_probability for step in reference.steps[start:stop]])
             policy_rho = torch.exp((evaluation.selected_logs[start:stop] - behavior).clamp(max=math.log(self.config.policy_rho_clip)))
             raw_adv = policy_rho * (action_targets - evaluation.values[start:stop])
-            if self.config.clip_combat_pg:
+            if self.config.clip_combat_pg and not self.config.normalize_combat_advantages:
                 c_adv_cap = self.config.combat_pg_adv_clip
                 raw_adv = c_adv_cap * torch.tanh(raw_adv / c_adv_cap)
             combat_values[start:stop] = targets
@@ -2656,10 +2680,12 @@ class MacroCreditLearner:
                     if step.control_domain == "macro":
                         norm_ks = ks_kl / max(1, denominators["macro_policy_steps"])
                         totals["distill_macro_kl"] += float(norm_ks.detach().clamp_min(0.0).item())
+                        terms.append(0.5 * kickstart_kl_weight * norm_ks)
                     else:
                         norm_ks = ks_kl / max(1, denominators["combat_policy_steps"])
                         totals["distill_combat_kl"] += float(norm_ks.detach().clamp_min(0.0).item())
-                    terms.append(0.5 * kickstart_kl_weight * norm_ks)
+                        if cfg.kickstart_combat_kl_scale > 0.0:
+                            terms.append(0.5 * kickstart_kl_weight * cfg.kickstart_combat_kl_scale * norm_ks)
             if choice and prepared.evaluation.step_log_probs is not None:
                 old_t_cpu = prepared.evaluation.step_log_probs.get(index)
                 if old_t_cpu is not None:
@@ -4112,7 +4138,10 @@ class MacroCreditLearner:
                                 slice_totals_gpu["distill_combat_kl"]
                                 + ks_com_kl.detach().clamp_min(0.0).double()
                             )
-                            batch_terms.append(0.5 * kickstart_kl_weight * ks_com_kl)
+                            if cfg.kickstart_combat_kl_scale > 0.0:
+                                batch_terms.append(
+                                    0.5 * kickstart_kl_weight * cfg.kickstart_combat_kl_scale * ks_com_kl
+                                )
 
                 if any(flat_is_choice_cpu[g] for g in gids_cpu):
                     c_cap_obs = int(safe_logs.shape[1])
@@ -5359,6 +5388,41 @@ class MacroCreditLearner:
         except BaseException:
             eval_packed_cache.clear()
             raise
+        if self.config.normalize_combat_advantages and not in_stage_a and prepared:
+            choice_adv_parts: list[Tensor] = []
+            for item in prepared:
+                c_idx = [
+                    s_i
+                    for s_i, st in enumerate(item.reference.steps)
+                    if st.control_domain != "macro" and int(st.snapshot.action_mask.sum()) > 1
+                ]
+                if c_idx:
+                    choice_adv_parts.append(item.combat_advantages[c_idx].double())
+            if choice_adv_parts:
+                flat_c_adv = torch.cat(choice_adv_parts, dim=0)
+                if flat_c_adv.numel() >= 2:
+                    adv_mean = float(flat_c_adv.mean().item())
+                    adv_std = float(flat_c_adv.std(unbiased=False).item())
+                    adv_denom = max(adv_std, 1e-4)
+                    for item in prepared:
+                        combat_mask = torch.tensor(
+                            [st.control_domain != "macro" for st in item.reference.steps],
+                            device=item.combat_advantages.device,
+                            dtype=torch.bool,
+                        )
+                        normed = torch.where(
+                            combat_mask,
+                            (item.combat_advantages - adv_mean) / adv_denom,
+                            torch.zeros_like(item.combat_advantages),
+                        )
+                        if self.config.clip_combat_pg:
+                            c_cap = self.config.combat_pg_adv_clip
+                            normed = torch.where(
+                                combat_mask,
+                                c_cap * torch.tanh(normed / c_cap),
+                                torch.zeros_like(normed),
+                            )
+                        item.combat_advantages = normed.detach()
         before = [parameter.detach().clone() for parameter in self._parameters]
         totals = {
             key: 0.0
@@ -5535,11 +5599,15 @@ class MacroCreditLearner:
                                 + mb_denoms["combat_steps"]
                                 + mb_denoms["afterstate_steps"]
                             )
-                            if (
-                                ppo_optimizer_steps_executed > 0
-                                and self.config.target_macro_step_kl > 0.0
+                            macro_kl_over = (
+                                self.config.target_macro_step_kl > 0.0
                                 and mb_totals["observed_macro_step_kl"] > self.config.target_macro_step_kl
-                            ):
+                            )
+                            combat_kl_over = (
+                                self.config.target_combat_step_kl > 0.0
+                                and mb_totals["observed_combat_step_kl"] > self.config.target_combat_step_kl
+                            )
+                            if ppo_optimizer_steps_executed > 0 and (macro_kl_over or combat_kl_over):
                                 self.optimizer.zero_grad(set_to_none=True)
                                 ppo_kl_early_stopped = True
                                 break
