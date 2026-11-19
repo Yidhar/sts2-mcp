@@ -1228,3 +1228,110 @@ def test_v65_calibrated_ratchet_and_intrastage_teacher_reanchor() -> None:
     )
     assert chosen == 15
 
+
+def test_v66_cross_surface_trunk_isolation_and_detached_lse() -> None:
+    import dataclasses
+
+    v66_toml = (
+        Path(__file__).resolve().parents[1]
+        / "config/experiments/hybrid_macro_credit_v22_durable_afterstate_v66_ratchet_g4_turbo.toml"
+    )
+    cfg66 = load_macro_training_config(v66_toml)
+    assert cfg66.learner.detach_value_heads_from_trunk is True
+    assert cfg66.learner.detach_macro_branch_prior_lse is True
+    assert cfg66.learner.isolate_nonreward_macro_trunk_grads is True
+    assert cfg66.learner.mpo_parent_prior_mix == 0.12
+    assert cfg66.learner.max_parent_macro_kl == 0.050
+
+    torch.manual_seed(20261119)
+    cfg = _tiny_model_config()
+    ac_cfg = HybridActorCriticConfig.durable_v11(cfg.to_model_config())
+    model = HybridDomainActorCriticModel(ac_cfg)
+    with torch.no_grad():
+        cast(Any, model.durable_value_head[-1]).weight.normal_(0.0, 0.3)
+        cast(Any, model.durable_twin_value_head[-1]).weight.normal_(0.0, 0.3)
+    encoder = GroundedObservationEncoder(cfg.to_encoding_config())
+    base_cohort = _build_synthetic_durable_cohort(model, encoder, num_games=3)
+
+    # 1. Verify detach_macro_branch_prior_lse keeps forward policy_logits 100% bit-identical!
+    s0 = base_cohort.natural_only[0].steps[0].snapshot
+    b0 = collate_encoded_snapshots(
+        (s0,),
+        expected_config=s0.config,
+        expected_fingerprint=s0.encoding_fingerprint,
+        device=torch.device("cpu"),
+    )
+    model.eval()
+    model._detach_macro_branch_prior_lse = False
+    with torch.no_grad():
+        out_plain = model(b0, None, compute_durable_value=False)
+    model._detach_macro_branch_prior_lse = True
+    with torch.no_grad():
+        out_det = model(b0, None, compute_durable_value=False)
+    assert float((out_plain.policy_logits - out_det.policy_logits).abs().max().item()) == 0.0
+
+    # 2. Relabel synthetic macro afterstate nodes as non-reward ("shop") and verify that
+    #    policy_head_gradient_norm > 0 while shared trunk & macro_stream receive ZERO gradient!
+    shop_trajs = tuple(
+        dataclasses.replace(
+            t,
+            steps=tuple(
+                dataclasses.replace(st, surface="shop") if st.control_domain == "macro" else st
+                for st in t.steps
+            ),
+            afterstate_nodes=tuple(
+                dataclasses.replace(n, surface="shop") for n in t.afterstate_nodes
+            ),
+        )
+        for t in base_cohort.natural_only
+    )
+    shop_cohort = dataclasses.replace(base_cohort, natural_only=shop_trajs)
+    pre_macro_stream = {
+        k: v.detach().clone()
+        for k, v in model.named_parameters()
+        if k.startswith(("macro_stream.", "world_encoder.", "candidate_encoder."))
+    }
+    teacher = copy.deepcopy(model)
+    teacher.eval()
+    l_cfg = MacroCreditLearnerConfig(
+        target_mode="durable_afterstate_v2",
+        enable_direct_vitals_context=True,
+        enable_macro_branch_prior=True,
+        enable_persistent_only_durable_value=True,
+        enable_asymmetric_revival_critic=True,
+        enable_draw_weighted_durable_value=True,
+        enable_role_conditioned_candidate_policy=True,
+        enable_deconfounded_durable_value=True,
+        enable_monotone_deconfounded_durable_value=True,
+        enable_balanced_deconfounded_durable_value=True,
+        enable_expressive_synergy_backbone=True,
+        enable_debloated_synergy_durable_value=True,
+        enable_build_conditioned_durable_value=True,
+        enable_twin_durable_value_heads=True,
+        enable_hierarchical_afterstate_mpo=True,
+        durable_warmup_updates=0,
+        combat_actor_warmup_updates=0,
+        detach_value_heads_from_trunk=True,
+        detach_macro_branch_prior_lse=True,
+        isolate_nonreward_macro_trunk_grads=True,
+        minority_only_within_branch_mpo=True,
+        within_branch_minority_prob_cap=0.30,
+        mpo_parent_prior_mix=0.12,
+        max_parent_macro_kl=0.050,
+        macro_policy_weight=1.0,
+        combat_policy_weight=0.0,
+        combat_entropy_weight=0.0,
+        kickstart_kl_weight=0.0,
+        kickstart_kl_floor=0.0,
+        weight_decay=0.0,
+    )
+    learner = MacroCreditLearner(model=model, config=l_cfg, update=0, teacher_model=teacher)
+    metrics = learner.learn(shop_cohort)
+    assert metrics["policy_head_gradient_norm"] > 0.0
+    assert metrics["shared_gradient_norm"] == 0.0
+    assert metrics["domain_stream_gradient_norm"] == 0.0
+    for k, prev_w in pre_macro_stream.items():
+        cur_w = dict(model.named_parameters())[k].detach()
+        assert float((cur_w - prev_w).abs().max().item()) == 0.0
+
+

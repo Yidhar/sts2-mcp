@@ -53,16 +53,16 @@ class RatchetStageSpec:
 
 
 DEFAULT_SMOOTH_LADDER: tuple[RatchetStageSpec, ...] = (
-    RatchetStageSpec(budget=24, wins_required=20, mean_revivals_limit=20.4, seed_index_offset=600_000),
-    RatchetStageSpec(budget=20, wins_required=20, mean_revivals_limit=17.0, seed_index_offset=650_000),
-    RatchetStageSpec(budget=16, wins_required=19, mean_revivals_limit=13.6, seed_index_offset=700_000),
-    RatchetStageSpec(budget=12, wins_required=19, mean_revivals_limit=10.2, seed_index_offset=750_000),
-    RatchetStageSpec(budget=8, wins_required=17, mean_revivals_limit=6.8, seed_index_offset=800_000),
-    RatchetStageSpec(budget=6, wins_required=17, mean_revivals_limit=5.1, seed_index_offset=850_000),
-    RatchetStageSpec(budget=4, wins_required=15, mean_revivals_limit=3.4, seed_index_offset=900_000),
-    RatchetStageSpec(budget=3, wins_required=15, mean_revivals_limit=2.55, seed_index_offset=950_000),
-    RatchetStageSpec(budget=2, wins_required=15, mean_revivals_limit=1.70, seed_index_offset=1_000_000),
-    RatchetStageSpec(budget=1, wins_required=14, mean_revivals_limit=0.85, seed_index_offset=1_050_000),
+    RatchetStageSpec(budget=24, wins_required=20, mean_revivals_limit=20.6, seed_index_offset=600_000),
+    RatchetStageSpec(budget=20, wins_required=16, mean_revivals_limit=17.2, seed_index_offset=650_000),
+    RatchetStageSpec(budget=16, wins_required=15, mean_revivals_limit=13.8, seed_index_offset=700_000),
+    RatchetStageSpec(budget=12, wins_required=14, mean_revivals_limit=10.4, seed_index_offset=750_000),
+    RatchetStageSpec(budget=8, wins_required=13, mean_revivals_limit=6.9, seed_index_offset=800_000),
+    RatchetStageSpec(budget=6, wins_required=12, mean_revivals_limit=5.2, seed_index_offset=850_000),
+    RatchetStageSpec(budget=4, wins_required=11, mean_revivals_limit=3.5, seed_index_offset=900_000),
+    RatchetStageSpec(budget=3, wins_required=10, mean_revivals_limit=2.6, seed_index_offset=950_000),
+    RatchetStageSpec(budget=2, wins_required=10, mean_revivals_limit=1.75, seed_index_offset=1_000_000),
+    RatchetStageSpec(budget=1, wins_required=9, mean_revivals_limit=0.88, seed_index_offset=1_050_000),
 )
 
 
@@ -272,10 +272,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=Path(
-            "packages/rl-agent/config/experiments/hybrid_macro_credit_v21_durable_afterstate_v65_ratchet_g4_turbo.toml"
+            "packages/rl-agent/config/experiments/hybrid_macro_credit_v22_durable_afterstate_v66_ratchet_g4_turbo.toml"
         ),
     )
-    parser.add_argument("--lineage-prefix", default="durable-afterstate-v6-5-ratchet")
+    parser.add_argument("--lineage-prefix", default="durable-afterstate-v6-6-ratchet")
     parser.add_argument("--lineage-suffix", default="g4")
     parser.add_argument("--initial-publication", type=Path, required=True)
     parser.add_argument("--drive-root-dir", type=Path, required=True)

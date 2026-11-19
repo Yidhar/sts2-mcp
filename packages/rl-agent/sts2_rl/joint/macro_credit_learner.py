@@ -147,6 +147,8 @@ class MacroCreditLearnerConfig:
     macro_pg_fallback_scale: float = 1.0
     mpo_parent_prior_mix: float = 0.0
     max_parent_macro_kl: float = 0.0
+    detach_macro_branch_prior_lse: bool = False
+    isolate_nonreward_macro_trunk_grads: bool = False
 
     def __post_init__(self) -> None:
         for bool_name in (
@@ -156,6 +158,8 @@ class MacroCreditLearnerConfig:
             "enable_post_step_kl_line_search",
             "detach_value_heads_from_trunk",
             "minority_only_within_branch_mpo",
+            "detach_macro_branch_prior_lse",
+            "isolate_nonreward_macro_trunk_grads",
             "separate_value_grad_clip",
             "enable_direct_vitals_context",
             "enable_macro_branch_prior",
@@ -607,6 +611,7 @@ class MacroCreditLearner:
         _configure_cuda_tf32(self.device, self.config.allow_tf32)
         if isinstance(model, HybridDomainActorCriticModel):
             model._detach_value_heads_from_trunk = bool(self.config.detach_value_heads_from_trunk)
+            model._detach_macro_branch_prior_lse = bool(self.config.detach_macro_branch_prior_lse)
         local_tokens = (
             "macro_stream",
             "combat_stream",
@@ -770,6 +775,7 @@ class MacroCreditLearner:
         critic_revival_context: Tensor | None = None,
         model_override: HybridDomainActorCriticModel | None = None,
         compute_durable_value: bool = True,
+        policy_detach_trunk_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor | None, Tensor]:
         self._check_resource()
         durable_value: Tensor | None = None
@@ -792,6 +798,7 @@ class MacroCreditLearner:
                                 critic_revival_context if self._use_revival_ctx(active_mod) else None
                             ),
                             compute_durable_value=compute_durable_value,
+                            policy_detach_trunk_mask=policy_detach_trunk_mask,
                             validate=False,
                         ),
                     )
@@ -2071,10 +2078,14 @@ class MacroCreditLearner:
                 if prepared.step_revival_ctx is None
                 else prepared.step_revival_ctx[index : index + 1].to(device=self.device, dtype=self.dtype)
             )
+            single_detach_mask: Tensor | None = None
+            if cfg.isolate_nonreward_macro_trunk_grads and step.control_domain == "macro" and step.surface != "reward":
+                single_detach_mask = torch.ones((1,), device=self.device, dtype=torch.bool)
             logits, value, durable_value, hidden = self._forward_full(
                 step.snapshot,
                 hidden,
                 critic_revival_context=step_rev_gpu,
+                policy_detach_trunk_mask=single_detach_mask,
             )
             logs, entropy, choice = self._policy(step, logits)
             if is_durable_v2:
@@ -3051,6 +3062,7 @@ class MacroCreditLearner:
         flat_has_dur_cpu: list[bool] = []
         flat_is_choice_cpu: list[bool] = []
         flat_has_as_cpu: list[bool] = []
+        flat_detach_pol_trunk_cpu: list[bool] = []
         flat_contributes_cpu: list[bool] = []
         flat_action_idx_cpu: list[int] = []
         staged_afterstates: list[
@@ -3196,6 +3208,9 @@ class MacroCreditLearner:
                 flat_has_dur_cpu.append(has_dur)
                 flat_is_choice_cpu.append(is_ch)
                 flat_has_as_cpu.append(has_as)
+                flat_detach_pol_trunk_cpu.append(
+                    bool(cfg.isolate_nonreward_macro_trunk_grads) and is_mac and s.surface != "reward"
+                )
                 flat_contributes_cpu.append(contrib)
                 flat_action_idx_cpu.append(int(s.action_index))
             cursor_steps += len(steps)
@@ -3226,6 +3241,11 @@ class MacroCreditLearner:
         flat_is_macro_gpu = torch.tensor(flat_is_macro_cpu, device=self.device, dtype=torch.bool)
         flat_is_choice_gpu = torch.tensor(flat_is_choice_cpu, device=self.device, dtype=torch.bool)
         flat_has_as_gpu = torch.tensor(flat_has_as_cpu, device=self.device, dtype=torch.bool)
+        flat_detach_pol_trunk_gpu = (
+            torch.tensor(flat_detach_pol_trunk_cpu, device=self.device, dtype=torch.bool)
+            if cfg.isolate_nonreward_macro_trunk_grads
+            else None
+        )
         flat_action_idx_gpu = torch.tensor(flat_action_idx_cpu, device=self.device, dtype=torch.long)
 
         # Sort chunks by active candidate*local footprint so combat chunks pack tightly without padding bloat.
@@ -3329,6 +3349,11 @@ class MacroCreditLearner:
                 )
                 active_hidden = torch.stack([hidden_list[c] for c in active_c], dim=0)
                 active_rev = None if flat_step_rev_gpu is None else flat_step_rev_gpu[gids_gpu]
+                active_pol_detach = (
+                    None
+                    if flat_detach_pol_trunk_gpu is None
+                    else flat_detach_pol_trunk_gpu[gids_gpu]
+                )
                 with self._autocast_ctx():
                     output = cast(
                         HybridActorCriticOutput,
@@ -3337,6 +3362,7 @@ class MacroCreditLearner:
                             active_hidden,
                             critic_revival_context=active_rev,
                             compute_durable_value=False,
+                            policy_detach_trunk_mask=active_pol_detach,
                             validate=False,
                         ),
                     )

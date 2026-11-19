@@ -743,6 +743,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         super().__init__(actor_critic.candidate_q_config())
         self.actor_critic_config = actor_critic
         self._detach_value_heads_from_trunk: bool = False
+        self._detach_macro_branch_prior_lse: bool = False
         del self.candidate_q_head
         cfg = actor_critic.grounded
         player_owner_digest = hashlib.sha256(b"owner\0player").digest()
@@ -3044,7 +3045,12 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         combat_lse = torch.logsumexp(scoped_logits, dim=-1)
         combat_rows = domain_ids.eq(COMBAT_DOMAIN_ID).unsqueeze(-1)
         if self.actor_critic_config.enable_macro_branch_prior:
-            macro_prior = combat_lse - branch_counts.squeeze(-1).log()
+            macro_lse = (
+                torch.logsumexp(scoped_logits.detach(), dim=-1)
+                if getattr(self, "_detach_macro_branch_prior_lse", False)
+                else combat_lse
+            )
+            macro_prior = macro_lse - branch_counts.squeeze(-1).log()
             raw_branch_logits = torch.where(
                 combat_rows,
                 combat_lse + branch_residual,
@@ -3209,6 +3215,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         *,
         critic_revival_context: Tensor | None = None,
         compute_durable_value: bool = True,
+        policy_detach_trunk_mask: Tensor | None = None,
         validate: bool = True,
     ) -> HybridActorCriticOutput:
         base, build_emb, vitals_emb, raw_vitals = self._forward_representation_with_build(
@@ -3231,10 +3238,34 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             raw_vitals_f = None if raw_vitals is None else raw_vitals.float()
             rev_ctx_f = None if rev_ctx is None else rev_ctx.float()
 
-            state = joint_state_f.unsqueeze(1).expand(-1, int(action_count), -1)
-            memory = rec_state_f.unsqueeze(1).expand(-1, int(action_count), -1)
+            has_pol_detach = policy_detach_trunk_mask is not None and bool(
+                policy_detach_trunk_mask.any().item()
+            )
+            if has_pol_detach:
+                assert policy_detach_trunk_mask is not None
+                dm_2d = policy_detach_trunk_mask.to(
+                    device=joint_state_f.device, dtype=torch.bool
+                ).view(-1, 1)
+                dm_3d = dm_2d.unsqueeze(-1)
+                pol_joint_state_f = torch.where(dm_2d, joint_state_f.detach(), joint_state_f)
+                pol_cand_emb_f = torch.where(dm_3d, cand_emb_f.detach(), cand_emb_f)
+                pol_rec_state_f = torch.where(dm_2d, rec_state_f.detach(), rec_state_f)
+                pol_vitals_emb_f = (
+                    None
+                    if vitals_emb_f is None
+                    else torch.where(dm_2d, vitals_emb_f.detach(), vitals_emb_f)
+                )
+            else:
+                dm_3d = None
+                pol_joint_state_f = joint_state_f
+                pol_cand_emb_f = cand_emb_f
+                pol_rec_state_f = rec_state_f
+                pol_vitals_emb_f = vitals_emb_f
+
+            state = pol_joint_state_f.unsqueeze(1).expand(-1, int(action_count), -1)
+            memory = pol_rec_state_f.unsqueeze(1).expand(-1, int(action_count), -1)
             raw_logits = self.candidate_policy_head(
-                torch.cat([cand_emb_f, state, memory], dim=-1)
+                torch.cat([pol_cand_emb_f, state, memory], dim=-1)
             ).squeeze(-1)
             if self.actor_critic_config.enable_role_conditioned_candidate_policy:
                 bounded_roles = batch.candidates.role_ids.long().clamp(
@@ -3242,12 +3273,14 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                     max=self.config.role_vocab_size - 1,
                 )
                 role_emb = self.token_embedder.role_embedding(bounded_roles).float()
-                cand_modulated = cand_emb_f * torch.tanh(
+                if dm_3d is not None:
+                    role_emb = torch.where(dm_3d, role_emb.detach(), role_emb)
+                cand_modulated = pol_cand_emb_f * torch.tanh(
                     self.candidate_role_gate(role_emb)
                 )
                 role_delta = self.candidate_role_policy_head(
                     torch.cat(
-                        [cand_modulated, cand_emb_f, role_emb, state],
+                        [cand_modulated, pol_cand_emb_f, role_emb, state],
                         dim=-1,
                     )
                 ).squeeze(-1)
@@ -3263,11 +3296,11 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 )
                 policy_logits = self._hierarchical_policy_logits(
                     raw_candidate_logits=raw_logits,
-                    candidate_embeddings=cand_emb_f,
-                    joint_state_embedding=joint_state_f,
-                    vitals_embedding=vitals_emb_f,
+                    candidate_embeddings=pol_cand_emb_f,
+                    joint_state_embedding=pol_joint_state_f,
+                    vitals_embedding=pol_vitals_emb_f,
                     salient_vitals=salient_for_actor,
-                    recurrent_state=rec_state_f,
+                    recurrent_state=pol_rec_state_f,
                     policy_branch_ids=batch.candidates.policy_branch_ids,
                     action_mask=base.action_mask,
                     domain_ids=batch.domain_ids,
