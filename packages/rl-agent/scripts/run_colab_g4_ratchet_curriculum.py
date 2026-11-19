@@ -73,14 +73,19 @@ DEFAULT_SMOOTH_LADDER: tuple[RatchetStageSpec, ...] = (
 )
 
 _JOINT_B0_STAGE_OVERRIDES: tuple[str, ...] = (
+    "learner.durable_warmup_updates=5",
+    "learner.combat_actor_warmup_updates=5",
     "learner.macro_actor_warmup_updates=5",
+    "learner.learning_rate=0.000120",
+    "learner.shared_learning_rate_scale=0.35",
+    "learner.combat_pg_kl_weight=0.02",
     "learner.enable_post_step_kl_line_search=true",
     "learner.max_parent_macro_kl=0.0",
     "learner.target_macro_step_kl=0.015",
     "learner.kickstart_kl_weight=0.02",
     "learner.kickstart_kl_floor=0.005",
     "learner.kickstart_combat_kl_scale=0.0",
-    "learner.ppo_epochs_per_cohort=2",
+    "learner.ppo_epochs_per_cohort=1",
     "learner.ppo_minibatches_per_cohort=2",
 )
 
@@ -91,7 +96,7 @@ ZERO_REVIVAL_ACT_LADDER: tuple[RatchetStageSpec, ...] = (
         stage_tag="b0-act1-combat",
         wins_required=20,
         mean_revivals_limit=0.0,
-        seed_index_offset=720_000,
+        seed_index_offset=730_000,
         min_skip_rate=0.0,
         max_mean_deck_size=30.0,
         extra_overrides=(
@@ -102,8 +107,8 @@ ZERO_REVIVAL_ACT_LADDER: tuple[RatchetStageSpec, ...] = (
             "learner.kickstart_kl_floor=0.05",
             "learner.kickstart_combat_kl_scale=0.0",
             "learner.combat_policy_weight=1.0",
-            "learner.ppo_epochs_per_cohort=3",
-            "learner.ppo_minibatches_per_cohort=4",
+            "learner.ppo_epochs_per_cohort=1",
+            "learner.ppo_minibatches_per_cohort=2",
         ),
     ),
     RatchetStageSpec(
