@@ -583,6 +583,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--initialize-from-macro-publication", type=Path)
     parser.add_argument("--distill-from-macro-publication", type=Path)
     parser.add_argument("--teacher-publication", type=Path)
+    parser.add_argument("--allow-teacher-reanchor", action="store_true")
     parser.add_argument("--migrate-runtime-from-checkpoint", type=Path)
     parser.add_argument("--resume-from-drive", action="store_true")
     parser.add_argument("--device", default="cuda")
@@ -694,9 +695,10 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
     if explicit_teacher is not None:
         if not explicit_teacher.is_file():
             raise FileNotFoundError(f"distillation teacher publication not found: {explicit_teacher}")
-        if not local_teacher_cache.is_file() or local_teacher_cache.resolve() != explicit_teacher.resolve():
+        explicit_sha = _sha256_file(explicit_teacher)
+        if not local_teacher_cache.is_file() or _sha256_file(local_teacher_cache) != explicit_sha:
             _atomic_copy_file(explicit_teacher, local_teacher_cache, verify_sha256=True)
-        if not drive_teacher_backup.is_file():
+        if not drive_teacher_backup.is_file() or _sha256_file(drive_teacher_backup) != explicit_sha:
             _atomic_copy_file(local_teacher_cache, drive_teacher_backup, verify_sha256=True)
     elif drive_teacher_backup.is_file() and not local_teacher_cache.is_file():
         _atomic_copy_file(drive_teacher_backup, local_teacher_cache, verify_sha256=True)
@@ -921,6 +923,8 @@ def run_campaign(argv: Sequence[str] | None = None) -> int:
             cmd.extend(["--resume", str(local_ckpt)])
             if local_teacher_cache.is_file():
                 cmd.extend(["--teacher-publication", str(local_teacher_cache)])
+                if args.allow_teacher_reanchor:
+                    cmd.append("--allow-teacher-reanchor")
         elif migrate_source is not None:
             cmd.extend(["--migrate-runtime-from-checkpoint", str(migrate_source)])
             if local_teacher_cache.is_file():

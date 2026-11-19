@@ -292,6 +292,14 @@ def _actor_critic_config(config: MacroTrainingConfig) -> HybridActorCriticConfig
     )
 
 
+def _needs_persistent_teacher(learner_cfg: MacroCreditLearnerConfig) -> bool:
+    return (
+        learner_cfg.kickstart_kl_floor > 0.0
+        or learner_cfg.mpo_parent_prior_mix > 0.0
+        or learner_cfg.max_parent_macro_kl > 0.0
+    )
+
+
 def _extract_distillation_teacher_info(
     initialization: Mapping[str, Any],
 ) -> tuple[str | None, str | None]:
@@ -495,7 +503,7 @@ def run_cohorts(
             if (
                 teacher_model is not None
                 and learner.update >= config.learner.distill_total_updates
-                and config.learner.kickstart_kl_floor <= 0.0
+                and not _needs_persistent_teacher(config.learner)
             ):
                 learner.release_teacher()
                 if getattr(learner, "device", torch.device("cpu")).type == "cuda":
@@ -623,7 +631,7 @@ def run_cohorts(
             if (
                 getattr(learner, "teacher_model", None) is not None
                 and learner.update >= config.learner.distill_total_updates
-                and config.learner.kickstart_kl_floor <= 0.0
+                and not _needs_persistent_teacher(config.learner)
             ):
                 learner.release_teacher()
                 if getattr(learner, "device", torch.device("cpu")).type == "cuda":
@@ -684,8 +692,14 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             "optional explicit path to the frozen teacher publication when resuming "
-            "or migrating an active distillation lineage across hosts; SHA-256 must still match"
+            "or migrating an active distillation lineage across hosts; SHA-256 must still match "
+            "unless --allow-teacher-reanchor is passed"
         ),
+    )
+    parser.add_argument(
+        "--allow-teacher-reanchor",
+        action="store_true",
+        help="explicitly permit updating the frozen teacher publication SHA-256 on --resume with provenance logging",
     )
     parser.add_argument("--sim-exe", type=Path)
     parser.add_argument("--max-updates", type=int, default=1, help="maximum committed updates in this invocation")
@@ -714,6 +728,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--teacher-publication is only valid with --resume, "
                 "--migrate-runtime-from-checkpoint, or --initialize-from-macro-publication"
             )
+        if args.allow_teacher_reanchor and not (args.resume and args.teacher_publication):
+            raise ValueError("--allow-teacher-reanchor requires both --resume and --teacher-publication")
         if (
             args.initialize_from_macro_publication
             and config.learner.distill_total_updates > 0
@@ -904,14 +920,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
             if (
                 (args.resume or args.migrate_runtime_from_checkpoint)
-                and config.learner.distill_total_updates > 0
                 and (
-                    learner.update < config.learner.distill_total_updates
-                    or config.learner.kickstart_kl_floor > 0.0
+                    (config.learner.distill_total_updates > 0 and learner.update < config.learner.distill_total_updates)
+                    or _needs_persistent_teacher(config.learner)
                 )
             ):
                 recorded_teacher_path, expected_teacher_sha = _extract_distillation_teacher_info(initialization)
-                if expected_teacher_sha is None:
+                if expected_teacher_sha is None and not args.allow_teacher_reanchor:
                     raise ValueError(
                         "active distillation checkpoint (update < distill_total_updates) "
                         "is missing teacher source_sha256 in initialization provenance"
@@ -929,13 +944,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                         f"active distillation teacher publication not found: {teacher_path}; "
                         "supply --teacher-publication if resuming across hosts"
                     )
+                verify_sha = (
+                    hashlib.sha256(teacher_path.read_bytes()).hexdigest()
+                    if args.allow_teacher_reanchor
+                    else expected_teacher_sha
+                )
+                assert verify_sha is not None
                 resumed_teacher = load_frozen_macro_teacher(
                     teacher_path,
                     expected_encoding=training.model.to_encoding_config(),
                     device=device,
                     rocm_sdpa_backend=training.runtime.rocm_sdpa_backend,
-                    expected_sha256=expected_teacher_sha,
+                    expected_sha256=verify_sha,
                 )
+                if args.allow_teacher_reanchor and verify_sha != expected_teacher_sha:
+                    reanchor_hist = list(initialization.get("teacher_reanchor_history") or [])
+                    reanchor_hist.append(
+                        {
+                            "at_update": learner.update,
+                            "previous_sha256": expected_teacher_sha,
+                            "new_sha256": verify_sha,
+                            "new_path": str(teacher_path),
+                        }
+                    )
+                    initialization["distillation_teacher_path"] = str(teacher_path)
+                    initialization["distillation_teacher_sha256"] = verify_sha
+                    initialization["teacher_reanchor_history"] = reanchor_hist
                 learner.set_teacher_model(resumed_teacher.model)
                 extra_source_paths.append(teacher_path)
             _json(output / "course.json", identity.as_mapping())

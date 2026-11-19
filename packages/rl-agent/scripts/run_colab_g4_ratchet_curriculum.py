@@ -53,16 +53,16 @@ class RatchetStageSpec:
 
 
 DEFAULT_SMOOTH_LADDER: tuple[RatchetStageSpec, ...] = (
-    RatchetStageSpec(budget=24, wins_required=26, mean_revivals_limit=16.8, seed_index_offset=600_000),
-    RatchetStageSpec(budget=20, wins_required=25, mean_revivals_limit=14.0, seed_index_offset=650_000),
-    RatchetStageSpec(budget=16, wins_required=24, mean_revivals_limit=11.2, seed_index_offset=700_000),
-    RatchetStageSpec(budget=12, wins_required=22, mean_revivals_limit=8.4, seed_index_offset=750_000),
-    RatchetStageSpec(budget=8, wins_required=20, mean_revivals_limit=5.6, seed_index_offset=800_000),
-    RatchetStageSpec(budget=6, wins_required=19, mean_revivals_limit=4.2, seed_index_offset=850_000),
-    RatchetStageSpec(budget=4, wins_required=18, mean_revivals_limit=2.8, seed_index_offset=900_000),
-    RatchetStageSpec(budget=3, wins_required=18, mean_revivals_limit=2.1, seed_index_offset=950_000),
-    RatchetStageSpec(budget=2, wins_required=18, mean_revivals_limit=1.4, seed_index_offset=1_000_000),
-    RatchetStageSpec(budget=1, wins_required=18, mean_revivals_limit=0.65, seed_index_offset=1_050_000),
+    RatchetStageSpec(budget=24, wins_required=20, mean_revivals_limit=20.4, seed_index_offset=600_000),
+    RatchetStageSpec(budget=20, wins_required=20, mean_revivals_limit=17.0, seed_index_offset=650_000),
+    RatchetStageSpec(budget=16, wins_required=19, mean_revivals_limit=13.6, seed_index_offset=700_000),
+    RatchetStageSpec(budget=12, wins_required=19, mean_revivals_limit=10.2, seed_index_offset=750_000),
+    RatchetStageSpec(budget=8, wins_required=17, mean_revivals_limit=6.8, seed_index_offset=800_000),
+    RatchetStageSpec(budget=6, wins_required=17, mean_revivals_limit=5.1, seed_index_offset=850_000),
+    RatchetStageSpec(budget=4, wins_required=15, mean_revivals_limit=3.4, seed_index_offset=900_000),
+    RatchetStageSpec(budget=3, wins_required=15, mean_revivals_limit=2.55, seed_index_offset=950_000),
+    RatchetStageSpec(budget=2, wins_required=15, mean_revivals_limit=1.70, seed_index_offset=1_000_000),
+    RatchetStageSpec(budget=1, wins_required=14, mean_revivals_limit=0.85, seed_index_offset=1_050_000),
 )
 
 
@@ -164,6 +164,65 @@ def evaluate_stage_promotion_gate(
     }
 
 
+def select_intrastage_teacher_reanchor(
+    rows: Sequence[Mapping[str, Any]],
+    stage: RatchetStageSpec,
+    *,
+    expected_episodes: int,
+    min_policy_version: int,
+    min_win_gain: int = 2,
+) -> int | None:
+    """Return the best anti-bloat-verified milestone update u >= min_policy_version that strictly beats baseline."""
+    baseline_wins: int | None = None
+    candidates: list[tuple[int, float, float, int]] = []
+    for row in rows:
+        pv = row.get("policy_version", row.get("evaluation_gate"))
+        episodes = row.get("episodes")
+        wins = row.get("successful_run_count")
+        budget = row.get("revival_budget")
+        mean_rev = row.get("mean_revivals_used")
+        skip_rate = row.get("skip_rate")
+        deck_size = row.get("mean_final_deck_size")
+        deadlocks = row.get("deadlock_count", 0)
+        if not (
+            isinstance(pv, int)
+            and not isinstance(pv, bool)
+            and episodes == expected_episodes
+            and budget == stage.budget
+            and isinstance(wins, int)
+            and not isinstance(wins, bool)
+        ):
+            continue
+        if pv in {0, min_policy_version}:
+            baseline_wins = wins if baseline_wins is None else max(baseline_wins, wins)
+        if pv <= min_policy_version or deadlocks != 0:
+            continue
+        if not (
+            isinstance(skip_rate, int | float)
+            and not isinstance(skip_rate, bool)
+            and math.isfinite(float(skip_rate))
+            and float(skip_rate) >= stage.min_skip_rate
+        ):
+            continue
+        if not (
+            isinstance(deck_size, int | float)
+            and not isinstance(deck_size, bool)
+            and math.isfinite(float(deck_size))
+            and float(deck_size) <= stage.max_mean_deck_size
+        ):
+            continue
+        rev_val = float(mean_rev) if isinstance(mean_rev, int | float) and math.isfinite(float(mean_rev)) else 1e9
+        act3_val = float(row.get("act3_reach_rate") or 0.0)
+        candidates.append((wins, -rev_val, act3_val, pv))
+
+    if not candidates:
+        return None
+    best_wins, _, _, best_pv = max(candidates)
+    if baseline_wins is not None and best_wins < baseline_wins + max(1, min_win_gain):
+        return None
+    return best_pv
+
+
 def _read_heldout_rows(stage_dir: Path) -> list[dict[str, Any]]:
     path = stage_dir / "heldout_evaluations.jsonl"
     if not path.is_file():
@@ -213,10 +272,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=Path(
-            "packages/rl-agent/config/experiments/hybrid_macro_credit_v19_durable_afterstate_v63_ratchet_g4_turbo.toml"
+            "packages/rl-agent/config/experiments/hybrid_macro_credit_v21_durable_afterstate_v65_ratchet_g4_turbo.toml"
         ),
     )
-    parser.add_argument("--lineage-prefix", default="durable-afterstate-v6-3-ratchet")
+    parser.add_argument("--lineage-prefix", default="durable-afterstate-v6-5-ratchet")
     parser.add_argument("--lineage-suffix", default="g4")
     parser.add_argument("--initial-publication", type=Path, required=True)
     parser.add_argument("--drive-root-dir", type=Path, required=True)
@@ -460,6 +519,22 @@ def run_ratchet(argv: Sequence[str] | None = None) -> int:
                 args.max_updates_per_stage,
                 ((committed // args.step_updates) + 1) * args.step_updates,
             )
+            effective_teacher_pub = current_parent_pub
+            reanchor_u = select_intrastage_teacher_reanchor(
+                rows,
+                stage,
+                expected_episodes=args.heldout_episodes,
+                min_policy_version=args.min_warmup_updates,
+            )
+            reanchored = False
+            if reanchor_u is not None:
+                cand_reanchor = stage_drive_dir / "snapshots" / f"update-{reanchor_u:06d}" / "publication.pt"
+                if cand_reanchor.is_file():
+                    local_reanchor = promotions_dir / f"reanchor_b{stage.budget}_u{reanchor_u:04d}_publication.pt"
+                    _atomic_copy_verified(cand_reanchor, local_reanchor)
+                    effective_teacher_pub = local_reanchor
+                    reanchored = True
+
             write_state(
                 stage_idx=stage_idx,
                 stage_spec=stage,
@@ -468,6 +543,7 @@ def run_ratchet(argv: Sequence[str] | None = None) -> int:
                 stage_drive_dir=stage_drive_dir,
                 target_upd=next_target,
                 state_label="running_stage",
+                extra={"intrastage_reanchor_update": reanchor_u if reanchored else None},
             )
 
             cmd = [
@@ -484,7 +560,7 @@ def run_ratchet(argv: Sequence[str] | None = None) -> int:
                 "--initialize-from-macro-publication",
                 str(current_parent_pub),
                 "--teacher-publication",
-                str(current_parent_pub),
+                str(effective_teacher_pub),
                 "--resume-from-drive",
                 "--device",
                 args.device,
@@ -503,6 +579,8 @@ def run_ratchet(argv: Sequence[str] | None = None) -> int:
                 "--heldout-eval-workers",
                 str(args.heldout_workers),
             ]
+            if reanchored:
+                cmd.append("--allow-teacher-reanchor")
             if args.sim_exe is not None:
                 cmd.extend(["--sim-exe", str(args.sim_exe)])
             for ov in overrides:

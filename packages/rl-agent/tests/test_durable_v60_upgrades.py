@@ -1012,7 +1012,7 @@ def test_v63_ratchet_promotion_gate_enforces_wins_revivals_and_antibloat(
         (st_dir / "status.json").write_text(json.dumps({"committed_update": tgt_u}) + "\n", encoding="utf-8")
         (st_dir / "publication.pt").write_bytes(f"pub-{lin}-u{tgt_u}".encode("utf-8"))
         # b24 passes on second chunk (u=10); b20 passes on first chunk (u=5)
-        wins = (22 if tgt_u == 5 else 29) if bud == 24 else 27
+        wins = (18 if tgt_u == 5 else 29) if bud == 24 else 27
         rev = 14.5 if bud == 24 else 12.1
         row = {
             "policy_version": tgt_u,
@@ -1144,3 +1144,87 @@ def test_v64_unfreeze_trunk_detach_and_parent_prior_prevents_skip_collapse() -> 
     assert metrics["domain_stream_gradient_norm"] == 0.0
     assert metrics["policy_head_gradient_norm"] == 0.0
     assert metrics["value_head_gradient_norm"] > 0.0
+
+
+def test_v65_calibrated_ratchet_and_intrastage_teacher_reanchor() -> None:
+    import sys
+
+    v65_toml = (
+        Path(__file__).resolve().parents[1]
+        / "config/experiments/hybrid_macro_credit_v21_durable_afterstate_v65_ratchet_g4_turbo.toml"
+    )
+    cfg65 = load_macro_training_config(v65_toml)
+    assert cfg65.learner.revival_budget == 20
+    assert cfg65.training.curriculum.revival_budget == 20
+    assert cfg65.learner.detach_value_heads_from_trunk is True
+    assert cfg65.learner.minority_only_within_branch_mpo is True
+    assert cfg65.learner.mpo_parent_prior_mix == 0.04
+    assert cfg65.learner.max_parent_macro_kl == 0.12
+    assert cfg65.learner.kickstart_kl_floor == 0.015
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts/run_colab_g4_ratchet_curriculum.py"
+    spec = importlib.util.spec_from_file_location("run_colab_g4_ratchet_curriculum_v65", script_path)
+    assert spec is not None and spec.loader is not None
+    ratchet_mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = ratchet_mod
+    spec.loader.exec_module(ratchet_mod)
+
+    b24 = ratchet_mod.DEFAULT_SMOOTH_LADDER[0]
+    ok_u60, _ = ratchet_mod.evaluate_stage_promotion_gate(
+        {
+            "policy_version": 60,
+            "episodes": 48,
+            "revival_budget": 24,
+            "successful_run_count": 21,
+            "mean_revivals_used": 17.88,
+            "skip_rate": 0.155,
+            "mean_final_deck_size": 30.88,
+            "deadlock_count": 0,
+        },
+        b24,
+        expected_episodes=48,
+        min_policy_version=5,
+    )
+    assert ok_u60 is True
+
+    b20 = ratchet_mod.DEFAULT_SMOOTH_LADDER[1]
+    rows = [
+        {
+            "policy_version": 0,
+            "episodes": 48,
+            "revival_budget": 20,
+            "successful_run_count": 15,
+            "mean_revivals_used": 16.9,
+            "skip_rate": 0.15,
+            "mean_final_deck_size": 31.0,
+            "deadlock_count": 0,
+        },
+        {
+            "policy_version": 10,
+            "episodes": 48,
+            "revival_budget": 20,
+            "successful_run_count": 19,
+            "mean_revivals_used": 16.1,
+            "skip_rate": 0.02,  # bloated — must NOT be chosen as reanchor!
+            "mean_final_deck_size": 37.5,
+            "deadlock_count": 0,
+        },
+        {
+            "policy_version": 15,
+            "episodes": 48,
+            "revival_budget": 20,
+            "successful_run_count": 18,
+            "mean_revivals_used": 16.4,
+            "skip_rate": 0.145,
+            "mean_final_deck_size": 30.9,
+            "deadlock_count": 0,
+        },
+    ]
+    chosen = ratchet_mod.select_intrastage_teacher_reanchor(
+        rows,
+        b20,
+        expected_episodes=48,
+        min_policy_version=5,
+    )
+    assert chosen == 15
+
