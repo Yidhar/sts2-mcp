@@ -3131,7 +3131,7 @@ class GroundedCollector:
         encoder: GroundedObservationEncoder,
         backend: EnvironmentBackend,
         scenario: Literal["full-run", "combat"],
-        objective: Literal["combat", "act1", "run"],
+        objective: Literal["combat", "act1", "act2", "run"],
         discount: float,
         max_episode_steps: int,
         character: str | None = None,

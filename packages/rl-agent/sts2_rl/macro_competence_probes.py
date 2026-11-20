@@ -782,6 +782,232 @@ def probe_deck_bloat_resistance(
     }
 
 
+def _build_combat_intent_probe_surface(
+    *,
+    incoming_damage: int,
+    player_block: int = 0,
+    player_hp: int = 40,
+    player_max_hp: int = 80,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    intents: list[dict[str, Any]] = (
+        [
+            {
+                "type": "attack",
+                "label": str(incoming_damage),
+                "total_damage": incoming_damage,
+                "damage": incoming_damage,
+                "repeats": 1,
+            }
+        ]
+        if incoming_damage > 0
+        else [{"type": "buff", "label": "Buff", "repeats": 0}]
+    )
+    hand = [
+        {
+            "index": 0,
+            "id": "CARD.STRIKE_IRONCLAD",
+            "type": "Attack",
+            "source_pile": "Hand",
+            "cost": 1,
+            "can_play": True,
+            "gains_block": False,
+            "dynamic_vars": [{"name": "Damage", "int_value": 6}],
+        },
+        {
+            "index": 1,
+            "id": "CARD.DEFEND_IRONCLAD",
+            "type": "Skill",
+            "source_pile": "Hand",
+            "cost": 1,
+            "can_play": True,
+            "gains_block": True,
+            "dynamic_vars": [{"name": "Block", "int_value": 5}],
+        },
+        {
+            "index": 2,
+            "id": "CARD.BASH",
+            "type": "Attack",
+            "source_pile": "Hand",
+            "cost": 2,
+            "can_play": True,
+            "gains_block": False,
+            "dynamic_vars": [{"name": "Damage", "int_value": 8}],
+        },
+    ]
+    enemy = {
+        "entity_id": "WATERFALL_GIANT",
+        "combat_id": 1,
+        "hp": 120,
+        "max_hp": 240,
+        "block": 0,
+        "is_alive": True,
+        "is_hittable": True,
+        "intends_to_attack": incoming_damage > 0,
+        "intents": intents,
+        "powers": [],
+    }
+    observation: dict[str, Any] = {
+        "phase": "combat",
+        "decision_domain": "combat",
+        "screen": "COMBAT",
+        "run": {"active": True, "act": 1, "floor": 17, "ascension": 0},
+        "player": {
+            "character": "IRONCLAD",
+            "hp": player_hp,
+            "max_hp": player_max_hp,
+            "block": player_block,
+            "energy": 3,
+            "max_energy": 3,
+            "gold": 120,
+            "hand": hand,
+            "draw_pile": [],
+            "discard_pile": [],
+            "exhaust_pile": [],
+            "deck": hand,
+            "relics": [{"id": "RELIC.BURNING_BLOOD"}],
+            "potions": [],
+            "powers": [],
+        },
+        "combat": {
+            "in_progress": True,
+            "round": 3,
+            "turn": "player",
+            "energy": 3,
+            "max_energy": 3,
+            "enemies": [enemy],
+        },
+    }
+    legal_actions: list[dict[str, Any]] = [
+        {
+            "action_handle": "probe:0:play_card",
+            "kind": "play_card",
+            "model_action_kind": "play_card",
+            "is_enabled": True,
+            "card_index": 0,
+            "target_id": 1,
+            "card": hand[0],
+            "target": enemy,
+        },
+        {
+            "action_handle": "probe:1:play_card",
+            "kind": "play_card",
+            "model_action_kind": "play_card",
+            "is_enabled": True,
+            "card_index": 1,
+            "card": hand[1],
+        },
+        {
+            "action_handle": "probe:2:play_card",
+            "kind": "play_card",
+            "model_action_kind": "play_card",
+            "is_enabled": True,
+            "card_index": 2,
+            "target_id": 1,
+            "card": hand[2],
+            "target": enemy,
+        },
+        {
+            "action_handle": "probe:3:end_turn",
+            "kind": "end_turn",
+            "model_action_kind": "end_turn",
+            "is_enabled": True,
+        },
+    ]
+    return observation, legal_actions
+
+
+@torch.no_grad()
+def probe_combat_intent_sensitivity(
+    model: HybridDomainActorCriticModel,
+    encoder: GroundedObservationEncoder,
+) -> dict[str, Any]:
+    """Paired combat counterfactual probe measuring enemy-intent & block awareness."""
+    model.eval()
+    device = next(model.parameters()).device
+    cases = (
+        ("buff0", 0, 0, 40),
+        ("atk10", 10, 0, 40),
+        ("atk25", 25, 0, 40),
+        ("atk25_blk25", 25, 25, 40),
+        ("lethal", 35, 0, 20),
+    )
+    p_defend: dict[str, float] = {}
+    p_bash: dict[str, float] = {}
+    c_vals: dict[str, float | None] = {}
+    s_vals: dict[str, float] = {}
+    for label, inc_dmg, blk, hp in cases:
+        obs, legal = _build_combat_intent_probe_surface(
+            incoming_damage=inc_dmg,
+            player_block=blk,
+            player_hp=hp,
+        )
+        encoded = encoder.encode(obs, legal)
+        batch = collate_encoded_snapshots(
+            (encoded.snapshot,),
+            expected_config=encoded.snapshot.config,
+            expected_fingerprint=encoded.snapshot.encoding_fingerprint,
+            device=device,
+            validate=False,
+        )
+        out = model(batch, None, compute_durable_value=False, validate=False)
+        mask = torch.tensor(encoded.snapshot.action_mask, device=device, dtype=torch.bool)
+        probs = (
+            torch.softmax(out.policy_logits[0, : mask.numel()].masked_fill(~mask, -torch.inf), dim=0)
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        defend_p = 0.0
+        bash_p = 0.0
+        for idx, prob in enumerate(probs):
+            raw_act = legal[encoded.action(idx).position]
+            cid = str((raw_act.get("card") or {}).get("id") or "")
+            if "DEFEND" in cid:
+                defend_p += float(prob)
+            elif "BASH" in cid:
+                bash_p += float(prob)
+        p_defend[label] = defend_p
+        p_bash[label] = bash_p
+        c_vals[label] = (
+            float(out.combat_value[0].detach().cpu().item())
+            if out.combat_value is not None
+            else None
+        )
+        s_vals[label] = float(out.value[0].detach().cpu().item())
+
+    c_buff0 = c_vals["buff0"]
+    c_atk25 = c_vals["atk25"]
+    c_atk25_blk25 = c_vals["atk25_blk25"]
+    c_lethal = c_vals["lethal"]
+    return {
+        "local_combat_critic_enabled": c_buff0 is not None,
+        "p_defend_buff0": p_defend["buff0"],
+        "p_defend_atk10": p_defend["atk10"],
+        "p_defend_atk25": p_defend["atk25"],
+        "p_defend_atk25_blk25": p_defend["atk25_blk25"],
+        "p_defend_lethal": p_defend["lethal"],
+        "p_bash_buff0": p_bash["buff0"],
+        "p_bash_atk25": p_bash["atk25"],
+        "defend_atk25_minus_buff0": p_defend["atk25"] - p_defend["buff0"],
+        "defend_atk25_minus_blk25": p_defend["atk25"] - p_defend["atk25_blk25"],
+        "defend_lethal_minus_buff0": p_defend["lethal"] - p_defend["buff0"],
+        "c_val_buff0": c_buff0,
+        "c_val_atk25": c_atk25,
+        "c_val_atk25_blk25": c_atk25_blk25,
+        "c_val_lethal": c_lethal,
+        "c_val_safe_minus_lethal": (
+            (c_buff0 - c_lethal) if (c_buff0 is not None and c_lethal is not None) else None
+        ),
+        "c_val_blk25_minus_blk0_under_atk25": (
+            (c_atk25_blk25 - c_atk25)
+            if (c_atk25_blk25 is not None and c_atk25 is not None)
+            else None
+        ),
+        "s_val_buff0": s_vals["buff0"],
+        "s_val_lethal": s_vals["lethal"],
+    }
+
+
 def run_all_competence_probes(
     model: HybridDomainActorCriticModel,
     encoder: GroundedObservationEncoder,
@@ -795,6 +1021,7 @@ def run_all_competence_probes(
         "multiset_split_invariance": probe_multiset_split_invariance(model, encoder),
         "gold_monotonicity": probe_gold_monotonicity(model, encoder),
         "deck_bloat_resistance": probe_deck_bloat_resistance(model, encoder),
+        "combat_intent_sensitivity": probe_combat_intent_sensitivity(model, encoder),
         "episode_macro_discipline": summarize_episode_macro_discipline(recent_episodes),
     }
     for key, value in report.items():
@@ -882,6 +1109,7 @@ __all__ = [
     "MACRO_COMPETENCE_PROBE_VERSION",
     "default_probe_decks",
     "probe_campfire_hp_sensitivity",
+    "probe_combat_intent_sensitivity",
     "probe_deck_bloat_resistance",
     "probe_gold_monotonicity",
     "probe_multiset_split_invariance",

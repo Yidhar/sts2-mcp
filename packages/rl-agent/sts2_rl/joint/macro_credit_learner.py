@@ -58,6 +58,7 @@ _PURE_VALUE_PARAM_PREFIXES: Final[tuple[str, ...]] = (
     "state_revival_",
     "durable_",
     "local_combat_value_head.",
+    "local_combat_value_vitals_",
 )
 
 
@@ -164,6 +165,7 @@ class MacroCreditLearnerConfig:
     normalize_combat_advantages: bool = False
     local_combat_value_lr_scale: float = 1.0
     target_combat_step_kl: float = 0.0
+    enable_direct_combat_vitals_context: bool = False
 
     def __post_init__(self) -> None:
         for bool_name in (
@@ -176,6 +178,7 @@ class MacroCreditLearnerConfig:
             "detach_macro_branch_prior_lse",
             "isolate_nonreward_macro_trunk_grads",
             "enable_local_combat_critic",
+            "enable_direct_combat_vitals_context",
             "normalize_combat_advantages",
             "separate_value_grad_clip",
             "enable_direct_vitals_context",
@@ -619,6 +622,7 @@ class MacroCreditLearner:
             "state_value_head",
             "state_revival_",
             "local_combat_value_head",
+            "local_combat_value_vitals_",
             "durable_cycle_",
             "durable_deck_",
             "durable_hp_",
@@ -670,9 +674,11 @@ class MacroCreditLearner:
             "combat_stream_norm",
             "candidate_policy_head",
             "candidate_role_",
+            "combat_vitals_",
             "state_value_head",
             "state_revival_",
             "local_combat_value_head",
+            "local_combat_value_vitals_",
             "branch_policy_head",
             "branch_vitals_",
             "durable_cycle_",
@@ -699,7 +705,9 @@ class MacroCreditLearner:
         for name, item in model.named_parameters():
             if not item.requires_grad:
                 continue
-            if use_custom_combat_val_lr and name.startswith("local_combat_value_head."):
+            if use_custom_combat_val_lr and name.startswith(
+                ("local_combat_value_head.", "local_combat_value_vitals_")
+            ):
                 local_combat_val.append(item)
                 continue
             is_local = name.startswith(local_tokens) and not name.startswith("durable_deck_synergy_")
@@ -5459,6 +5467,7 @@ class MacroCreditLearner:
         post_combat_kl = 0.0
         post_parent_macro_kl = 0.0
         raw_post_macro_kl = 0.0
+        raw_post_combat_kl = 0.0
         line_search_scale = 1.0
         line_search_backtracks = 0
         saved_req_grads: list[bool] | None = None
@@ -5727,18 +5736,28 @@ class MacroCreditLearner:
                     )
                     target_calls += post_kl_calls
                     raw_post_macro_kl = post_macro_kl
-                    step_kl_over = (
+                    raw_post_combat_kl = post_combat_kl
+                    macro_step_kl_over = (
                         self.config.target_macro_step_kl > 0.0
                         and post_macro_kl > self.config.target_macro_step_kl
                     )
+                    combat_step_kl_over = (
+                        self.config.target_combat_step_kl > 0.0
+                        and post_combat_kl > self.config.target_combat_step_kl
+                    )
+                    step_kl_over = macro_step_kl_over or combat_step_kl_over
                     parent_kl_over = (
                         eff_parent_cap > 0.0
                         and kickstart_teacher_logs is not None
                         and post_parent_macro_kl > eff_parent_cap + 1e-6
                     )
+                    line_search_active_from = min(
+                        self.config.durable_warmup_updates,
+                        self.config.combat_actor_warmup_updates,
+                    )
                     if (
                         self.config.enable_post_step_kl_line_search
-                        and self.update >= self.config.durable_warmup_updates
+                        and self.update >= line_search_active_from
                         and (step_kl_over or parent_kl_over)
                         and self.config.line_search_max_backtracks > 0
                     ):
@@ -5763,6 +5782,17 @@ class MacroCreditLearner:
                                     0.90
                                     * math.sqrt(
                                         self.config.target_macro_step_kl / max(post_macro_kl, 1e-12)
+                                    ),
+                                )
+                            if (
+                                self.config.target_combat_step_kl > 0.0
+                                and post_combat_kl > self.config.target_combat_step_kl
+                            ):
+                                ratio = min(
+                                    ratio,
+                                    0.90
+                                    * math.sqrt(
+                                        self.config.target_combat_step_kl / max(post_combat_kl, 1e-12)
                                     ),
                                 )
                             if (
@@ -5798,13 +5828,17 @@ class MacroCreditLearner:
                                 self.config.target_macro_step_kl > 0.0
                                 and post_macro_kl > self.config.target_macro_step_kl
                             )
+                            still_combat_over = (
+                                self.config.target_combat_step_kl > 0.0
+                                and post_combat_kl > self.config.target_combat_step_kl
+                            )
                             still_parent_over = (
                                 eff_parent_cap > 0.0
                                 and kickstart_teacher_logs is not None
                                 and post_parent_macro_kl > eff_parent_cap + 1e-6
                             )
                             if (
-                                (not still_step_over and not still_parent_over)
+                                (not still_step_over and not still_combat_over and not still_parent_over)
                                 or line_search_scale <= self.config.line_search_min_scale + 1e-9
                             ):
                                 break
@@ -5903,6 +5937,7 @@ class MacroCreditLearner:
             "ppo_kl_early_stopped": ppo_kl_early_stopped,
             "warmup_trunk_frozen": warmup_trunk_frozen,
             "raw_updated_macro_policy_kl": raw_post_macro_kl,
+            "raw_updated_combat_policy_kl": raw_post_combat_kl,
             "line_search_scale": line_search_scale,
             "line_search_backtracks": line_search_backtracks,
             "effective_kickstart_kl_weight": effective_kickstart_kl_weight,

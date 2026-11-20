@@ -291,12 +291,18 @@ def _actor_critic_config(config: MacroTrainingConfig) -> HybridActorCriticConfig
             enable_local_combat_value_head=(
                 config.learner.enable_local_combat_critic
             ),
+            enable_direct_combat_vitals_context=(
+                config.learner.enable_direct_combat_vitals_context
+            ),
         )
     return HybridActorCriticConfig(
         grounded,
         domain_layers=config.learner.domain_layers,
         joint_layers=config.learner.joint_layers,
         enable_local_combat_value_head=config.learner.enable_local_combat_critic,
+        enable_direct_combat_vitals_context=(
+            config.learner.enable_direct_combat_vitals_context
+        ),
     )
 
 

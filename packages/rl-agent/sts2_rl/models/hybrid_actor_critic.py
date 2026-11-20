@@ -39,10 +39,14 @@ HYBRID_ACTOR_CRITIC_V2_MODEL_VERSION: Final = "sts2-hybrid-domain-actor-critic-v
 # facts (deck=2, player=13, relic=15, potion=16, modifier=20, run=22), isolated
 # from variable-size map graphs and transient picker containers.
 DECK_ZONE_ID: Final = 2
+HAND_ZONE_ID: Final = 3
 SHOP_ZONE_ID: Final = 9
 PLAYER_ZONE_ID: Final = 13
+ENEMY_ZONE_ID: Final = 14
+INTENT_ZONE_ID: Final = 19
 MODIFIER_ZONE_ID: Final = 20
 RUN_ZONE_ID: Final = 22
+COMBAT_ZONE_ID: Final = 23
 SHOP_SUB_ZONE_ID: Final = 28
 NUMERIC_FACT_SLOT_START: Final = 6
 NUMERIC_FACT_SLOT_END: Final = 166
@@ -51,15 +55,24 @@ DECK_QUANTITY_SLOT: Final = 131
 DECK_REFERENCE_SIZE: Final = 12.0
 DURABLE_DECK_SIZE_DIM: Final = 4
 DURABLE_DECK_SUMMARY_DIM: Final = 4
+PLAYER_BLOCK_OFFSET: Final = 15 - NUMERIC_FACT_SLOT_START
 PLAYER_CURRENT_HP_OFFSET: Final = 34 - NUMERIC_FACT_SLOT_START
+INTENT_DAMAGE_OFFSET: Final = 38 - NUMERIC_FACT_SLOT_START
+COMBAT_ENERGY_OFFSET: Final = 44 - NUMERIC_FACT_SLOT_START
 PLAYER_GOLD_OFFSET: Final = 54 - NUMERIC_FACT_SLOT_START
 PLAYER_HP_OFFSET: Final = 62 - NUMERIC_FACT_SLOT_START
+ENEMY_IS_ALIVE_OFFSET: Final = 67 - NUMERIC_FACT_SLOT_START
+COMBAT_MAX_ENERGY_OFFSET: Final = 110 - NUMERIC_FACT_SLOT_START
 PLAYER_MAX_HP_OFFSET: Final = 111 - NUMERIC_FACT_SLOT_START
 PLAYER_OPEN_POTION_SLOTS_OFFSET: Final = 119 - NUMERIC_FACT_SLOT_START
+INTENT_REPEATS_OFFSET: Final = 133 - NUMERIC_FACT_SLOT_START
+COMBAT_ROUND_OFFSET: Final = 136 - NUMERIC_FACT_SLOT_START
+INTENT_TOTAL_DAMAGE_OFFSET: Final = 156 - NUMERIC_FACT_SLOT_START
 RUN_ACT_OFFSET: Final = 6 - NUMERIC_FACT_SLOT_START
 RUN_ACT_SLOT: Final = 6
 RUN_FLOOR_OFFSET: Final = 51 - NUMERIC_FACT_SLOT_START
 SALIENT_VITALS_DIM: Final = 4
+COMBAT_VITALS_DIM: Final = 16
 DURABLE_PROGRESS_VITALS_DIM: Final = 10
 DURABLE_STAGE_DIM: Final = 5
 DURABLE_HP_BASIS_DIM: Final = 5
@@ -74,6 +87,7 @@ V2_FRESH_TENSOR_PREFIXES: Final[tuple[str, ...]] = (
     "branch_policy_head.",
     "branch_vitals_",
     "candidate_role_",
+    "combat_vitals_",
     "durable_cycle_",
     "durable_deck_",
     "durable_hp_",
@@ -87,6 +101,7 @@ V2_FRESH_TENSOR_PREFIXES: Final[tuple[str, ...]] = (
     "durable_vitals_",
     "latent_slot_readout.",
     "local_combat_value_head.",
+    "local_combat_value_vitals_",
     "persistent_build_",
     "persistent_vitals_",
     "state_revival_",
@@ -125,6 +140,7 @@ class HybridActorCriticConfig:
     enable_build_conditioned_durable_value: bool = False
     enable_twin_durable_value_heads: bool = False
     enable_local_combat_value_head: bool = False
+    enable_direct_combat_vitals_context: bool = False
 
     def __post_init__(self) -> None:
         HybridCandidateQConfig(
@@ -150,6 +166,7 @@ class HybridActorCriticConfig:
             "enable_build_conditioned_durable_value",
             "enable_twin_durable_value_heads",
             "enable_local_combat_value_head",
+            "enable_direct_combat_vitals_context",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"hybrid actor-critic {name} must be boolean")
@@ -223,6 +240,7 @@ class HybridActorCriticConfig:
             or self.enable_build_conditioned_durable_value
             or self.enable_twin_durable_value_heads
             or self.enable_local_combat_value_head
+            or self.enable_direct_combat_vitals_context
         )
 
     @classmethod
@@ -541,6 +559,9 @@ class HybridActorCriticConfig:
                 enable_local_combat_value_head=bool(
                     mapping.get("enable_local_combat_value_head", False)
                 ),
+                enable_direct_combat_vitals_context=bool(
+                    mapping.get("enable_direct_combat_vitals_context", False)
+                ),
             )
         raise ValueError(f"unsupported hybrid actor-critic model_config version: {version!r}")
 
@@ -634,6 +655,12 @@ class HybridActorCriticConfig:
                 base.update(
                     enable_local_combat_value_head=(
                         self.enable_local_combat_value_head
+                    ),
+                )
+            if self.enable_direct_combat_vitals_context:
+                base.update(
+                    enable_direct_combat_vitals_context=(
+                        self.enable_direct_combat_vitals_context
                     ),
                 )
         return base
@@ -817,6 +844,46 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 lc_fc1,
                 nn.SiLU(),
                 lc_out,
+            )
+            if actor_critic.enable_direct_combat_vitals_context:
+                self.local_combat_value_vitals_linear = nn.Linear(
+                    COMBAT_VITALS_DIM, 1, bias=False
+                )
+                nn.init.zeros_(self.local_combat_value_vitals_linear.weight)
+                lcv_mid = max(32, cfg.ffn_dim // 2)
+                lcv_fc1 = nn.Linear(COMBAT_VITALS_DIM, lcv_mid)
+                nn.init.normal_(lcv_fc1.weight, mean=0.0, std=0.20)
+                nn.init.zeros_(lcv_fc1.bias)
+                lcv_out = nn.Linear(lcv_mid, 1)
+                nn.init.zeros_(lcv_out.weight)
+                nn.init.zeros_(lcv_out.bias)
+                self.local_combat_value_vitals_head = nn.Sequential(
+                    lcv_fc1,
+                    nn.SiLU(),
+                    lcv_out,
+                )
+        if actor_critic.enable_direct_combat_vitals_context:
+            self.combat_vitals_to_state = nn.Linear(COMBAT_VITALS_DIM, cfg.d_model)
+            nn.init.zeros_(self.combat_vitals_to_state.weight)
+            nn.init.zeros_(self.combat_vitals_to_state.bias)
+            self.combat_vitals_policy_norm = nn.LayerNorm(cfg.d_model)
+            self.combat_vitals_policy_bilinear = nn.Linear(
+                cfg.d_model,
+                COMBAT_VITALS_DIM + 1,
+                bias=False,
+            )
+            nn.init.zeros_(self.combat_vitals_policy_bilinear.weight)
+            cv_pol_mid = max(32, cfg.ffn_dim // 2)
+            cv_pol_fc1 = nn.Linear(cfg.d_model + COMBAT_VITALS_DIM, cv_pol_mid)
+            nn.init.normal_(cv_pol_fc1.weight, mean=0.0, std=0.10)
+            nn.init.zeros_(cv_pol_fc1.bias)
+            cv_pol_out = nn.Linear(cv_pol_mid, 1)
+            nn.init.zeros_(cv_pol_out.weight)
+            nn.init.zeros_(cv_pol_out.bias)
+            self.combat_vitals_policy_head = nn.Sequential(
+                cv_pol_fc1,
+                nn.SiLU(),
+                cv_pol_out,
             )
         if actor_critic.enable_expressive_synergy_backbone:
             slot_in_dim = cfg.latent_slots * cfg.d_model
@@ -1885,6 +1952,157 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             dim=-1,
         )
         return torch.cat([scaled_player, scaled_run, zone_counts, salient], dim=-1)
+
+    def _extract_combat_vitals(
+        self,
+        world: WorldTokenBatch,
+        domain_ids: Tensor,
+    ) -> Tensor:
+        """Extract pure factual combat tactical vitals directly from world tokens.
+
+        Returns a ``[B, COMBAT_VITALS_DIM]`` float tensor that is strictly zero
+        on non-combat (macro) rows so macro policy/value behavior is untouched.
+        """
+
+        slot_end = min(int(world.features.shape[-1]), NUMERIC_FACT_SLOT_END)
+        feats = world.features[:, :, NUMERIC_FACT_SLOT_START:slot_end]
+        batch_size, world_cap, num_width = feats.shape
+        device = feats.device
+        dtype = feats.dtype
+        valid = world.mask.bool()
+        zeros_bw = torch.zeros((batch_size, world_cap), dtype=dtype, device=device)
+
+        def _col(offset: int) -> Tensor:
+            if 0 <= offset < num_width:
+                return feats[:, :, offset]
+            return zeros_bw
+
+        def _masked_max(mask_bw: Tensor, values_bw: Tensor) -> Tensor:
+            return torch.where(mask_bw, values_bw, zeros_bw).amax(dim=1)
+
+        player_mask = world.zone_ids.eq(PLAYER_ZONE_ID) & valid
+        combat_mask = world.zone_ids.eq(COMBAT_ZONE_ID) & valid
+        combat_or_player = player_mask | combat_mask
+        enemy_mask = world.zone_ids.eq(ENEMY_ZONE_ID) & valid
+        intent_mask = world.zone_ids.eq(INTENT_ZONE_ID) & valid
+
+        hp_col = _col(PLAYER_HP_OFFSET)
+        cur_hp_col = _col(PLAYER_CURRENT_HP_OFFSET)
+        max_hp_col = _col(PLAYER_MAX_HP_OFFSET)
+        block_col = _col(PLAYER_BLOCK_OFFSET)
+        energy_col = _col(COMBAT_ENERGY_OFFSET)
+        max_energy_col = _col(COMBAT_MAX_ENERGY_OFFSET)
+        round_col = _col(COMBAT_ROUND_OFFSET)
+        is_alive_col = _col(ENEMY_IS_ALIVE_OFFSET)
+        dmg_col = _col(INTENT_DAMAGE_OFFSET)
+        rep_col = _col(INTENT_REPEATS_OFFSET)
+        tot_dmg_col = _col(INTENT_TOTAL_DAMAGE_OFFSET)
+
+        hp_log = torch.maximum(
+            _masked_max(player_mask, hp_col),
+            _masked_max(player_mask, cur_hp_col),
+        )
+        hp_val = torch.expm1((10.0 * hp_log).clamp(0.0, 8.0)).clamp_min(0.0)
+        max_hp_val = torch.expm1(
+            (10.0 * _masked_max(player_mask, max_hp_col)).clamp(0.0, 8.0)
+        ).clamp_min(1.0)
+        hp_ratio = (hp_val / max_hp_val).clamp(0.0, 2.0)
+        low_hp_urgency = (0.5 - hp_ratio).clamp_min(0.0) * 2.0
+        block_val = torch.expm1(
+            (10.0 * _masked_max(player_mask, block_col)).clamp(0.0, 8.0)
+        ).clamp_min(0.0)
+
+        energy_val = torch.expm1(
+            (10.0 * _masked_max(combat_or_player, energy_col)).clamp(0.0, 5.0)
+        ).clamp_min(0.0)
+        max_energy_val = torch.expm1(
+            (10.0 * _masked_max(combat_or_player, max_energy_col)).clamp(0.0, 5.0)
+        ).clamp_min(1.0)
+        round_val = torch.expm1(
+            (10.0 * _masked_max(combat_or_player, round_col)).clamp(0.0, 6.0)
+        ).clamp_min(0.0)
+
+        enemy_hp_bw = torch.expm1((10.0 * hp_col).clamp(0.0, 9.0)).clamp_min(0.0)
+        enemy_blk_bw = torch.expm1((10.0 * block_col).clamp(0.0, 8.0)).clamp_min(0.0)
+        enemy_alive = enemy_mask & ((is_alive_col > 0.5) | (enemy_hp_bw > 0.5))
+        alive_enemy_count = enemy_alive.to(dtype=dtype).sum(dim=1)
+        total_enemy_ehp = torch.where(
+            enemy_alive, enemy_hp_bw + enemy_blk_bw, zeros_bw
+        ).sum(dim=1)
+        big_hp = torch.full_like(enemy_hp_bw, 1e6)
+        min_enemy_hp_raw = torch.where(enemy_alive, enemy_hp_bw, big_hp).amin(dim=1)
+        has_alive_enemy = alive_enemy_count > 0.5
+        min_enemy_hp = torch.where(
+            has_alive_enemy,
+            min_enemy_hp_raw,
+            torch.zeros_like(min_enemy_hp_raw),
+        )
+
+        # Match intent tokens against alive enemies via decision-local relation IDs
+        # in O(B * W * 32) without host sync or O(W^2) memory.
+        rel = world.relation_binding_ids
+        k_enemy = min(world_cap, 32)
+        top_alive_scores, top_enemy_idx = enemy_alive.to(torch.int8).topk(k_enemy, dim=1)
+        top_alive_mask = top_alive_scores > 0
+        top_enemy_rels = rel.gather(1, top_enemy_idx)
+        has_alive_rel = (top_alive_mask & (top_enemy_rels > 1)).any(dim=1, keepdim=True)
+        matches_alive_enemy = (
+            intent_mask.unsqueeze(2)
+            & top_alive_mask.unsqueeze(1)
+            & (rel.unsqueeze(2) == top_enemy_rels.unsqueeze(1))
+            & (rel.unsqueeze(2) > 1)
+        ).any(dim=2)
+        active_intent = intent_mask & torch.where(
+            has_alive_rel & (rel > 1),
+            matches_alive_enemy,
+            torch.ones_like(intent_mask),
+        )
+        per_hit = torch.expm1((10.0 * dmg_col).clamp(0.0, 8.0)).clamp_min(0.0)
+        rep_raw = torch.expm1((10.0 * rep_col).clamp(0.0, 5.0)).clamp_min(0.0)
+        tot_dmg_slot = torch.expm1((10.0 * tot_dmg_col).clamp(0.0, 8.0)).clamp_min(0.0)
+        eff_repeats = torch.where(rep_raw > 0.5, rep_raw, torch.ones_like(rep_raw))
+        intent_dmg_bw = torch.where(per_hit > 0.05, per_hit * eff_repeats, tot_dmg_slot)
+        total_incoming = torch.where(active_intent, intent_dmg_bw, zeros_bw).sum(dim=1)
+
+        is_attacked = (total_incoming > 0.5).to(dtype=dtype)
+        incoming_norm = (total_incoming / 30.0).clamp(0.0, 4.0)
+        block_norm = (block_val / 30.0).clamp(0.0, 4.0)
+        unblocked_incoming = (total_incoming - block_val).clamp_min(0.0)
+        unblocked_norm = (unblocked_incoming / 30.0).clamp(0.0, 4.0)
+        needs_block = (unblocked_incoming > 0.5).to(dtype=dtype)
+        block_surplus_norm = ((block_val - total_incoming).clamp_min(0.0) / 30.0).clamp(0.0, 4.0)
+        unblocked_hp_frac = (unblocked_incoming / hp_val.clamp_min(1.0)).clamp(0.0, 2.0)
+        lethal_risk = (unblocked_incoming >= (hp_val.clamp_min(1.0) - 0.5)).to(dtype=dtype) * is_attacked
+        energy_norm = (energy_val / 3.0).clamp(0.0, 3.0)
+        energy_frac = (energy_val / max_energy_val).clamp(0.0, 2.0)
+        round_norm = (round_val / 10.0).clamp(0.0, 3.0)
+        alive_enemies_norm = (alive_enemy_count / 3.0).clamp(0.0, 3.0)
+        total_enemy_ehp_norm = (total_enemy_ehp / 100.0).clamp(0.0, 4.0)
+        min_enemy_hp_scale = torch.tanh(min_enemy_hp / 15.0) * has_alive_enemy.to(dtype=dtype)
+
+        stacked = torch.stack(
+            [
+                is_attacked,
+                incoming_norm,
+                block_norm,
+                unblocked_norm,
+                needs_block,
+                block_surplus_norm,
+                unblocked_hp_frac,
+                lethal_risk,
+                hp_ratio,
+                low_hp_urgency,
+                energy_norm,
+                energy_frac,
+                round_norm,
+                alive_enemies_norm,
+                total_enemy_ehp_norm,
+                min_enemy_hp_scale,
+            ],
+            dim=-1,
+        )
+        combat_row_mask = domain_ids.eq(COMBAT_DOMAIN_ID).to(dtype=dtype).unsqueeze(-1)
+        return stacked * combat_row_mask
 
     def _mask_world_to_persistent(self, world: WorldTokenBatch) -> WorldTokenBatch:
         persistent_mask = self._persistent_token_mask(world.zone_ids, world.owner_ids, world.mask)
@@ -3114,12 +3332,20 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         recurrent_state: Tensor | None = None,
         *,
         validate: bool = True,
-    ) -> tuple[HybridRepresentationOutput, Tensor | None, Tensor | None, Tensor | None]:
+    ) -> tuple[
+        HybridRepresentationOutput,
+        Tensor | None,
+        Tensor | None,
+        Tensor | None,
+        Tensor | None,
+    ]:
         has_build = self.actor_critic_config.enable_persistent_build_context
         has_vitals = self.actor_critic_config.enable_direct_vitals_context
-        if not has_build and not has_vitals:
+        has_combat_vitals = self.actor_critic_config.enable_direct_combat_vitals_context
+        if not has_build and not has_vitals and not has_combat_vitals:
             return (
                 self.forward_representation(batch, recurrent_state, validate=validate),
+                None,
                 None,
                 None,
                 None,
@@ -3153,6 +3379,11 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         raw_vitals: Tensor | None = None
         if has_vitals:
             vitals_emb, raw_vitals = self._encode_direct_vitals(batch.world)
+        combat_vitals: Tensor | None = (
+            self._extract_combat_vitals(batch.world, batch.domain_ids)
+            if has_combat_vitals
+            else None
+        )
         mask = candidates.action_mask.bool()
         cfg = self.config
         memory_half = cfg.recurrent_hidden_dim // 2
@@ -3184,6 +3415,11 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             state_token = state_token + self.persistent_build_to_state(build_emb)
         if vitals_emb is not None:
             state_token = state_token + self.persistent_vitals_to_state(vitals_emb)
+        if combat_vitals is not None:
+            state_token = state_token + (
+                self.combat_vitals_to_state(combat_vitals.to(dtype=state_token.dtype))
+                * combat_domain.to(dtype=state_token.dtype)
+            )
         slow_strategy_token = self.strategy_token(next_run)
         action_count = int(mask.shape[1])
         candidate_tokens = candidates.embeddings + memory_context.unsqueeze(1)
@@ -3243,6 +3479,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             build_emb,
             vitals_emb,
             raw_vitals,
+            combat_vitals,
         )
 
     def forward(  # type: ignore[override]
@@ -3255,7 +3492,13 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         policy_detach_trunk_mask: Tensor | None = None,
         validate: bool = True,
     ) -> HybridActorCriticOutput:
-        base, build_emb, vitals_emb, raw_vitals = self._forward_representation_with_build(
+        (
+            base,
+            build_emb,
+            vitals_emb,
+            raw_vitals,
+            combat_vitals,
+        ) = self._forward_representation_with_build(
             batch,
             recurrent_state,
             validate=validate,
@@ -3273,6 +3516,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             rec_state_f = base.recurrent_state.float()
             vitals_emb_f = None if vitals_emb is None else vitals_emb.float()
             raw_vitals_f = None if raw_vitals is None else raw_vitals.float()
+            combat_vitals_f = None if combat_vitals is None else combat_vitals.float()
             rev_ctx_f = None if rev_ctx is None else rev_ctx.float()
 
             has_pol_detach = policy_detach_trunk_mask is not None and bool(
@@ -3322,6 +3566,24 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                     )
                 ).squeeze(-1)
                 raw_logits = raw_logits + role_delta
+            if combat_vitals_f is not None:
+                combat_domain_f = batch.domain_ids.eq(COMBAT_DOMAIN_ID).to(
+                    dtype=raw_logits.dtype
+                ).unsqueeze(-1)
+                cand_cv_norm = self.combat_vitals_policy_norm(pol_cand_emb_f)
+                cv_aug = torch.cat(
+                    [torch.ones_like(combat_vitals_f[:, :1]), combat_vitals_f],
+                    dim=-1,
+                )
+                cv_bilinear = (
+                    self.combat_vitals_policy_bilinear(cand_cv_norm)
+                    * cv_aug.unsqueeze(1)
+                ).sum(dim=-1)
+                cv_exp = combat_vitals_f.unsqueeze(1).expand(-1, int(action_count), -1)
+                cv_mlp = self.combat_vitals_policy_head(
+                    torch.cat([cand_cv_norm, cv_exp], dim=-1)
+                ).squeeze(-1)
+                raw_logits = raw_logits + (cv_bilinear + cv_mlp) * combat_domain_f
             if self.actor_critic_config.enable_hierarchical_branch_policy:
                 salient_for_actor = (
                     raw_vitals_f[:, -SALIENT_VITALS_DIM:]
@@ -3352,9 +3614,18 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             ).squeeze(-1)
             combat_value: Tensor | None = None
             if self.actor_critic_config.enable_local_combat_value_head:
-                combat_value = self.local_combat_value_head(
+                cv_pred: Tensor = self.local_combat_value_head(
                     torch.cat([val_joint, val_rec], dim=-1)
                 ).squeeze(-1)
+                if combat_vitals_f is not None:
+                    combat_row_f = batch.domain_ids.eq(COMBAT_DOMAIN_ID).to(
+                        dtype=cv_pred.dtype
+                    )
+                    cv_pred = cv_pred + (
+                        self.local_combat_value_vitals_linear(combat_vitals_f).squeeze(-1)
+                        + self.local_combat_value_vitals_head(combat_vitals_f).squeeze(-1)
+                    ) * combat_row_f
+                combat_value = cv_pred
             if rev_ctx_f is not None:
                 rev_scaled = rev_ctx_f * 4.0
                 value = (
@@ -3576,6 +3847,7 @@ def initialize_actor_critic_from_macro_publication(
 
 
 __all__ = [
+    "COMBAT_VITALS_DIM",
     "CRITIC_REVIVAL_CONTEXT_DIM",
     "HYBRID_ACTOR_CRITIC_MODEL_VERSION",
     "HYBRID_ACTOR_CRITIC_V2_MODEL_VERSION",
