@@ -778,6 +778,51 @@ def _reconstruct_heldout_journal(
     return reconstructed_episodes
 
 
+_RESUMABLE_COMPLETION_STATUSES = frozenset({"paused_stage_cap_reached"})
+
+
+def _strip_stale_terminal_events(metrics_path: Path) -> int:
+    """Remove stale resumable terminal records from metrics.jsonl when a stage resumes live."""
+    if not metrics_path.is_file() or metrics_path.stat().st_size == 0:
+        return 0
+    raw_bytes = metrics_path.read_bytes()
+    if b'"run_complete"' not in raw_bytes and b'"run_failed"' not in raw_bytes:
+        return 0
+    kept: list[str] = []
+    removed = 0
+    for line in raw_bytes.decode("utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if stripped:
+            try:
+                obj = json.loads(stripped)
+            except Exception:
+                obj = None
+            if isinstance(obj, Mapping):
+                ev = obj.get("event")
+                if ev == "run_failed" or (
+                    ev == "run_complete"
+                    and str(obj.get("completion_status") or "") in _RESUMABLE_COMPLETION_STATUSES
+                ):
+                    removed += 1
+                    continue
+        kept.append(line)
+    if removed == 0:
+        return 0
+    tmp_path = metrics_path.with_name(f".{metrics_path.name}.tmp-{os.getpid()}")
+    payload = ("\n".join(kept) + "\n") if kept else ""
+    tmp_path.write_text(payload, encoding="utf-8", newline="\n")
+    for attempt in range(3):
+        try:
+            os.replace(tmp_path, metrics_path)
+            return removed
+        except PermissionError:
+            if attempt == 2:
+                tmp_path.unlink(missing_ok=True)
+                return 0
+            time.sleep(0.05)
+    return 0
+
+
 def sync_once(
     *,
     root: Path,
@@ -907,7 +952,11 @@ def sync_once(
                         )
                     ),
                     "version": (
-                        "sts2-durable-afterstate-v7.2-turbo-b0"
+                        "sts2-durable-afterstate-v7.4-joint-b0"
+                        if ("v7-4" in lineage or "v7.4" in lineage)
+                        else "sts2-durable-afterstate-v7.3-combat-vitals-b0"
+                        if ("v7-3" in lineage or "v7.3" in lineage)
+                        else "sts2-durable-afterstate-v7.2-turbo-b0"
                         if ("v7-2" in lineage or "v7.2" in lineage)
                         else "sts2-durable-afterstate-v7.1-combat-first-b0"
                         if ("v7-1" in lineage or "v7.1" in lineage)
@@ -955,6 +1004,15 @@ def sync_once(
         )
 
     stage_alive = bool(remote_bundle.get("alive")) and force_terminal_status is None
+    # If this stage was previously paused at cap (or failed) and has now resumed live, strip stale
+    # terminal lines so the dashboard immediately transitions back to active training status.
+    if stage_alive and metrics_path.is_file() and metrics_path.stat().st_size > 0:
+        removed_stale = _strip_stale_terminal_events(metrics_path)
+        if removed_stale > 0:
+            print(
+                f"[sync] Cleared {removed_stale} stale terminal event(s) for resumed live stage {lineage}",
+                flush=True,
+            )
     # Flush immediate live heartbeat BEFORE running local HeadlessSim journal replay so telemetry age resets right away.
     if stage_alive and metrics_path.is_file() and metrics_path.stat().st_size > 0:
         remote_status_early = remote_bundle.get("status")

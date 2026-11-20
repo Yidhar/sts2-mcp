@@ -78,8 +78,13 @@ _JOINT_B0_STAGE_OVERRIDES: tuple[str, ...] = (
     "learner.macro_actor_warmup_updates=5",
     "learner.learning_rate=0.000120",
     "learner.shared_learning_rate_scale=0.25",
-    "learner.combat_pg_kl_weight=0.01",
-    "learner.combat_entropy_weight=0.005",
+    "learner.local_combat_win_reward=1.5",
+    "learner.local_combat_loss_reward=-1.5",
+    "learner.local_combat_hp_weight=1.2",
+    "learner.combat_pg_kl_weight=0.005",
+    "learner.combat_entropy_weight=0.012",
+    "learner.macro_entropy_weight=0.002",
+    "learner.mpo_parent_prior_mix=0.04",
     "learner.enable_post_step_kl_line_search=true",
     "learner.max_parent_macro_kl=0.0",
     "learner.target_macro_step_kl=0.015",
@@ -87,6 +92,7 @@ _JOINT_B0_STAGE_OVERRIDES: tuple[str, ...] = (
     "learner.kickstart_kl_weight=0.02",
     "learner.kickstart_kl_floor=0.005",
     "learner.kickstart_combat_kl_scale=0.0",
+    "learner.likelihood_tolerance=0.15",
     "learner.ppo_epochs_per_cohort=1",
     "learner.ppo_minibatches_per_cohort=2",
 )
@@ -125,7 +131,7 @@ ZERO_REVIVAL_ACT_LADDER: tuple[RatchetStageSpec, ...] = (
         stage_tag="b0-act1",
         wins_required=30,
         mean_revivals_limit=0.0,
-        seed_index_offset=760_000,
+        seed_index_offset=765_000,
         min_skip_rate=0.08,
         max_mean_deck_size=21.0,
         extra_overrides=_JOINT_B0_STAGE_OVERRIDES,
@@ -375,7 +381,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--sim-exe", type=Path, default=None)
     parser.add_argument("--step-updates", type=int, default=5)
-    parser.add_argument("--max-updates-per-stage", type=int, default=80)
+    parser.add_argument("--max-updates-per-stage", type=int, default=250)
     parser.add_argument("--min-warmup-updates", type=int, default=5)
     parser.add_argument("--heldout-episodes", type=int, default=48)
     parser.add_argument("--heldout-workers", type=int, default=32)
@@ -396,7 +402,55 @@ def _build_parser() -> argparse.ArgumentParser:
         default="",
         help="optional comma-separated subset of stage_key values (e.g. 'b0-act1,b0-act2,b0-act3')",
     )
+    parser.add_argument(
+        "--start-stage",
+        default="",
+        help="optional starting stage_key from the selected ladder (runs from this stage through the end)",
+    )
     return parser
+
+
+def _select_ratchet_stages(
+    *,
+    curriculum_mode: str,
+    budgets: str = "",
+    stages: str = "",
+    start_stage: str = "",
+) -> tuple[RatchetStageSpec, ...]:
+    start_key = start_stage.strip()
+    if start_key and (stages.strip() or budgets.strip()):
+        raise ValueError("--start-stage cannot be combined with --stages or --budgets")
+    if curriculum_mode == "act-b0":
+        base_ladder = ZERO_REVIVAL_ACT_LADDER
+        by_key = {spec.stage_key: spec for spec in base_ladder}
+        if stages.strip():
+            wanted_keys = [tok.strip() for tok in stages.split(",") if tok.strip()]
+            return tuple(by_key[k] for k in wanted_keys)
+        if start_key:
+            keys = [spec.stage_key for spec in base_ladder]
+            if start_key not in by_key:
+                raise ValueError(f"unknown --start-stage {start_key!r}; expected one of {keys}")
+            return base_ladder[keys.index(start_key) :]
+        return base_ladder
+
+    by_budget = {spec.budget: spec for spec in DEFAULT_SMOOTH_LADDER}
+    by_key = {spec.stage_key: spec for spec in DEFAULT_SMOOTH_LADDER}
+    if budgets.strip():
+        wanted = [int(tok.strip()) for tok in budgets.split(",") if tok.strip()]
+        selected = tuple(by_budget[b] for b in wanted)
+    elif stages.strip():
+        wanted_keys = [tok.strip() for tok in stages.split(",") if tok.strip()]
+        selected = tuple(by_key[k] for k in wanted_keys)
+    elif start_key:
+        keys = [spec.stage_key for spec in DEFAULT_SMOOTH_LADDER]
+        if start_key not in by_key:
+            raise ValueError(f"unknown --start-stage {start_key!r}; expected one of {keys}")
+        selected = DEFAULT_SMOOTH_LADDER[keys.index(start_key) :]
+    else:
+        selected = DEFAULT_SMOOTH_LADDER
+    if any(b.budget >= a.budget for a, b in zip(selected, selected[1:])):
+        raise ValueError("ratchet budgets must strictly decrease")
+    return selected
 
 
 def run_ratchet(argv: Sequence[str] | None = None) -> int:
@@ -430,27 +484,12 @@ def run_ratchet(argv: Sequence[str] | None = None) -> int:
     promotions_dir = root / "ratchet_promotions" / ratchet_id
     promotions_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.curriculum_mode == "act-b0":
-        base_ladder = ZERO_REVIVAL_ACT_LADDER
-        by_key = {spec.stage_key: spec for spec in base_ladder}
-        if args.stages.strip():
-            wanted_keys = [tok.strip() for tok in args.stages.split(",") if tok.strip()]
-            stages = tuple(by_key[k] for k in wanted_keys)
-        else:
-            stages = base_ladder
-    else:
-        by_budget = {spec.budget: spec for spec in DEFAULT_SMOOTH_LADDER}
-        if args.budgets.strip():
-            wanted = [int(tok.strip()) for tok in args.budgets.split(",") if tok.strip()]
-            stages = tuple(by_budget[b] for b in wanted)
-        elif args.stages.strip():
-            by_key = {spec.stage_key: spec for spec in DEFAULT_SMOOTH_LADDER}
-            wanted_keys = [tok.strip() for tok in args.stages.split(",") if tok.strip()]
-            stages = tuple(by_key[k] for k in wanted_keys)
-        else:
-            stages = DEFAULT_SMOOTH_LADDER
-        if any(b.budget >= a.budget for a, b in zip(stages, stages[1:])):
-            raise ValueError("ratchet budgets must strictly decrease")
+    stages = _select_ratchet_stages(
+        curriculum_mode=args.curriculum_mode,
+        budgets=args.budgets,
+        stages=args.stages,
+        start_stage=args.start_stage,
+    )
 
     # Load prior ratchet state if resuming across restarts (only if ratchet_id matches!)
     prior_state: dict[str, Any] = {}
