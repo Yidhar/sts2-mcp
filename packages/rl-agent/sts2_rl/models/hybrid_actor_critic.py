@@ -88,6 +88,7 @@ V2_FRESH_TENSOR_PREFIXES: Final[tuple[str, ...]] = (
     "branch_vitals_",
     "candidate_role_",
     "combat_vitals_",
+    "durable_active_",
     "durable_cycle_",
     "durable_deck_",
     "durable_hp_",
@@ -141,6 +142,7 @@ class HybridActorCriticConfig:
     enable_twin_durable_value_heads: bool = False
     enable_local_combat_value_head: bool = False
     enable_direct_combat_vitals_context: bool = False
+    enable_active_durable_vitals_gates: bool = False
 
     def __post_init__(self) -> None:
         HybridCandidateQConfig(
@@ -167,6 +169,7 @@ class HybridActorCriticConfig:
             "enable_twin_durable_value_heads",
             "enable_local_combat_value_head",
             "enable_direct_combat_vitals_context",
+            "enable_active_durable_vitals_gates",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"hybrid actor-critic {name} must be boolean")
@@ -219,6 +222,13 @@ class HybridActorCriticConfig:
             raise ValueError(
                 "enable_twin_durable_value_heads requires enable_durable_value_head=True and enable_persistent_only_durable_value=True"
             )
+        if (
+            self.enable_active_durable_vitals_gates
+            and not self.enable_monotone_deconfounded_durable_value
+        ):
+            raise ValueError(
+                "enable_active_durable_vitals_gates requires enable_monotone_deconfounded_durable_value=True"
+            )
 
     @property
     def has_v2_extensions(self) -> bool:
@@ -241,6 +251,7 @@ class HybridActorCriticConfig:
             or self.enable_twin_durable_value_heads
             or self.enable_local_combat_value_head
             or self.enable_direct_combat_vitals_context
+            or self.enable_active_durable_vitals_gates
         )
 
     @classmethod
@@ -562,6 +573,9 @@ class HybridActorCriticConfig:
                 enable_direct_combat_vitals_context=bool(
                     mapping.get("enable_direct_combat_vitals_context", False)
                 ),
+                enable_active_durable_vitals_gates=bool(
+                    mapping.get("enable_active_durable_vitals_gates", False)
+                ),
             )
         raise ValueError(f"unsupported hybrid actor-critic model_config version: {version!r}")
 
@@ -661,6 +675,12 @@ class HybridActorCriticConfig:
                 base.update(
                     enable_direct_combat_vitals_context=(
                         self.enable_direct_combat_vitals_context
+                    ),
+                )
+            if self.enable_active_durable_vitals_gates:
+                base.update(
+                    enable_active_durable_vitals_gates=(
+                        self.enable_active_durable_vitals_gates
                     ),
                 )
         return base
@@ -1050,6 +1070,27 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                         nn.SiLU(),
                         cyc_out,
                     )
+                    if actor_critic.enable_active_durable_vitals_gates:
+                        def _make_active_gate(out_d: int, init_b: float) -> nn.Sequential:
+                            a_fc1 = nn.Linear(stage_in_dim, stage_mid_dim)
+                            nn.init.normal_(a_fc1.weight, mean=0.0, std=0.10)
+                            nn.init.zeros_(a_fc1.bias)
+                            a_out = nn.Linear(stage_mid_dim, out_d)
+                            nn.init.zeros_(a_out.weight)
+                            nn.init.constant_(a_out.bias, init_b)
+                            return nn.Sequential(
+                                nn.LayerNorm(stage_in_dim), a_fc1, nn.SiLU(), a_out
+                            )
+
+                        self.durable_active_hp_gate = _make_active_gate(
+                            DURABLE_HP_BASIS_DIM, -1.2
+                        )
+                        self.durable_active_liquid_gate = _make_active_gate(
+                            DURABLE_LIQUID_BASIS_DIM, -2.0
+                        )
+                        self.durable_active_cycle_gate = _make_active_gate(
+                            DURABLE_CYCLE_BASIS_DIM, -2.0
+                        )
                 elif actor_critic.enable_deconfounded_durable_value:
                     prog_in_dim = DURABLE_PROGRESS_VITALS_DIM + rev_dim
                     prog_mid_dim = max(16, cfg.ffn_dim // 2)
@@ -1268,6 +1309,16 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                     self.durable_twin_cycle_gate = _make_twin_gate(
                         DURABLE_CYCLE_BASIS_DIM, -5.5 if t_bal else -3.8
                     )
+                    if actor_critic.enable_active_durable_vitals_gates:
+                        self.durable_active_twin_hp_gate = _make_twin_gate(
+                            DURABLE_HP_BASIS_DIM, -1.2
+                        )
+                        self.durable_active_twin_liquid_gate = _make_twin_gate(
+                            DURABLE_LIQUID_BASIS_DIM, -2.0
+                        )
+                        self.durable_active_twin_cycle_gate = _make_twin_gate(
+                            DURABLE_CYCLE_BASIS_DIM, -2.0
+                        )
                 if actor_critic.enable_draw_weighted_durable_value:
                     t_deck_ctx_dim = (
                         cfg.d_model * (1 + int(actor_critic.enable_direct_vitals_context))
@@ -2702,6 +2753,17 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                     if ac.enable_debloated_synergy_durable_value:
                         cyc_logits = cyc_logits + 1.5
                     w_cycle = nn.functional.softplus(cyc_logits)
+                    if ac.enable_active_durable_vitals_gates:
+                        act_cyc_gate = (
+                            self.durable_active_twin_cycle_gate
+                            if use_twin
+                            else self.durable_active_cycle_gate
+                        )
+                        raw_act_cyc = act_cyc_gate(stage_in)
+                        eff_act_cyc = (
+                            nn.functional.leaky_relu(raw_act_cyc + 4.0, negative_slope=0.1) - 4.0
+                        ).clamp(max=3.5)
+                        w_cycle = w_cycle + nn.functional.softplus(eff_act_cyc)
                     v_cycle = -(w_cycle * bloat_basis).sum(dim=-1)
                     deck_utility = deck_utility + v_cycle
                 out = out + deck_utility
@@ -2820,6 +2882,27 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                             out = out + v_shop_raw * in_shop.to(dtype=out.dtype)
                 w_hp = nn.functional.softplus(hp_logits)
                 w_liq = nn.functional.softplus(liq_logits)
+                if ac.enable_active_durable_vitals_gates:
+                    act_hp_gate = (
+                        self.durable_active_twin_hp_gate
+                        if use_twin
+                        else self.durable_active_hp_gate
+                    )
+                    act_liq_gate = (
+                        self.durable_active_twin_liquid_gate
+                        if use_twin
+                        else self.durable_active_liquid_gate
+                    )
+                    raw_act_hp = act_hp_gate(stage_in)
+                    raw_act_liq = act_liq_gate(stage_in)
+                    eff_act_hp = (
+                        nn.functional.leaky_relu(raw_act_hp + 4.0, negative_slope=0.1) - 4.0
+                    ).clamp(max=3.5)
+                    eff_act_liq = (
+                        nn.functional.leaky_relu(raw_act_liq + 4.0, negative_slope=0.1) - 4.0
+                    ).clamp(max=3.5)
+                    w_hp = w_hp + nn.functional.softplus(eff_act_hp)
+                    w_liq = w_liq + nn.functional.softplus(eff_act_liq)
                 stage_term = (
                     v_stage
                     if ac.enable_balanced_deconfounded_durable_value

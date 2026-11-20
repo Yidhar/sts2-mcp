@@ -294,6 +294,9 @@ def _actor_critic_config(config: MacroTrainingConfig) -> HybridActorCriticConfig
             enable_direct_combat_vitals_context=(
                 config.learner.enable_direct_combat_vitals_context
             ),
+            enable_active_durable_vitals_gates=(
+                config.learner.enable_active_durable_vitals_gates
+            ),
         )
     return HybridActorCriticConfig(
         grounded,

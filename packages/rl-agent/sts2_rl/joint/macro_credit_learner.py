@@ -164,8 +164,10 @@ class MacroCreditLearnerConfig:
     kickstart_combat_kl_scale: float = 1.0
     normalize_combat_advantages: bool = False
     local_combat_value_lr_scale: float = 1.0
+    durable_value_lr_scale: float = 1.0
     target_combat_step_kl: float = 0.0
     enable_direct_combat_vitals_context: bool = False
+    enable_active_durable_vitals_gates: bool = False
 
     def __post_init__(self) -> None:
         for bool_name in (
@@ -179,6 +181,7 @@ class MacroCreditLearnerConfig:
             "isolate_nonreward_macro_trunk_grads",
             "enable_local_combat_critic",
             "enable_direct_combat_vitals_context",
+            "enable_active_durable_vitals_gates",
             "normalize_combat_advantages",
             "separate_value_grad_clip",
             "enable_direct_vitals_context",
@@ -226,6 +229,13 @@ class MacroCreditLearnerConfig:
         ):
             raise ValueError(
                 "macro credit enable_balanced_deconfounded_durable_value requires enable_monotone_deconfounded_durable_value=True"
+            )
+        if (
+            self.enable_active_durable_vitals_gates
+            and not self.enable_monotone_deconfounded_durable_value
+        ):
+            raise ValueError(
+                "macro credit enable_active_durable_vitals_gates requires enable_monotone_deconfounded_durable_value=True"
             )
         if (
             self.enable_expressive_synergy_backbone
@@ -317,6 +327,7 @@ class MacroCreditLearnerConfig:
             "combat_pg_adv_clip",
             "hp_loss_reference",
             "local_combat_value_lr_scale",
+            "durable_value_lr_scale",
         )
         non_negative = (
             "weight_decay",
@@ -623,6 +634,7 @@ class MacroCreditLearner:
             "state_revival_",
             "local_combat_value_head",
             "local_combat_value_vitals_",
+            "durable_active_",
             "durable_cycle_",
             "durable_deck_",
             "durable_hp_",
@@ -681,6 +693,7 @@ class MacroCreditLearner:
             "local_combat_value_vitals_",
             "branch_policy_head",
             "branch_vitals_",
+            "durable_active_",
             "durable_cycle_",
             "durable_deck_",
             "durable_hp_",
@@ -696,12 +709,14 @@ class MacroCreditLearner:
             "persistent_vitals_",
         )
         local_combat_val: list[nn.Parameter] = []
+        durable_val: list[nn.Parameter] = []
         local: list[nn.Parameter] = []
         shared: list[nn.Parameter] = []
         use_custom_combat_val_lr = (
             self.config.local_combat_value_lr_scale != 1.0
             and self.config.enable_local_combat_critic
         )
+        use_custom_durable_val_lr = self.config.durable_value_lr_scale != 1.0
         for name, item in model.named_parameters():
             if not item.requires_grad:
                 continue
@@ -709,6 +724,13 @@ class MacroCreditLearner:
                 ("local_combat_value_head.", "local_combat_value_vitals_")
             ):
                 local_combat_val.append(item)
+                continue
+            if (
+                use_custom_durable_val_lr
+                and name.startswith("durable_")
+                and not name.startswith("durable_deck_synergy_")
+            ):
+                durable_val.append(item)
                 continue
             is_local = name.startswith(local_tokens) and not name.startswith("durable_deck_synergy_")
             (local if is_local else shared).append(item)
@@ -718,6 +740,13 @@ class MacroCreditLearner:
                 {
                     "params": local_combat_val,
                     "lr": self.config.learning_rate * self.config.local_combat_value_lr_scale,
+                }
+            )
+        if durable_val:
+            groups.append(
+                {
+                    "params": durable_val,
+                    "lr": self.config.learning_rate * self.config.durable_value_lr_scale,
                 }
             )
         if local:
@@ -4953,6 +4982,8 @@ class MacroCreditLearner:
                         "state_value_head",
                         "state_revival_",
                         "local_combat_value_head",
+                        "local_combat_value_vitals_",
+                        "durable_active_",
                         "durable_cycle_",
                         "durable_deck_",
                         "durable_hp_",
