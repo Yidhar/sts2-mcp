@@ -21,6 +21,7 @@ from torch import Tensor, nn
 
 from .grounded_candidate import (
     COMBAT_DOMAIN_ID,
+    MACRO_ECONOMIC_SURFACE_REST,
     GroundedCandidateBatch,
     GroundedCandidateConfig,
     WorldEncoding,
@@ -41,6 +42,7 @@ HYBRID_ACTOR_CRITIC_V2_MODEL_VERSION: Final = "sts2-hybrid-domain-actor-critic-v
 DECK_ZONE_ID: Final = 2
 HAND_ZONE_ID: Final = 3
 SHOP_ZONE_ID: Final = 9
+REST_SITE_ZONE_ID: Final = 11
 PLAYER_ZONE_ID: Final = 13
 ENEMY_ZONE_ID: Final = 14
 INTENT_ZONE_ID: Final = 19
@@ -50,11 +52,18 @@ COMBAT_ZONE_ID: Final = 23
 SHOP_SUB_ZONE_ID: Final = 28
 NUMERIC_FACT_SLOT_START: Final = 6
 NUMERIC_FACT_SLOT_END: Final = 166
+CARD_CURRENT_UPGRADE_LEVEL_SLOT: Final = 37
 DECK_FLOOR_ADDED_SLOT: Final = 52
+CANDIDATE_HEAL_AMOUNT_SLOT: Final = 59
+CARD_IS_UPGRADED_SLOT: Final = 102
 DECK_QUANTITY_SLOT: Final = 131
+CARD_UPGRADE_LEVEL_SLOT: Final = 158
+CARD_UPGRADED_SLOT: Final = 159
+CARD_UPGRADES_SLOT: Final = 160
 DECK_REFERENCE_SIZE: Final = 12.0
 DURABLE_DECK_SIZE_DIM: Final = 4
 DURABLE_DECK_SUMMARY_DIM: Final = 4
+DURABLE_CARD_ID_EMB_DIM: Final = 64
 PLAYER_BLOCK_OFFSET: Final = 15 - NUMERIC_FACT_SLOT_START
 PLAYER_CURRENT_HP_OFFSET: Final = 34 - NUMERIC_FACT_SLOT_START
 INTENT_DAMAGE_OFFSET: Final = 38 - NUMERIC_FACT_SLOT_START
@@ -143,6 +152,8 @@ class HybridActorCriticConfig:
     enable_local_combat_value_head: bool = False
     enable_direct_combat_vitals_context: bool = False
     enable_active_durable_vitals_gates: bool = False
+    enable_marginal_card_id_durable_value: bool = False
+    suppress_full_hp_campfire_heal: bool = False
 
     def __post_init__(self) -> None:
         HybridCandidateQConfig(
@@ -170,6 +181,8 @@ class HybridActorCriticConfig:
             "enable_local_combat_value_head",
             "enable_direct_combat_vitals_context",
             "enable_active_durable_vitals_gates",
+            "enable_marginal_card_id_durable_value",
+            "suppress_full_hp_campfire_heal",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"hybrid actor-critic {name} must be boolean")
@@ -229,6 +242,13 @@ class HybridActorCriticConfig:
             raise ValueError(
                 "enable_active_durable_vitals_gates requires enable_monotone_deconfounded_durable_value=True"
             )
+        if (
+            self.enable_marginal_card_id_durable_value
+            and not self.enable_draw_weighted_durable_value
+        ):
+            raise ValueError(
+                "enable_marginal_card_id_durable_value requires enable_draw_weighted_durable_value=True"
+            )
 
     @property
     def has_v2_extensions(self) -> bool:
@@ -252,6 +272,8 @@ class HybridActorCriticConfig:
             or self.enable_local_combat_value_head
             or self.enable_direct_combat_vitals_context
             or self.enable_active_durable_vitals_gates
+            or self.enable_marginal_card_id_durable_value
+            or self.suppress_full_hp_campfire_heal
         )
 
     @classmethod
@@ -576,6 +598,12 @@ class HybridActorCriticConfig:
                 enable_active_durable_vitals_gates=bool(
                     mapping.get("enable_active_durable_vitals_gates", False)
                 ),
+                enable_marginal_card_id_durable_value=bool(
+                    mapping.get("enable_marginal_card_id_durable_value", False)
+                ),
+                suppress_full_hp_campfire_heal=bool(
+                    mapping.get("suppress_full_hp_campfire_heal", False)
+                ),
             )
         raise ValueError(f"unsupported hybrid actor-critic model_config version: {version!r}")
 
@@ -681,6 +709,18 @@ class HybridActorCriticConfig:
                 base.update(
                     enable_active_durable_vitals_gates=(
                         self.enable_active_durable_vitals_gates
+                    ),
+                )
+            if self.enable_marginal_card_id_durable_value:
+                base.update(
+                    enable_marginal_card_id_durable_value=(
+                        self.enable_marginal_card_id_durable_value
+                    ),
+                )
+            if self.suppress_full_hp_campfire_heal:
+                base.update(
+                    suppress_full_hp_campfire_heal=(
+                        self.suppress_full_hp_campfire_heal
                     ),
                 )
         return base
@@ -814,6 +854,9 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         self.actor_critic_config = actor_critic
         self._detach_value_heads_from_trunk: bool = False
         self._detach_macro_branch_prior_lse: bool = False
+        self._suppress_full_hp_campfire_heal: bool = bool(
+            actor_critic.suppress_full_hp_campfire_heal
+        )
         del self.candidate_q_head
         cfg = actor_critic.grounded
         player_owner_digest = hashlib.sha256(b"owner\0player").digest()
@@ -823,6 +866,10 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         mapping_item_digest = hashlib.sha256(b"type\0mapping:item").digest()
         self._mapping_item_type_id = 2 + int.from_bytes(mapping_item_digest[:8], "big") % (
             cfg.type_vocab_size - 2
+        )
+        rest_heal_role_digest = hashlib.sha256(b"role\0rest_site:rest").digest()
+        self._rest_heal_role_id = 2 + int.from_bytes(rest_heal_role_digest[:8], "big") % (
+            cfg.role_vocab_size - 2
         )
         control_input = cfg.d_model * 2 + cfg.recurrent_hidden_dim
         self.candidate_policy_head = nn.Sequential(
@@ -1174,6 +1221,42 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 self.durable_deck_out = nn.Linear(cfg.ffn_dim * 3, 1)
                 nn.init.zeros_(self.durable_deck_out.weight)
                 nn.init.zeros_(self.durable_deck_out.bias)
+                if actor_critic.enable_marginal_card_id_durable_value:
+                    marg_mid = max(32, cfg.ffn_dim // 2)
+                    marg_in_dim = DURABLE_CARD_ID_EMB_DIM + cfg.ffn_dim * 2
+                    self.durable_deck_card_id_emb = nn.Embedding(
+                        cfg.entity_vocab_size * 2,
+                        DURABLE_CARD_ID_EMB_DIM,
+                        padding_idx=0,
+                    )
+                    gen_h1 = torch.Generator(device="cpu")
+                    gen_h1.manual_seed(20261121)
+                    with torch.no_grad():
+                        self.durable_deck_card_id_emb.weight.copy_(
+                            torch.randn(
+                                self.durable_deck_card_id_emb.weight.shape,
+                                generator=gen_h1,
+                                dtype=torch.float32,
+                            )
+                            * 0.10
+                        )
+                        self.durable_deck_card_id_emb.weight[0].zero_()
+                    self.durable_deck_marginal_id_linear = nn.Linear(
+                        DURABLE_CARD_ID_EMB_DIM, 1, bias=False
+                    )
+                    nn.init.zeros_(self.durable_deck_marginal_id_linear.weight)
+                    marg_fc1 = nn.Linear(marg_in_dim, marg_mid)
+                    nn.init.normal_(marg_fc1.weight, mean=0.0, std=0.08)
+                    nn.init.zeros_(marg_fc1.bias)
+                    marg_fc_out = nn.Linear(marg_mid, 1)
+                    nn.init.zeros_(marg_fc_out.weight)
+                    nn.init.zeros_(marg_fc_out.bias)
+                    self.durable_deck_marginal_mlp = nn.Sequential(
+                        nn.LayerNorm(marg_in_dim),
+                        marg_fc1,
+                        nn.SiLU(),
+                        marg_fc_out,
+                    )
                 if actor_critic.enable_expressive_synergy_backbone:
                     synergy_heads = (
                         cfg.n_heads if cfg.ffn_dim % cfg.n_heads == 0 else 1
@@ -1333,6 +1416,42 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                     self.durable_twin_deck_out = nn.Linear(cfg.ffn_dim * 3, 1)
                     nn.init.zeros_(self.durable_twin_deck_out.weight)
                     nn.init.zeros_(self.durable_twin_deck_out.bias)
+                    if actor_critic.enable_marginal_card_id_durable_value:
+                        t_marg_mid = max(32, cfg.ffn_dim // 2)
+                        t_marg_in_dim = DURABLE_CARD_ID_EMB_DIM + cfg.ffn_dim * 2
+                        self.durable_twin_deck_card_id_emb = nn.Embedding(
+                            cfg.entity_vocab_size * 2,
+                            DURABLE_CARD_ID_EMB_DIM,
+                            padding_idx=0,
+                        )
+                        gen_h2 = torch.Generator(device="cpu")
+                        gen_h2.manual_seed(20261122)
+                        with torch.no_grad():
+                            self.durable_twin_deck_card_id_emb.weight.copy_(
+                                torch.randn(
+                                    self.durable_twin_deck_card_id_emb.weight.shape,
+                                    generator=gen_h2,
+                                    dtype=torch.float32,
+                                )
+                                * 0.10
+                            )
+                            self.durable_twin_deck_card_id_emb.weight[0].zero_()
+                        self.durable_twin_deck_marginal_id_linear = nn.Linear(
+                            DURABLE_CARD_ID_EMB_DIM, 1, bias=False
+                        )
+                        nn.init.zeros_(self.durable_twin_deck_marginal_id_linear.weight)
+                        t_marg_fc1 = nn.Linear(t_marg_in_dim, t_marg_mid)
+                        nn.init.normal_(t_marg_fc1.weight, mean=0.0, std=0.08)
+                        nn.init.zeros_(t_marg_fc1.bias)
+                        t_marg_fc_out = nn.Linear(t_marg_mid, 1)
+                        nn.init.zeros_(t_marg_fc_out.weight)
+                        nn.init.zeros_(t_marg_fc_out.bias)
+                        self.durable_twin_deck_marginal_mlp = nn.Sequential(
+                            nn.LayerNorm(t_marg_in_dim),
+                            t_marg_fc1,
+                            nn.SiLU(),
+                            t_marg_fc_out,
+                        )
                     if actor_critic.enable_monotone_deconfounded_durable_value:
                         self.durable_twin_deck_tilted_out = nn.Linear(
                             cfg.ffn_dim * 3,
@@ -2474,6 +2593,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         card_repr: Tensor | None = None,
         card_raw_feats: Tensor | None = None,
         deck_card_mask: Tensor | None = None,
+        card_upg_ids: Tensor | None = None,
         draw_prob: Tensor | None = None,
         deck_size: Tensor | None = None,
         has_deck: Tensor | None = None,
@@ -2511,6 +2631,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 card_repr=None if card_repr is None else card_repr.float(),
                 card_raw_feats=None if card_raw_feats is None else card_raw_feats.float(),
                 deck_card_mask=deck_card_mask,
+                card_upg_ids=card_upg_ids,
                 draw_prob=None if draw_prob is None else draw_prob.float(),
                 deck_size=None if deck_size is None else deck_size.float(),
                 has_deck=has_deck,
@@ -2532,6 +2653,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         card_repr: Tensor | None = None,
         card_raw_feats: Tensor | None = None,
         deck_card_mask: Tensor | None = None,
+        card_upg_ids: Tensor | None = None,
         draw_prob: Tensor | None = None,
         deck_size: Tensor | None = None,
         has_deck: Tensor | None = None,
@@ -2672,6 +2794,51 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             ).to(dtype=out.dtype)
             card_utilities = d_out(bilinear_card).squeeze(-1)
             expected_card_utility = torch.einsum("bw,bw->b", draw_prob, card_utilities)
+            marginal_deck_sum: Tensor | None = None
+            if ac.enable_marginal_card_id_durable_value and card_upg_ids is not None:
+                d_card_id_emb = (
+                    self.durable_twin_deck_card_id_emb
+                    if use_twin
+                    else self.durable_deck_card_id_emb
+                )
+                d_marg_id_lin = (
+                    self.durable_twin_deck_marginal_id_linear
+                    if use_twin
+                    else self.durable_deck_marginal_id_linear
+                )
+                d_marg_mlp = (
+                    self.durable_twin_deck_marginal_mlp
+                    if use_twin
+                    else self.durable_deck_marginal_mlp
+                )
+                marg_card_mask = (
+                    deck_card_mask
+                    if deck_card_mask is not None
+                    else (draw_prob > 0.0)
+                )
+                safe_n_marg = deck_size.clamp_min(1.0)
+                card_count_w = torch.where(
+                    marg_card_mask,
+                    (draw_prob * safe_n_marg.unsqueeze(1)).to(dtype=out.dtype),
+                    torch.zeros_like(draw_prob, dtype=out.dtype),
+                )
+                bounded_upg_ids = card_upg_ids.long().clamp(
+                    0, d_card_id_emb.num_embeddings - 1
+                )
+                id_emb = d_card_id_emb(bounded_upg_ids).to(dtype=card_hidden.dtype)
+                if head_drop is not None:
+                    id_emb = head_drop(id_emb)
+                marg_in = torch.cat([id_emb, card_hidden, raw_hidden], dim=-1)
+                marg_raw = (d_marg_id_lin(id_emb) + d_marg_mlp(marg_in)).squeeze(-1)
+                marginal_card_delta = 0.30 * torch.tanh(marg_raw / 0.30)
+                marginal_deck_sum = (
+                    torch.einsum(
+                        "bw,bw->b",
+                        card_count_w,
+                        marginal_card_delta.to(dtype=out.dtype),
+                    )
+                    * has_deck.to(dtype=out.dtype)
+                )
             if ac.enable_monotone_deconfounded_durable_value:
                 d_tilted = (
                     self.durable_twin_deck_tilted_out if use_twin else self.durable_deck_tilted_out
@@ -2766,9 +2933,13 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                         w_cycle = w_cycle + nn.functional.softplus(eff_act_cyc)
                     v_cycle = -(w_cycle * bloat_basis).sum(dim=-1)
                     deck_utility = deck_utility + v_cycle
+                if marginal_deck_sum is not None:
+                    deck_utility = deck_utility + marginal_deck_sum
                 out = out + deck_utility
             elif ac.enable_deconfounded_durable_value:
-                out = out + expected_card_utility
+                out = out + expected_card_utility + (
+                    marginal_deck_sum if marginal_deck_sum is not None else 0.0
+                )
             else:
                 has_deck_f = has_deck.to(dtype=out.dtype)
                 safe_n = deck_size.clamp_min(1.0)
@@ -2793,7 +2964,12 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                     self.durable_deck_size_head(deck_size_in).squeeze(-1)
                     + self.durable_deck_size_linear(deck_size_vec).squeeze(-1)
                 ) * has_deck_f
-                out = out + expected_card_utility + deck_size_delta
+                out = (
+                    out
+                    + expected_card_utility
+                    + deck_size_delta
+                    + (marginal_deck_sum if marginal_deck_sum is not None else 0.0)
+                )
 
         if ac.enable_monotone_deconfounded_durable_value:
             if monotone_parts is not None and stage_in is not None:
@@ -3003,6 +3179,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             card_repr: Tensor | None = None
             card_raw_feats: Tensor | None = None
             deck_card_mask: Tensor | None = None
+            card_upg_ids: Tensor | None = None
             draw_prob: Tensor | None = None
             deck_size: Tensor | None = None
             has_deck: Tensor | None = None
@@ -3016,6 +3193,28 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 draw_prob = prep.draw_prob
                 deck_size = prep.deck_size
                 has_deck = prep.has_deck
+                if self.actor_critic_config.enable_marginal_card_id_durable_value:
+                    f_w = pers_world.features
+                    f_dim = int(f_w.shape[-1])
+                    is_upg = torch.zeros_like(deck_card_mask, dtype=torch.bool)
+                    if f_dim > CARD_IS_UPGRADED_SLOT:
+                        is_upg = is_upg | (f_w[:, :, CARD_IS_UPGRADED_SLOT] > 0.5)
+                    if f_dim > CARD_UPGRADED_SLOT:
+                        is_upg = is_upg | (f_w[:, :, CARD_UPGRADED_SLOT] > 0.5)
+                    if f_dim > CARD_UPGRADE_LEVEL_SLOT:
+                        is_upg = is_upg | (f_w[:, :, CARD_UPGRADE_LEVEL_SLOT] > 1e-4)
+                    if f_dim > CARD_CURRENT_UPGRADE_LEVEL_SLOT:
+                        is_upg = is_upg | (f_w[:, :, CARD_CURRENT_UPGRADE_LEVEL_SLOT] > 1e-4)
+                    if f_dim > CARD_UPGRADES_SLOT:
+                        is_upg = is_upg | (f_w[:, :, CARD_UPGRADES_SLOT] > 1e-4)
+                    bounded_eids = pers_world.entity_ids.long().clamp(
+                        0, self.config.entity_vocab_size - 1
+                    )
+                    card_upg_ids = torch.where(
+                        deck_card_mask,
+                        bounded_eids * 2 + is_upg.long(),
+                        torch.zeros_like(bounded_eids),
+                    )
                 pers_enc, raw_world_tokens = self._encode_world_with_weights(
                     pers_world,
                     zero_domains,
@@ -3061,6 +3260,8 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                         card_idx.unsqueeze(-1).expand(-1, -1, int(card_raw_feats.shape[-1])),
                     )
                     deck_card_mask = deck_card_mask.gather(1, card_idx)
+                    if card_upg_ids is not None:
+                        card_upg_ids = card_upg_ids.gather(1, card_idx)
                     draw_prob = draw_prob.gather(1, card_idx)
             else:
                 pers_world = self._mask_world_to_persistent(world)
@@ -3158,6 +3359,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             card_repr=card_repr,
             card_raw_feats=card_raw_feats,
             deck_card_mask=deck_card_mask,
+            card_upg_ids=card_upg_ids,
             draw_prob=draw_prob,
             deck_size=deck_size,
             has_deck=has_deck,
@@ -3178,6 +3380,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             card_repr=card_repr,
             card_raw_feats=card_raw_feats,
             deck_card_mask=deck_card_mask,
+            card_upg_ids=card_upg_ids,
             draw_prob=draw_prob,
             deck_size=deck_size,
             has_deck=has_deck,
@@ -3565,6 +3768,66 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             combat_vitals,
         )
 
+    def _apply_full_hp_campfire_heal_suppression(
+        self,
+        *,
+        policy_logits: Tensor,
+        batch: GroundedCandidateBatch,
+        action_mask: Tensor,
+    ) -> Tensor:
+        """Suppress zero-gain Campfire HEAL (`rest`) when `hp >= max_hp - 1` and another legal action exists."""
+        world_valid = batch.world.mask.bool()
+        is_rest_surface = (~batch.domain_ids.eq(COMBAT_DOMAIN_ID)) & (
+            batch.macro_economic_surface_ids.eq(MACRO_ECONOMIC_SURFACE_REST)
+            | (batch.world.zone_ids.eq(REST_SITE_ZONE_ID) & world_valid).any(dim=1)
+        )
+        if not bool(is_rest_surface.any().item()):
+            return policy_logits
+
+        w_feats = batch.world.features
+        f_dim = int(w_feats.shape[-1])
+        hp_slot = NUMERIC_FACT_SLOT_START + PLAYER_HP_OFFSET
+        cur_hp_slot = NUMERIC_FACT_SLOT_START + PLAYER_CURRENT_HP_OFFSET
+        max_hp_slot = NUMERIC_FACT_SLOT_START + PLAYER_MAX_HP_OFFSET
+        if f_dim <= max(hp_slot, cur_hp_slot, max_hp_slot):
+            return policy_logits
+
+        player_mask = batch.world.zone_ids.eq(PLAYER_ZONE_ID) & world_valid
+        zeros_bw = torch.zeros_like(w_feats[:, :, 0])
+        hp_log = torch.where(
+            player_mask,
+            torch.maximum(w_feats[:, :, hp_slot], w_feats[:, :, cur_hp_slot]),
+            zeros_bw,
+        ).amax(dim=1)
+        max_hp_log = torch.where(
+            player_mask,
+            w_feats[:, :, max_hp_slot],
+            zeros_bw,
+        ).amax(dim=1)
+        hp_val = torch.expm1((10.0 * hp_log.float()).clamp(0.0, 8.0))
+        max_hp_val = torch.expm1((10.0 * max_hp_log.float()).clamp(0.0, 8.0))
+        is_full_hp = (max_hp_val >= 2.0) & (hp_val >= (max_hp_val - 1.25))
+        if not bool((is_rest_surface & is_full_hp).any().item()):
+            return policy_logits
+
+        is_heal_cand = batch.candidates.role_ids.eq(self._rest_heal_role_id)
+        loc_feats = batch.candidates.local_features
+        if int(loc_feats.shape[-1]) > CANDIDATE_HEAL_AMOUNT_SLOT:
+            loc_heal = torch.where(
+                batch.candidates.local_mask.bool(),
+                loc_feats[:, :, :, CANDIDATE_HEAL_AMOUNT_SLOT],
+                torch.zeros_like(loc_feats[:, :, :, 0]),
+            ).amax(dim=-1)
+            is_heal_cand = is_heal_cand | (loc_heal > 1e-4)
+        is_heal_cand = action_mask & is_heal_cand
+        has_other_legal = (action_mask & (~is_heal_cand)).any(dim=1)
+        suppress_mask = (
+            (is_rest_surface & is_full_hp & has_other_legal).unsqueeze(1) & is_heal_cand
+        )
+        if not bool(suppress_mask.any().item()):
+            return policy_logits
+        return torch.where(suppress_mask, policy_logits - 25.0, policy_logits)
+
     def forward(  # type: ignore[override]
         self,
         batch: GroundedCandidateBatch,
@@ -3689,6 +3952,15 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 )
             else:
                 policy_logits = raw_logits.masked_fill(~base.action_mask, 0.0)
+            if (
+                self.actor_critic_config.suppress_full_hp_campfire_heal
+                or bool(getattr(self, "_suppress_full_hp_campfire_heal", False))
+            ):
+                policy_logits = self._apply_full_hp_campfire_heal_suppression(
+                    policy_logits=policy_logits,
+                    batch=batch,
+                    action_mask=base.action_mask,
+                )
             detach_val = bool(getattr(self, "_detach_value_heads_from_trunk", False))
             val_joint = joint_state_f.detach() if detach_val else joint_state_f
             val_rec = rec_state_f.detach() if detach_val else rec_state_f

@@ -954,7 +954,9 @@ def sync_once(
                         )
                     ),
                     "version": (
-                        "sts2-durable-afterstate-v8.2-locked-combat-fast96-b0"
+                        "sts2-durable-afterstate-v8.3-marginal-hybrid-b0"
+                        if ("v8-3" in lineage or "v8.3" in lineage)
+                        else "sts2-durable-afterstate-v8.2-locked-combat-fast96-b0"
                         if ("v8-2" in lineage or "v8.2" in lineage)
                         else "sts2-durable-afterstate-v8.1-twin-crn-b0"
                         if ("v8-1" in lineage or "v8.1" in lineage)

@@ -303,6 +303,12 @@ def _actor_critic_config(config: MacroTrainingConfig) -> HybridActorCriticConfig
             enable_active_durable_vitals_gates=(
                 config.learner.enable_active_durable_vitals_gates
             ),
+            enable_marginal_card_id_durable_value=(
+                config.learner.enable_marginal_card_id_durable_value
+            ),
+            suppress_full_hp_campfire_heal=(
+                config.learner.suppress_full_hp_campfire_heal
+            ),
         )
     return HybridActorCriticConfig(
         grounded,

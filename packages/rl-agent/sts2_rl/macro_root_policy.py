@@ -177,6 +177,8 @@ class FrozenMacroRootPolicy:
                 "enable_build_conditioned_durable_value",
                 "enable_twin_durable_value_heads",
                 "enable_local_combat_value_head",
+                "enable_marginal_card_id_durable_value",
+                "suppress_full_hp_campfire_heal",
             ):
                 if getattr(parsed_macro_source_cfg, flag_name) and not getattr(model_config, flag_name):
                     raise ValueError(
