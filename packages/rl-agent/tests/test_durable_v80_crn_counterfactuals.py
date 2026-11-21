@@ -960,3 +960,151 @@ def test_v30_v81_config_and_act_b0_crn_96_seed_gate_scaling() -> None:
         )
         == 20
     )
+
+
+def test_crn_pairwise_keeps_dropout_disabled_on_identical_worlds() -> None:
+    tiny, ac_cfg = _tiny_v80_config()
+    torch.manual_seed(820)
+    model = HybridDomainActorCriticModel(ac_cfg)
+    model.eval()
+    # Exaggerate Twin dropout rate so any accidental .train(True) immediately produces large mask noise!
+    model.durable_twin_head1_dropout.p = 0.50
+    model.durable_twin_dropout.p = 0.50
+    encoder = GroundedObservationEncoder(tiny.to_encoding_config())
+
+    rew_obs, rew_legal = _make_card_reward_surface(floor=4)
+    post_worlds = _encode_reward_afterstate_worlds(encoder, rew_obs, rew_legal)
+    identical_worlds = (post_worlds[0],) * 4
+
+    base_traj = _build_crn_trajectory(
+        model,
+        encoder,
+        seed=13_600_000,
+        teacher_version=0,
+        crn_indices=(0, 1, 2, 3),
+        crn_returns=(1.0, 1.0, 1.0, 1.0),
+    )
+    ident_node = MacroAfterstateNode(
+        step_index=1,
+        surface="reward",
+        candidate_branches=("take", "take", "take", "skip"),
+        post_worlds=identical_worlds,
+        crn_candidate_indices=(0, 1, 2, 3),
+        crn_candidate_returns=(1.0, 1.0, 1.0, 1.0),
+    )
+    traj = replace(base_traj, afterstate_nodes=(ident_node,))
+    cfg = MacroCreditLearnerConfig(
+        target_mode="durable_afterstate_v2",
+        domain_layers=1,
+        joint_layers=1,
+        enable_direct_vitals_context=True,
+        enable_direct_combat_vitals_context=True,
+        enable_active_durable_vitals_gates=True,
+        enable_macro_branch_prior=True,
+        enable_persistent_only_durable_value=True,
+        enable_asymmetric_revival_critic=True,
+        enable_draw_weighted_durable_value=True,
+        enable_role_conditioned_candidate_policy=True,
+        enable_deconfounded_durable_value=True,
+        enable_monotone_deconfounded_durable_value=True,
+        enable_balanced_deconfounded_durable_value=True,
+        enable_expressive_synergy_backbone=True,
+        enable_debloated_synergy_durable_value=True,
+        enable_build_conditioned_durable_value=True,
+        enable_twin_durable_value_heads=True,
+        enable_hierarchical_afterstate_mpo=True,
+        crn_pairwise_value_weight=1.0,
+        macro_value_weight=0.0,
+        durable_post_value_weight=0.0,
+        durable_stage_baseline_weight=0.0,
+        combat_policy_weight=0.0,
+        combat_value_weight=0.0,
+        revival_budget=0,
+    )
+    learner = MacroCreditLearner(model=model, config=cfg)
+    m = learner.learn(MacroCreditCohort("v82-no-het-dropout", 0, (), natural_only=(traj,)))
+    # Identical post-worlds with equal returns MUST have exact 0 centered delta-V loss!
+    assert m["crn_pairwise_value_loss"] < 1e-12
+
+
+def test_v31_v82_locked_combat_and_fast96_config() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    cfg = load_macro_training_config(
+        repo_root
+        / "config/experiments/hybrid_macro_credit_v31_durable_afterstate_v82_locked_combat_fast96_b0_act1_g4.toml"
+    )
+    assert cfg.course.roots_per_cohort == 96
+    assert cfg.course.parallel_collectors == 48
+    assert cfg.course.crn_roots_per_episode == 0
+    assert cfg.learner.ppo_minibatches_per_cohort == 1
+    assert cfg.learner.combat_policy_weight == 0.0
+    assert cfg.learner.combat_value_weight == 0.0
+    assert cfg.learner.combat_entropy_weight == 0.0
+    assert cfg.learner.kickstart_kl_floor == 0.015
+    assert cfg.learner.kickstart_combat_kl_scale == 6.0
+    assert cfg.learner.macro_pg_fallback_scale == 0.0
+    assert cfg.learner.target_macro_step_kl == 0.008
+
+    # Prove locked combat + active teacher combat KL anchor keeps distill_combat_kl near 0 across Macro updates!
+    tiny, ac_cfg = _tiny_v80_config()
+    torch.manual_seed(822)
+    student = HybridDomainActorCriticModel(ac_cfg)
+    teacher = copy.deepcopy(student)
+    student.eval()
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    encoder = GroundedObservationEncoder(tiny.to_encoding_config())
+
+    l_cfg = MacroCreditLearnerConfig(
+        target_mode="durable_afterstate_v2",
+        domain_layers=1,
+        joint_layers=1,
+        enable_direct_vitals_context=True,
+        enable_direct_combat_vitals_context=True,
+        enable_active_durable_vitals_gates=True,
+        enable_macro_branch_prior=True,
+        enable_persistent_only_durable_value=True,
+        enable_asymmetric_revival_critic=True,
+        enable_draw_weighted_durable_value=True,
+        enable_role_conditioned_candidate_policy=True,
+        enable_deconfounded_durable_value=True,
+        enable_monotone_deconfounded_durable_value=True,
+        enable_balanced_deconfounded_durable_value=True,
+        enable_expressive_synergy_backbone=True,
+        enable_debloated_synergy_durable_value=True,
+        enable_build_conditioned_durable_value=True,
+        enable_twin_durable_value_heads=True,
+        enable_hierarchical_afterstate_mpo=True,
+        durable_warmup_updates=0,
+        combat_actor_warmup_updates=0,
+        macro_actor_warmup_updates=0,
+        macro_pg_fallback_scale=0.0,
+        macro_entropy_weight=0.0,
+        combat_policy_weight=0.0,
+        combat_value_weight=0.0,
+        combat_entropy_weight=0.0,
+        kickstart_kl_weight=0.020,
+        kickstart_kl_floor=0.015,
+        kickstart_combat_kl_scale=6.0,
+        ppo_minibatches_per_cohort=1,
+        revival_budget=0,
+        learning_rate=1e-3,
+    )
+    learner = MacroCreditLearner(model=student, config=l_cfg, teacher_model=teacher)
+    last_m: dict[str, Any] = {}
+    for step_u in range(5):
+        trajs = tuple(
+            _build_crn_trajectory(
+                student,
+                encoder,
+                seed=13_700_000 + 20 * step_u + 2 * i,
+                teacher_version=learner.update,
+                crn_indices=None,
+                crn_returns=None,
+            )
+            for i in range(2)
+        )
+        last_m = learner.learn(MacroCreditCohort(f"v82-u{step_u}", learner.update, (), natural_only=trajs))
+    assert last_m["distill_combat_kl"] < 0.002
+    assert last_m["mean_updated_combat_policy_kl"] < 0.002

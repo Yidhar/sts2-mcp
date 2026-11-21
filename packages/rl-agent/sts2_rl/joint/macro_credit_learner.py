@@ -3267,99 +3267,92 @@ class MacroCreditLearner:
         max_worlds_per_group = 64 if self._has_high_vram() else 32
         loss_total = torch.zeros((), device=self.device, dtype=torch.float64)
         n_nodes = len(sorted_entries)
-        if has_twin:
-            ac_model._twin_dropout_active = True
-            ac_model.durable_twin_head1_dropout.train(True)
-            ac_model.durable_twin_dropout.train(True)
-        try:
-            n_idx = 0
-            while n_idx < n_nodes:
-                self._check_resource()
-                group_end = n_idx
-                group_worlds = 0
-                while group_end < n_nodes:
-                    w_cnt = len(sorted_entries[group_end][2])
-                    if group_end > n_idx and group_worlds + w_cnt > max_worlds_per_group:
-                        break
-                    group_worlds += w_cnt
-                    group_end += 1
-                sub_nodes = sorted_entries[n_idx:group_end]
-                n_idx = group_end
+        # Keep Twin dropout DISABLED (.eval()) during centered within-root delta-V regression:
+        # independent per-row dropout masks across candidate post-worlds of the same root inject
+        # +-0.15 mask noise directly into (v_n - v_n.mean()) and inflate Twin disagreement.
+        n_idx = 0
+        while n_idx < n_nodes:
+            self._check_resource()
+            group_end = n_idx
+            group_worlds = 0
+            while group_end < n_nodes:
+                w_cnt = len(sorted_entries[group_end][2])
+                if group_end > n_idx and group_worlds + w_cnt > max_worlds_per_group:
+                    break
+                group_worlds += w_cnt
+                group_end += 1
+            sub_nodes = sorted_entries[n_idx:group_end]
+            n_idx = group_end
 
-                flat_worlds: list[EncodedWorldSnapshot] = []
-                flat_hiddens: list[Tensor] = []
-                flat_revs: list[Tensor] = []
-                node_spans: list[tuple[int, int, int, Tensor]] = []
-                for _, ref_idx, w_tuple, r_centered, h_row, p_rev in sub_nodes:
-                    s_w = len(flat_worlds)
-                    w_cnt = len(w_tuple)
-                    flat_worlds.extend(w_tuple)
-                    if h_row is not None:
-                        flat_hiddens.extend([h_row] * w_cnt)
-                    if p_rev is not None:
-                        flat_revs.extend([p_rev] * w_cnt)
-                    node_spans.append((s_w, s_w + w_cnt, ref_idx, r_centered))
+            flat_worlds: list[EncodedWorldSnapshot] = []
+            flat_hiddens: list[Tensor] = []
+            flat_revs: list[Tensor] = []
+            node_spans: list[tuple[int, int, int, Tensor]] = []
+            for _, ref_idx, w_tuple, r_centered, h_row, p_rev in sub_nodes:
+                s_w = len(flat_worlds)
+                w_cnt = len(w_tuple)
+                flat_worlds.extend(w_tuple)
+                if h_row is not None:
+                    flat_hiddens.extend([h_row] * w_cnt)
+                if p_rev is not None:
+                    flat_revs.extend([p_rev] * w_cnt)
+                node_spans.append((s_w, s_w + w_cnt, ref_idx, r_centered))
 
-                wb, dom = collate_encoded_worlds(
-                    tuple(flat_worlds),
-                    expected_config=flat_worlds[0].config,
-                    expected_fingerprint=flat_worlds[0].encoding_fingerprint,
-                    device=self.device,
-                    validate=False,
-                )
-                stacked_h = torch.stack(flat_hiddens, dim=0) if flat_hiddens else None
-                stacked_r = torch.stack(flat_revs, dim=0) if flat_revs else None
-                if has_twin:
-                    with self._autocast_ctx():
-                        v1_all, v2_all, _ = ac_model.forward_durable_value_pair(
-                            wb,
-                            dom,
-                            stacked_h,
-                            critic_revival_context=stacked_r,
-                            validate=False,
-                        )
-                    if not bool((torch.isfinite(v1_all).all() & torch.isfinite(v2_all).all()).item()):
-                        raise FloatingPointError("CRN pairwise durable_value_pair forward is non-finite")
-                    node_losses = []
-                    for s_w, e_w, ref_idx, r_c in node_spans:
-                        v1_n = v1_all[s_w:e_w]
-                        v2_n = v2_all[s_w:e_w]
-                        l1 = F.smooth_l1_loss(v1_n - v1_n.mean(), r_c, beta=0.25)
-                        l2 = F.smooth_l1_loss(v2_n - v2_n.mean(), r_c, beta=0.25)
-                        if twin_ref_weights is not None:
-                            w1 = twin_ref_weights[0][ref_idx]
-                            w2 = twin_ref_weights[1][ref_idx]
-                            node_losses.append(0.5 * (w1 * l1 + w2 * l2))
-                        else:
-                            node_losses.append(0.5 * (l1 + l2))
-                else:
-                    with self._autocast_ctx():
-                        v_all, _ = ac_model.forward_durable_value(
-                            wb,
-                            dom,
-                            stacked_h,
-                            critic_revival_context=stacked_r,
-                            validate=False,
-                        )
-                    if not bool(torch.isfinite(v_all).all().item()):
-                        raise FloatingPointError("CRN pairwise durable_value forward is non-finite")
-                    node_losses = []
-                    for s_w, e_w, _, r_c in node_spans:
-                        v_n = v_all[s_w:e_w]
-                        node_losses.append(F.smooth_l1_loss(v_n - v_n.mean(), r_c, beta=0.25))
-
-                sub_loss = torch.stack(node_losses).sum() / denom_crn
-                loss_total = loss_total + sub_loss.detach().double()
-                scaled = 0.5 * cfg.crn_pairwise_value_weight * sub_loss
-                if not bool(torch.isfinite(scaled).item()):
-                    raise FloatingPointError("CRN pairwise durable loss is non-finite")
-                scaled.backward()  # type: ignore[no-untyped-call]
-                del scaled, sub_loss
-        finally:
+            wb, dom = collate_encoded_worlds(
+                tuple(flat_worlds),
+                expected_config=flat_worlds[0].config,
+                expected_fingerprint=flat_worlds[0].encoding_fingerprint,
+                device=self.device,
+                validate=False,
+            )
+            stacked_h = torch.stack(flat_hiddens, dim=0) if flat_hiddens else None
+            stacked_r = torch.stack(flat_revs, dim=0) if flat_revs else None
             if has_twin:
-                ac_model._twin_dropout_active = False
-                ac_model.durable_twin_head1_dropout.eval()
-                ac_model.durable_twin_dropout.eval()
+                with self._autocast_ctx():
+                    v1_all, v2_all, _ = ac_model.forward_durable_value_pair(
+                        wb,
+                        dom,
+                        stacked_h,
+                        critic_revival_context=stacked_r,
+                        validate=False,
+                    )
+                if not bool((torch.isfinite(v1_all).all() & torch.isfinite(v2_all).all()).item()):
+                    raise FloatingPointError("CRN pairwise durable_value_pair forward is non-finite")
+                node_losses = []
+                for s_w, e_w, ref_idx, r_c in node_spans:
+                    v1_n = v1_all[s_w:e_w]
+                    v2_n = v2_all[s_w:e_w]
+                    l1 = F.smooth_l1_loss(v1_n - v1_n.mean(), r_c, beta=0.25)
+                    l2 = F.smooth_l1_loss(v2_n - v2_n.mean(), r_c, beta=0.25)
+                    if twin_ref_weights is not None:
+                        w1 = twin_ref_weights[0][ref_idx]
+                        w2 = twin_ref_weights[1][ref_idx]
+                        node_losses.append(0.5 * (w1 * l1 + w2 * l2))
+                    else:
+                        node_losses.append(0.5 * (l1 + l2))
+            else:
+                with self._autocast_ctx():
+                    v_all, _ = ac_model.forward_durable_value(
+                        wb,
+                        dom,
+                        stacked_h,
+                        critic_revival_context=stacked_r,
+                        validate=False,
+                    )
+                if not bool(torch.isfinite(v_all).all().item()):
+                    raise FloatingPointError("CRN pairwise durable_value forward is non-finite")
+                node_losses = []
+                for s_w, e_w, _, r_c in node_spans:
+                    v_n = v_all[s_w:e_w]
+                    node_losses.append(F.smooth_l1_loss(v_n - v_n.mean(), r_c, beta=0.25))
+
+            sub_loss = torch.stack(node_losses).sum() / denom_crn
+            loss_total = loss_total + sub_loss.detach().double()
+            scaled = 0.5 * cfg.crn_pairwise_value_weight * sub_loss
+            if not bool(torch.isfinite(scaled).item()):
+                raise FloatingPointError("CRN pairwise durable loss is non-finite")
+            scaled.backward()  # type: ignore[no-untyped-call]
+            del scaled, sub_loss
         return float(loss_total.item())
 
     def _backward_stateless_distill_afterstates(
