@@ -280,6 +280,7 @@ class _CRNPrefixReplayAuthority(StochasticBranchAuthority):
         teacher_version: int,
         config: TrainingConfig,
         macro_branch_epsilon: float = 0.0,
+        greedy_post_root: bool = True,
     ) -> None:
         super().__init__(
             policy,
@@ -294,6 +295,7 @@ class _CRNPrefixReplayAuthority(StochasticBranchAuthority):
         self._prefix_selected_actions = prefix_selected_actions
         self._root_step_index = int(root_step_index)
         self._expected_root_candidates = int(expected_root_candidates)
+        self.greedy_post_root = bool(greedy_post_root)
         self.reached_root = False
 
     def _prepare_semantic_exploration(
@@ -357,6 +359,9 @@ class _CRNPrefixReplayAuthority(StochasticBranchAuthority):
             self.root_teacher_log_probs = self.last_teacher_log_probs
             self._behavior_log_probability = 0.0
             return self.forced_candidate
+        if self.greedy_post_root:
+            self._behavior_log_probability = 0.0
+            return greedy
         selected = min(int(np.searchsorted(np.cumsum(probabilities), draw, side="right")), len(candidates) - 1)
         self._behavior_log_probability = float(behavior_logs[selected].item())
         return selected
@@ -1233,29 +1238,26 @@ def collect_durable_afterstate_episode(
                     r_idx = target_node.step_index
                     ref_step = trajectory.steps[r_idx]
                     ref_action = int(ref_step.action_index)
+                    eff_max_b = (
+                        min(3, max(2, int(crn_max_branches_per_root)))
+                        if target_node.surface == "rest"
+                        else max(2, int(crn_max_branches_per_root))
+                    )
                     branch_indices = _select_crn_branch_indices(
                         target_node,
                         ref_action=ref_action,
                         teacher_log_probs=capture.afterstate_teacher_log_probs.get(r_idx),
-                        max_branches=max(2, int(crn_max_branches_per_root)),
+                        max_branches=eff_max_b,
                     )
                     if len(branch_indices) < 2:
                         continue
                     prefix_actions = tuple(int(st.action_index) for st in trajectory.steps[:r_idx])
                     expected_cands = int(ref_step.snapshot.candidate_count)
                     returns_by_idx: dict[int, float] = {}
-                    if ref_action in branch_indices:
-                        returns_by_idx[ref_action] = _trajectory_post_root_effective_return(
-                            trajectory,
-                            r_idx,
-                            zero_macro_pace_penalty=crn_zero_macro_pace_penalty,
-                            linear_hp_loss_weight=crn_linear_hp_loss_weight,
-                            hp_loss_reference=crn_hp_loss_reference,
-                        )
                     branch_ok = True
+                    # Evaluate EVERY selected candidate (including ref_action) with identical
+                    # deterministic greedy post-root continuation to eliminate Pass-0 stochastic asymmetry.
                     for alt_idx in branch_indices:
-                        if alt_idx == ref_action:
-                            continue
                         rem_branch = maximum_group_seconds - (time.monotonic() - started)
                         if rem_branch <= 5.0:
                             branch_ok = False
@@ -1271,7 +1273,8 @@ def collect_durable_afterstate_episode(
                             forced_candidate=int(alt_idx),
                             teacher_version=teacher_version,
                             config=config,
-                            macro_branch_epsilon=macro_branch_epsilon,
+                            macro_branch_epsilon=0.0,
+                            greedy_post_root=True,
                         )
                         crn_trace = _CRNReturnCaptureTrace(
                             root_step_index=r_idx,

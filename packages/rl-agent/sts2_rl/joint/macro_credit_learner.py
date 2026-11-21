@@ -169,6 +169,7 @@ class MacroCreditLearnerConfig:
     enable_direct_combat_vitals_context: bool = False
     enable_active_durable_vitals_gates: bool = False
     crn_only_macro_mpo: bool = False
+    use_direct_crn_mpo: bool = False
     crn_pairwise_value_weight: float = 0.0
     crn_mpo_return_scale: float = 1.0
 
@@ -186,6 +187,7 @@ class MacroCreditLearnerConfig:
             "enable_direct_combat_vitals_context",
             "enable_active_durable_vitals_gates",
             "crn_only_macro_mpo",
+            "use_direct_crn_mpo",
             "normalize_combat_advantages",
             "separate_value_grad_clip",
             "enable_direct_vitals_context",
@@ -731,7 +733,11 @@ class MacroCreditLearner:
             ):
                 local_combat_val.append(item)
                 continue
-            if use_custom_durable_val_lr and name.startswith("durable_"):
+            if (
+                use_custom_durable_val_lr
+                and name.startswith("durable_")
+                and not name.startswith("durable_deck_synergy_")
+            ):
                 durable_val.append(item)
                 continue
             is_local = name.startswith(local_tokens) and not name.startswith("durable_deck_synergy_")
@@ -1647,7 +1653,7 @@ class MacroCreditLearner:
             node.crn_candidate_returns is not None
             and node.crn_candidate_indices is not None
         )
-        if has_crn:
+        if has_crn and self.config.use_direct_crn_mpo:
             assert node.crn_candidate_returns is not None
             assert node.crn_candidate_indices is not None
             crn_indices = node.crn_candidate_indices
@@ -1699,11 +1705,12 @@ class MacroCreditLearner:
                 min_temperature=self.config.macro_mpo_min_temperature,
             )
 
-        node_macro_kl = 0.0 if self.config.crn_only_macro_mpo else effective_macro_kl
+        suppress_non_crn = self.config.crn_only_macro_mpo and not has_crn
+        node_macro_kl = 0.0 if suppress_non_crn else effective_macro_kl
         if self.config.enable_hierarchical_afterstate_mpo:
             effective_within_kl = (
                 0.0
-                if self.config.crn_only_macro_mpo
+                if suppress_non_crn
                 else (
                     self.config.macro_within_branch_kl
                     if self.update >= self._macro_actor_active_threshold()
@@ -2585,11 +2592,7 @@ class MacroCreditLearner:
                                     0.5 * cfg.durable_stage_baseline_weight * post_stage_loss
                                 )
                         if durable_actor_active and as_target.projection.actor_enabled:
-                            denom_m_pol = (
-                                max(1, denominators["crn_afterstate_steps"])
-                                if cfg.crn_only_macro_mpo
-                                else max(1, denominators["macro_policy_steps"])
-                            )
+                            denom_m_pol = max(1, denominators["macro_policy_steps"])
                             mpo_step_terms: list[Tensor] = []
                             if not torch.equal(
                                 as_target.projection.target_probabilities,
@@ -2627,11 +2630,7 @@ class MacroCreditLearner:
                                     terms.append(0.5 * cfg.macro_policy_weight * actor)
                     else:
                         if as_target is not None and durable_actor_active and as_target.projection.actor_enabled:
-                            denom_m_pol = (
-                                max(1, denominators["crn_afterstate_steps"])
-                                if cfg.crn_only_macro_mpo
-                                else max(1, denominators["macro_policy_steps"])
-                            )
+                            denom_m_pol = max(1, denominators["macro_policy_steps"])
                             cond_mpo_terms: list[Tensor] = []
                             if not torch.equal(
                                 as_target.projection.target_probabilities,
@@ -3198,6 +3197,7 @@ class MacroCreditLearner:
         prepared_items: Sequence[_PreparedReference],
         *,
         stateless_durable: bool,
+        twin_ref_weights: tuple[Tensor, Tensor] | None = None,
     ) -> float:
         """Supervise centered counterfactual delta-V(w_k) against centered CRN empirical returns."""
         cfg = self.config
@@ -3208,13 +3208,14 @@ class MacroCreditLearner:
         crn_entries: list[
             tuple[
                 int,
+                int,
                 tuple[EncodedWorldSnapshot, ...],
                 Tensor,
                 Tensor | None,
                 Tensor | None,
             ]
         ] = []
-        for item in prepared_items:
+        for ref_idx, item in enumerate(prepared_items):
             if item.afterstate_targets is None:
                 continue
             for step_idx, as_t in item.afterstate_targets.items():
@@ -3253,93 +3254,112 @@ class MacroCreditLearner:
                         device=self.device, dtype=self.dtype
                     )
                 )
-                crn_entries.append((max_w, tuple(worlds_list), r_centered, h_row, p_rev))
+                crn_entries.append((max_w, ref_idx, tuple(worlds_list), r_centered, h_row, p_rev))
         if not crn_entries:
             return 0.0
 
-        denom_crn = max(1, len(crn_entries))
+        denom_crn = (
+            max(16, len(crn_entries))
+            if len(prepared_items) >= 8
+            else max(1, len(crn_entries))
+        )
         sorted_entries = sorted(crn_entries, key=lambda row: row[0])
         max_worlds_per_group = 64 if self._has_high_vram() else 32
         loss_total = torch.zeros((), device=self.device, dtype=torch.float64)
         n_nodes = len(sorted_entries)
-        n_idx = 0
-        while n_idx < n_nodes:
-            self._check_resource()
-            group_end = n_idx
-            group_worlds = 0
-            while group_end < n_nodes:
-                w_cnt = len(sorted_entries[group_end][1])
-                if group_end > n_idx and group_worlds + w_cnt > max_worlds_per_group:
-                    break
-                group_worlds += w_cnt
-                group_end += 1
-            sub_nodes = sorted_entries[n_idx:group_end]
-            n_idx = group_end
+        if has_twin:
+            ac_model._twin_dropout_active = True
+            ac_model.durable_twin_head1_dropout.train(True)
+            ac_model.durable_twin_dropout.train(True)
+        try:
+            n_idx = 0
+            while n_idx < n_nodes:
+                self._check_resource()
+                group_end = n_idx
+                group_worlds = 0
+                while group_end < n_nodes:
+                    w_cnt = len(sorted_entries[group_end][2])
+                    if group_end > n_idx and group_worlds + w_cnt > max_worlds_per_group:
+                        break
+                    group_worlds += w_cnt
+                    group_end += 1
+                sub_nodes = sorted_entries[n_idx:group_end]
+                n_idx = group_end
 
-            flat_worlds: list[EncodedWorldSnapshot] = []
-            flat_hiddens: list[Tensor] = []
-            flat_revs: list[Tensor] = []
-            node_spans: list[tuple[int, int, Tensor]] = []
-            for _, w_tuple, r_centered, h_row, p_rev in sub_nodes:
-                s_w = len(flat_worlds)
-                w_cnt = len(w_tuple)
-                flat_worlds.extend(w_tuple)
-                if h_row is not None:
-                    flat_hiddens.extend([h_row] * w_cnt)
-                if p_rev is not None:
-                    flat_revs.extend([p_rev] * w_cnt)
-                node_spans.append((s_w, s_w + w_cnt, r_centered))
+                flat_worlds: list[EncodedWorldSnapshot] = []
+                flat_hiddens: list[Tensor] = []
+                flat_revs: list[Tensor] = []
+                node_spans: list[tuple[int, int, int, Tensor]] = []
+                for _, ref_idx, w_tuple, r_centered, h_row, p_rev in sub_nodes:
+                    s_w = len(flat_worlds)
+                    w_cnt = len(w_tuple)
+                    flat_worlds.extend(w_tuple)
+                    if h_row is not None:
+                        flat_hiddens.extend([h_row] * w_cnt)
+                    if p_rev is not None:
+                        flat_revs.extend([p_rev] * w_cnt)
+                    node_spans.append((s_w, s_w + w_cnt, ref_idx, r_centered))
 
-            wb, dom = collate_encoded_worlds(
-                tuple(flat_worlds),
-                expected_config=flat_worlds[0].config,
-                expected_fingerprint=flat_worlds[0].encoding_fingerprint,
-                device=self.device,
-                validate=False,
-            )
-            stacked_h = torch.stack(flat_hiddens, dim=0) if flat_hiddens else None
-            stacked_r = torch.stack(flat_revs, dim=0) if flat_revs else None
+                wb, dom = collate_encoded_worlds(
+                    tuple(flat_worlds),
+                    expected_config=flat_worlds[0].config,
+                    expected_fingerprint=flat_worlds[0].encoding_fingerprint,
+                    device=self.device,
+                    validate=False,
+                )
+                stacked_h = torch.stack(flat_hiddens, dim=0) if flat_hiddens else None
+                stacked_r = torch.stack(flat_revs, dim=0) if flat_revs else None
+                if has_twin:
+                    with self._autocast_ctx():
+                        v1_all, v2_all, _ = ac_model.forward_durable_value_pair(
+                            wb,
+                            dom,
+                            stacked_h,
+                            critic_revival_context=stacked_r,
+                            validate=False,
+                        )
+                    if not bool((torch.isfinite(v1_all).all() & torch.isfinite(v2_all).all()).item()):
+                        raise FloatingPointError("CRN pairwise durable_value_pair forward is non-finite")
+                    node_losses = []
+                    for s_w, e_w, ref_idx, r_c in node_spans:
+                        v1_n = v1_all[s_w:e_w]
+                        v2_n = v2_all[s_w:e_w]
+                        l1 = F.smooth_l1_loss(v1_n - v1_n.mean(), r_c, beta=0.25)
+                        l2 = F.smooth_l1_loss(v2_n - v2_n.mean(), r_c, beta=0.25)
+                        if twin_ref_weights is not None:
+                            w1 = twin_ref_weights[0][ref_idx]
+                            w2 = twin_ref_weights[1][ref_idx]
+                            node_losses.append(0.5 * (w1 * l1 + w2 * l2))
+                        else:
+                            node_losses.append(0.5 * (l1 + l2))
+                else:
+                    with self._autocast_ctx():
+                        v_all, _ = ac_model.forward_durable_value(
+                            wb,
+                            dom,
+                            stacked_h,
+                            critic_revival_context=stacked_r,
+                            validate=False,
+                        )
+                    if not bool(torch.isfinite(v_all).all().item()):
+                        raise FloatingPointError("CRN pairwise durable_value forward is non-finite")
+                    node_losses = []
+                    for s_w, e_w, _, r_c in node_spans:
+                        v_n = v_all[s_w:e_w]
+                        node_losses.append(F.smooth_l1_loss(v_n - v_n.mean(), r_c, beta=0.25))
+
+                sub_loss = torch.stack(node_losses).sum() / denom_crn
+                loss_total = loss_total + sub_loss.detach().double()
+                scaled = 0.5 * cfg.crn_pairwise_value_weight * sub_loss
+                if not bool(torch.isfinite(scaled).item()):
+                    raise FloatingPointError("CRN pairwise durable loss is non-finite")
+                scaled.backward()  # type: ignore[no-untyped-call]
+                del scaled, sub_loss
+        finally:
             if has_twin:
-                with self._autocast_ctx():
-                    v1_all, v2_all, _ = ac_model.forward_durable_value_pair(
-                        wb,
-                        dom,
-                        stacked_h,
-                        critic_revival_context=stacked_r,
-                        validate=False,
-                    )
-                if not bool((torch.isfinite(v1_all).all() & torch.isfinite(v2_all).all()).item()):
-                    raise FloatingPointError("CRN pairwise durable_value_pair forward is non-finite")
-                node_losses = []
-                for s_w, e_w, r_c in node_spans:
-                    v1_n = v1_all[s_w:e_w]
-                    v2_n = v2_all[s_w:e_w]
-                    l1 = F.smooth_l1_loss(v1_n - v1_n.mean(), r_c)
-                    l2 = F.smooth_l1_loss(v2_n - v2_n.mean(), r_c)
-                    node_losses.append(0.5 * (l1 + l2))
-            else:
-                with self._autocast_ctx():
-                    v_all, _ = ac_model.forward_durable_value(
-                        wb,
-                        dom,
-                        stacked_h,
-                        critic_revival_context=stacked_r,
-                        validate=False,
-                    )
-                if not bool(torch.isfinite(v_all).all().item()):
-                    raise FloatingPointError("CRN pairwise durable_value forward is non-finite")
-                node_losses = []
-                for s_w, e_w, r_c in node_spans:
-                    v_n = v_all[s_w:e_w]
-                    node_losses.append(F.smooth_l1_loss(v_n - v_n.mean(), r_c))
-
-            sub_loss = torch.stack(node_losses).sum() / denom_crn
-            loss_total = loss_total + sub_loss.detach().double()
-            scaled = 0.5 * cfg.crn_pairwise_value_weight * sub_loss
-            if not bool(torch.isfinite(scaled).item()):
-                raise FloatingPointError("CRN pairwise durable loss is non-finite")
-            scaled.backward()  # type: ignore[no-untyped-call]
-            del scaled, sub_loss
+                ac_model._twin_dropout_active = False
+                ac_model.durable_twin_head1_dropout.eval()
+                ac_model.durable_twin_dropout.eval()
         return float(loss_total.item())
 
     def _backward_stateless_distill_afterstates(
@@ -3790,11 +3810,7 @@ class MacroCreditLearner:
         denom_macro_steps = max(1, denominators["macro_steps"])
         denom_afterstate = max(1, denominators["afterstate_steps"])
         denom_macro_pol = max(1, denominators["macro_policy_steps"])
-        denom_mpo_pol = (
-            max(1, denominators["crn_afterstate_steps"])
-            if cfg.crn_only_macro_mpo
-            else denom_macro_pol
-        )
+        denom_mpo_pol = denom_macro_pol
         denom_combat_steps = max(1, denominators["combat_steps"])
         denom_combat_pol = max(1, denominators["combat_policy_steps"])
 
@@ -4440,7 +4456,17 @@ class MacroCreditLearner:
                         safe_cur_obs = safe_logs[k_obs_gpu].masked_fill(~valid_obs, 0.0)
                         obs_kl_vec = (probs_old_obs * (safe_old_obs - safe_cur_obs)).sum(dim=-1)
                         if any(obs_is_mac):
-                            obs_mac_kl = torch.where(is_mac_obs_gpu, obs_kl_vec, 0.0).sum() / denom_macro_pol
+                            if (
+                                durable_actor_active
+                                and cfg.macro_pg_fallback_scale == 0.0
+                                and denominators["afterstate_steps"] > 0
+                            ):
+                                obs_mac_kl = (
+                                    torch.where(is_mac_obs_gpu & has_as_obs_gpu, obs_kl_vec, 0.0).sum()
+                                    / denom_afterstate
+                                )
+                            else:
+                                obs_mac_kl = torch.where(is_mac_obs_gpu, obs_kl_vec, 0.0).sum() / denom_macro_pol
                             slice_totals_gpu["observed_macro_step_kl"] = (
                                 slice_totals_gpu["observed_macro_step_kl"]
                                 + obs_mac_kl.detach().clamp_min(0.0).double()
@@ -4533,6 +4559,7 @@ class MacroCreditLearner:
             totals["crn_pairwise_value_loss"] += self._backward_crn_pairwise_durable(
                 prepared_items,
                 stateless_durable=stateless_durable,
+                twin_ref_weights=twin_ref_weights,
             )
             self._check_resource()
         return totals, maximum_chunk
@@ -4656,11 +4683,7 @@ class MacroCreditLearner:
         denom_macro_steps = max(1, denominators["macro_steps"])
         denom_afterstate = max(1, denominators["afterstate_steps"])
         denom_macro_pol = max(1, denominators["macro_policy_steps"])
-        denom_mpo_pol = (
-            max(1, denominators["crn_afterstate_steps"])
-            if cfg.crn_only_macro_mpo
-            else denom_macro_pol
-        )
+        denom_mpo_pol = denom_macro_pol
         denom_combat_steps = max(1, denominators["combat_steps"])
         denom_combat_pol = max(1, denominators["combat_policy_steps"])
 
@@ -5395,6 +5418,8 @@ class MacroCreditLearner:
         calls = sum(ev.forward_calls for ev in post_evals)
         macro_kl_sum = 0.0
         macro_kl_count = 0
+        active_macro_kl_sum = 0.0
+        active_macro_kl_count = 0
         combat_kl_sum = 0.0
         combat_kl_count = 0
         parent_macro_kl_sum = 0.0
@@ -5432,6 +5457,13 @@ class MacroCreditLearner:
                 if it.reference.steps[s_idx].control_domain == "macro":
                     macro_kl_sum += kl_val
                     macro_kl_count += 1
+                    if (
+                        it.afterstate_targets is not None
+                        and s_idx in it.afterstate_targets
+                        and it.afterstate_targets[s_idx].projection.actor_enabled
+                    ):
+                        active_macro_kl_sum += kl_val
+                        active_macro_kl_count += 1
                     if par_map is not None:
                         par_logs = par_map.get(s_idx)
                         if par_logs is not None:
@@ -5457,8 +5489,13 @@ class MacroCreditLearner:
                 else:
                     combat_kl_sum += kl_val
                     combat_kl_count += 1
+        eff_macro_kl = (
+            active_macro_kl_sum / active_macro_kl_count
+            if (self.config.macro_pg_fallback_scale == 0.0 and active_macro_kl_count > 0)
+            else (macro_kl_sum / max(1, macro_kl_count))
+        )
         return (
-            macro_kl_sum / max(1, macro_kl_count),
+            eff_macro_kl,
             combat_kl_sum / max(1, combat_kl_count),
             parent_macro_kl_sum / max(1, parent_macro_kl_count),
             calls,
@@ -5882,6 +5919,7 @@ class MacroCreditLearner:
                                         stateless_durable=self._uses_stateless_durable_value(
                                             cast(HybridDomainActorCriticModel, self.model)
                                         ),
+                                        twin_ref_weights=twin_w,
                                     )
                             maximum_chunk = max(maximum_chunk, mb_max_chunk)
                             executed_forward_steps += (
@@ -5961,6 +5999,7 @@ class MacroCreditLearner:
                                 stateless_durable=self._uses_stateless_durable_value(
                                     cast(HybridDomainActorCriticModel, self.model)
                                 ),
+                                twin_ref_weights=twin_w_single,
                             )
                     gradient_norm_val, groups = self._clip_and_step_optimizer()
                     ppo_optimizer_steps_executed = 1

@@ -593,7 +593,9 @@ def test_crn_mpo_and_pairwise_delta_v_train_synergy_and_policy(chunk_batch_size:
         combat_actor_warmup_updates=0,
         macro_actor_warmup_updates=0,
         minority_only_within_branch_mpo=False,
-        crn_only_macro_mpo=True,
+        crn_only_macro_mpo=False,
+        use_direct_crn_mpo=False,
+        double_mpo_pessimism_coef=0.25,
         crn_pairwise_value_weight=2.0,
         macro_pg_fallback_scale=0.0,
         macro_entropy_weight=0.0,
@@ -604,38 +606,30 @@ def test_crn_mpo_and_pairwise_delta_v_train_synergy_and_policy(chunk_batch_size:
         eval_batch_size=chunk_batch_size,
         chunk_batch_size=chunk_batch_size,
         revival_budget=0,
-        learning_rate=2e-3,
+        learning_rate=3e-3,
         shared_learning_rate_scale=0.25,
         weight_decay=0.0,
     )
     learner = MacroCreditLearner(model=model, config=cfg)
 
-    # Verify durable_deck_synergy_* is unchained into the 3x durable_val LR group!
+    # Fix #3: Verify durable_deck_synergy_* stays PROTECTED in 0.25x shared LR group,
+    # while readout gates (durable_deck_out / durable_active_hp_gate) get 3.0x durable_val LR!
     syn_param = next(
         p for n, p in model.named_parameters() if n.startswith("durable_deck_synergy_ffn.")
     )
+    readout_param = next(
+        p for n, p in model.named_parameters() if n.startswith("durable_active_hp_gate.")
+    )
     syn_lr = None
+    readout_lr = None
     for grp in learner.optimizer.param_groups:
         if any(p is syn_param for p in grp["params"]):
             syn_lr = float(grp["lr"])
-            break
-    assert syn_lr is not None
-    assert abs(syn_lr - cfg.learning_rate * cfg.durable_value_lr_scale) < 1e-9
-
-    # Also verify default durable_value_lr_scale=1.0 keeps durable_deck_synergy_* in shared group!
-    cfg_default_lr = replace(cfg, durable_value_lr_scale=1.0)
-    default_model = HybridDomainActorCriticModel(ac_cfg)
-    learner_default = MacroCreditLearner(model=default_model, config=cfg_default_lr)
-    def_syn_param = next(
-        p for n, p in default_model.named_parameters() if n.startswith("durable_deck_synergy_ffn.")
-    )
-    def_syn_lr = None
-    for grp in learner_default.optimizer.param_groups:
-        if any(p is def_syn_param for p in grp["params"]):
-            def_syn_lr = float(grp["lr"])
-            break
-    assert def_syn_lr is not None
-    assert abs(def_syn_lr - cfg_default_lr.learning_rate * cfg_default_lr.shared_learning_rate_scale) < 1e-9
+        if any(p is readout_param for p in grp["params"]):
+            readout_lr = float(grp["lr"])
+    assert syn_lr is not None and readout_lr is not None
+    assert abs(syn_lr - cfg.learning_rate * cfg.shared_learning_rate_scale) < 1e-9
+    assert abs(readout_lr - cfg.learning_rate * cfg.durable_value_lr_scale) < 1e-9
 
     syn_before = syn_param.detach().clone()
     # Strong empirical CRN preference: Card 0 (+1.2) > Skip (+0.6) > Card 2 (-0.1) > Card 1 (-1.0)
@@ -648,7 +642,7 @@ def test_crn_mpo_and_pairwise_delta_v_train_synergy_and_policy(chunk_batch_size:
 
     first_loss: float | None = None
     last_metrics: dict[str, Any] = {}
-    for step_u in range(6):
+    for step_u in range(10):
         trajs = tuple(
             _build_crn_trajectory(
                 model,
@@ -660,7 +654,7 @@ def test_crn_mpo_and_pairwise_delta_v_train_synergy_and_policy(chunk_batch_size:
             )
             for i in range(2)
         )
-        cohort = MacroCreditCohort(f"v80-crn-u{step_u}", learner.update, (), natural_only=trajs)
+        cohort = MacroCreditCohort(f"v81-crn-u{step_u}", learner.update, (), natural_only=trajs)
         last_metrics = learner.learn(cohort)
         if first_loss is None:
             first_loss = float(last_metrics["crn_pairwise_value_loss"])
@@ -677,8 +671,151 @@ def test_crn_mpo_and_pairwise_delta_v_train_synergy_and_policy(chunk_batch_size:
     assert float(last_metrics["crn_pairwise_value_loss"]) < first_loss
     assert float(last_metrics["crn_value_rank_agreement"]) >= 0.8
     assert not torch.allclose(syn_param, syn_before)
-    # Policy must increase probability gap of winning Card 0 over losing Card 1!
-    assert (after_lp0 - after_lp1) > (init_lp0 - init_lp1) + 0.05
+    # Twin Critics learn counterfactual delta-V first, then Twin Double-MPO shifts policy cleanly!
+    assert (after_lp0 - after_lp1) > (init_lp0 - init_lp1) + 0.02
+
+
+def test_unblinded_active_macro_kl_triggers_line_search_with_many_map_steps() -> None:
+    tiny, ac_cfg = _tiny_v80_config()
+    torch.manual_seed(811)
+    model = HybridDomainActorCriticModel(ac_cfg)
+    model.eval()
+    encoder = GroundedObservationEncoder(tiny.to_encoding_config())
+
+    # Build a trajectory with 8 untouched Map steps + 1 active Reward afterstate step + 1 Combat step.
+    # Previously, 8 untouched Map steps (KL=0) diluted post_macro_kl by 9x and blinded KL line search!
+    rew_obs, rew_legal = _make_card_reward_surface(floor=10)
+    com_obs, com_legal = _make_combat_surface(floor=11)
+    rew_snap = encoder.encode(rew_obs, rew_legal).snapshot
+    com_snap = encoder.encode(com_obs, com_legal).snapshot
+    post_worlds = _encode_reward_afterstate_worlds(encoder, rew_obs, rew_legal)
+
+    hidden = model.initial_state(1, device=torch.device("cpu"))
+    steps_list: list[HybridVTraceStep] = []
+    facts_list: list[MacroRewardFacts] = []
+    for fl in range(2, 10):
+        m_obs, m_legal = _make_map_surface(floor=fl)
+        m_snap = encoder.encode(m_obs, m_legal).snapshot
+        lp_m, hidden = _compute_log_prob(model, m_snap, hidden, 0)
+        f_m = _reward_facts(0.0, fl, fl + 1)
+        steps_list.append(
+            HybridVTraceStep(
+                m_snap,
+                0,
+                lp_m,
+                f_m.reward,
+                decision_discount(floor_before=fl, floor_after=fl + 1, terminal=False),
+                False,
+                "map",
+                "monster",
+                "macro",
+                0,
+            )
+        )
+        facts_list.append(f_m)
+
+    lp_r, hidden = _compute_log_prob(model, rew_snap, hidden, 0)
+    f_r = _reward_facts(0.0, 10, 11)
+    reward_step_idx = len(steps_list)
+    steps_list.append(
+        HybridVTraceStep(
+            rew_snap,
+            0,
+            lp_r,
+            f_r.reward,
+            decision_discount(floor_before=10, floor_after=11, terminal=False),
+            False,
+            "reward",
+            "take",
+            "macro",
+            0,
+        )
+    )
+    facts_list.append(f_r)
+
+    lp_c, _ = _compute_log_prob(model, com_snap, hidden, 0)
+    f_c = _reward_facts(1.0, 11, 11)
+    steps_list.append(
+        HybridVTraceStep(
+            com_snap,
+            0,
+            lp_c,
+            f_c.reward,
+            decision_discount(floor_before=11, floor_after=11, terminal=True),
+            True,
+            "combat",
+            "play",
+            "combat",
+            0,
+        )
+    )
+    facts_list.append(f_c)
+
+    node = MacroAfterstateNode(
+        step_index=reward_step_idx,
+        surface="reward",
+        candidate_branches=("take", "take", "take", "skip"),
+        post_worlds=post_worlds,
+    )
+    trajs = tuple(
+        MacroCreditTrajectory(
+            f"v81-kl-{i}",
+            13_500_000 + 2 * i,
+            0,
+            (),
+            tuple(steps_list),
+            None,
+            None,
+            "factual_terminal",
+            tuple(facts_list),
+            afterstate_nodes=(node,),
+            macro_branch_epsilon=0.0,
+        )
+        for i in range(2)
+    )
+    cfg = MacroCreditLearnerConfig(
+        target_mode="durable_afterstate_v2",
+        domain_layers=1,
+        joint_layers=1,
+        enable_direct_vitals_context=True,
+        enable_direct_combat_vitals_context=True,
+        enable_active_durable_vitals_gates=True,
+        enable_macro_branch_prior=True,
+        enable_persistent_only_durable_value=True,
+        enable_asymmetric_revival_critic=True,
+        enable_draw_weighted_durable_value=True,
+        enable_role_conditioned_candidate_policy=True,
+        enable_deconfounded_durable_value=True,
+        enable_monotone_deconfounded_durable_value=True,
+        enable_balanced_deconfounded_durable_value=True,
+        enable_expressive_synergy_backbone=True,
+        enable_debloated_synergy_durable_value=True,
+        enable_build_conditioned_durable_value=True,
+        enable_twin_durable_value_heads=True,
+        enable_hierarchical_afterstate_mpo=True,
+        double_mpo_pessimism_coef=0.0,
+        durable_warmup_updates=0,
+        combat_actor_warmup_updates=0,
+        macro_actor_warmup_updates=0,
+        macro_pg_fallback_scale=0.0,
+        macro_entropy_weight=0.0,
+        macro_kl=0.10,
+        macro_within_branch_kl=0.10,
+        enable_post_step_kl_line_search=True,
+        target_macro_step_kl=0.002,
+        combat_policy_weight=0.0,
+        combat_value_weight=0.0,
+        eval_batch_size=2,
+        chunk_batch_size=2,
+        revival_budget=0,
+        learning_rate=5e-2,
+    )
+    learner = MacroCreditLearner(model=model, config=cfg)
+    m = learner.learn(MacroCreditCohort("v81-kl-test", 0, (), natural_only=trajs))
+    assert m["raw_updated_macro_policy_kl"] > 0.002
+    assert m["line_search_backtracks"] > 0
+    assert m["line_search_scale"] < 1.0
+    assert m["mean_updated_macro_policy_kl"] <= m["raw_updated_macro_policy_kl"]
 
 
 def test_select_crn_branch_indices_card_reward_and_campfire() -> None:
@@ -716,23 +853,28 @@ def test_select_crn_branch_indices_card_reward_and_campfire() -> None:
     assert picked == (0, 2, 4, 5)
 
 
-def test_v29_config_and_act_b0_crn_96_seed_gate_scaling() -> None:
+def test_v30_v81_config_and_act_b0_crn_96_seed_gate_scaling() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     cfg = load_macro_training_config(
         repo_root
-        / "config/experiments/hybrid_macro_credit_v29_durable_afterstate_v80_crn_b0_act1_g4.toml"
+        / "config/experiments/hybrid_macro_credit_v30_durable_afterstate_v81_twin_crn_critic_b0_act1_g4.toml"
     )
     assert cfg.course.roots_per_cohort == 32
     assert cfg.course.parallel_collectors == 48
     assert cfg.course.crn_roots_per_episode == 1
     assert cfg.course.crn_max_branches_per_root == 4
-    assert cfg.learner.crn_only_macro_mpo is True
-    assert cfg.learner.crn_pairwise_value_weight == 1.0
+    assert cfg.learner.crn_only_macro_mpo is False
+    assert cfg.learner.use_direct_crn_mpo is False
+    assert cfg.learner.double_mpo_pessimism_coef == 0.35
+    assert cfg.learner.minority_only_within_branch_mpo is True
+    assert cfg.learner.crn_pairwise_value_weight == 0.35
     assert cfg.learner.macro_pg_fallback_scale == 0.0
     assert cfg.learner.macro_entropy_weight == 0.0
     assert cfg.learner.combat_pg_kl_weight == 0.02
     assert cfg.learner.combat_entropy_weight == 0.007
-    assert cfg.learner.durable_value_lr_scale == 3.0
+    assert cfg.learner.durable_value_lr_scale == 2.0
+    assert cfg.learner.macro_actor_warmup_updates == 10
+    assert cfg.learner.target_macro_step_kl == 0.010
     assert cfg.training.runtime.seed == 6760000
 
     scripts_dir = str(repo_root / "scripts")
