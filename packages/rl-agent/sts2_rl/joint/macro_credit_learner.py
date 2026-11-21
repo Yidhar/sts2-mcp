@@ -173,7 +173,10 @@ class MacroCreditLearnerConfig:
     crn_pairwise_value_weight: float = 0.0
     crn_mpo_return_scale: float = 1.0
     enable_marginal_card_id_durable_value: bool = False
+    enable_centered_marginal_card_id_durable_value: bool = False
+    enable_saturated_high_hp_basis: bool = False
     suppress_full_hp_campfire_heal: bool = False
+    campfire_heal_suppress_hp_ratio: float = 0.0
     hybrid_afterstate_vtrace_alpha: float = 0.0
     hybrid_afterstate_vtrace_clip: float = 0.50
     afterstate_macro_pg_scale: float = 0.0
@@ -192,6 +195,8 @@ class MacroCreditLearnerConfig:
             "enable_direct_combat_vitals_context",
             "enable_active_durable_vitals_gates",
             "enable_marginal_card_id_durable_value",
+            "enable_centered_marginal_card_id_durable_value",
+            "enable_saturated_high_hp_basis",
             "suppress_full_hp_campfire_heal",
             "crn_only_macro_mpo",
             "use_direct_crn_mpo",
@@ -256,6 +261,20 @@ class MacroCreditLearnerConfig:
         ):
             raise ValueError(
                 "macro credit enable_marginal_card_id_durable_value requires enable_draw_weighted_durable_value=True"
+            )
+        if (
+            self.enable_centered_marginal_card_id_durable_value
+            and not self.enable_marginal_card_id_durable_value
+        ):
+            raise ValueError(
+                "macro credit enable_centered_marginal_card_id_durable_value requires enable_marginal_card_id_durable_value=True"
+            )
+        if (
+            self.enable_saturated_high_hp_basis
+            and not self.enable_monotone_deconfounded_durable_value
+        ):
+            raise ValueError(
+                "macro credit enable_saturated_high_hp_basis requires enable_monotone_deconfounded_durable_value=True"
             )
         if (
             self.enable_expressive_synergy_backbone
@@ -408,6 +427,7 @@ class MacroCreditLearnerConfig:
             "mpo_parent_prior_mix",
             "hybrid_afterstate_vtrace_alpha",
             "afterstate_macro_pg_scale",
+            "campfire_heal_suppress_hp_ratio",
         ):
             u_val = getattr(self, unit_name)
             if isinstance(u_val, bool) or not math.isfinite(u_val) or not 0.0 <= u_val <= 1.0:
@@ -709,6 +729,9 @@ class MacroCreditLearner:
             model._detach_value_heads_from_trunk = bool(self.config.detach_value_heads_from_trunk)
             model._detach_macro_branch_prior_lse = bool(self.config.detach_macro_branch_prior_lse)
             model._suppress_full_hp_campfire_heal = bool(self.config.suppress_full_hp_campfire_heal)
+            model._campfire_heal_suppress_hp_ratio = float(
+                self.config.campfire_heal_suppress_hp_ratio
+            )
         local_tokens = (
             "macro_stream",
             "combat_stream",
@@ -806,6 +829,9 @@ class MacroCreditLearner:
             raise ValueError("teacher_model requires enable_durable_value_head=True")
         teacher_model._suppress_full_hp_campfire_heal = bool(
             self.config.suppress_full_hp_campfire_heal
+        )
+        teacher_model._campfire_heal_suppress_hp_ratio = float(
+            self.config.campfire_heal_suppress_hp_ratio
         )
         teacher_model.to(self.device)
         teacher_model.eval()
@@ -5592,6 +5618,8 @@ class MacroCreditLearner:
         combat_kl_count = 0
         parent_macro_kl_sum = 0.0
         parent_macro_kl_count = 0
+        active_parent_macro_kl_sum = 0.0
+        active_parent_macro_kl_count = 0
         for nat_idx, (it, post_ev) in enumerate(zip(nat_items, post_evals, strict=True)):
             old_map = it.evaluation.step_log_probs or {}
             new_map = post_ev.step_log_probs or {}
@@ -5625,11 +5653,12 @@ class MacroCreditLearner:
                 if it.reference.steps[s_idx].control_domain == "macro":
                     macro_kl_sum += kl_val
                     macro_kl_count += 1
-                    if (
+                    is_active_afterstate = (
                         it.afterstate_targets is not None
                         and s_idx in it.afterstate_targets
                         and it.afterstate_targets[s_idx].projection.actor_enabled
-                    ):
+                    )
+                    if is_active_afterstate:
                         active_macro_kl_sum += kl_val
                         active_macro_kl_count += 1
                     if par_map is not None:
@@ -5654,6 +5683,9 @@ class MacroCreditLearner:
                                 )
                                 parent_macro_kl_sum += p_kl
                                 parent_macro_kl_count += 1
+                                if is_active_afterstate:
+                                    active_parent_macro_kl_sum += p_kl
+                                    active_parent_macro_kl_count += 1
                 else:
                     combat_kl_sum += kl_val
                     combat_kl_count += 1
@@ -5662,10 +5694,15 @@ class MacroCreditLearner:
             if (self.config.macro_pg_fallback_scale == 0.0 and active_macro_kl_count > 0)
             else (macro_kl_sum / max(1, macro_kl_count))
         )
+        eff_parent_macro_kl = (
+            active_parent_macro_kl_sum / active_parent_macro_kl_count
+            if (self.config.macro_pg_fallback_scale == 0.0 and active_parent_macro_kl_count > 0)
+            else (parent_macro_kl_sum / max(1, parent_macro_kl_count))
+        )
         return (
             eff_macro_kl,
             combat_kl_sum / max(1, combat_kl_count),
-            parent_macro_kl_sum / max(1, parent_macro_kl_count),
+            eff_parent_macro_kl,
             calls,
         )
 
@@ -6183,6 +6220,8 @@ class MacroCreditLearner:
                 ):
                     pre_parent_kl_sum = 0.0
                     pre_parent_kl_cnt = 0
+                    active_pre_parent_kl_sum = 0.0
+                    active_pre_parent_kl_cnt = 0
                     if kickstart_teacher_logs is not None:
                         nat_pre = [it for it in prepared if it.root is None]
                         for n_i, it_pre in enumerate(nat_pre):
@@ -6202,7 +6241,7 @@ class MacroCreditLearner:
                                 v_po = torch.isfinite(pr_d) & torch.isfinite(ol_d)
                                 if bool(v_po.any().item()):
                                     p_pr = pr_d.exp().masked_fill(~v_po, 0.0)
-                                    pre_parent_kl_sum += max(
+                                    pre_kl_val = max(
                                         0.0,
                                         float(
                                             (
@@ -6213,8 +6252,20 @@ class MacroCreditLearner:
                                             .item()
                                         ),
                                     )
+                                    pre_parent_kl_sum += pre_kl_val
                                     pre_parent_kl_cnt += 1
-                    pre_parent_macro_kl = pre_parent_kl_sum / max(1, pre_parent_kl_cnt)
+                                    if (
+                                        it_pre.afterstate_targets is not None
+                                        and s_i in it_pre.afterstate_targets
+                                        and it_pre.afterstate_targets[s_i].projection.actor_enabled
+                                    ):
+                                        active_pre_parent_kl_sum += pre_kl_val
+                                        active_pre_parent_kl_cnt += 1
+                    pre_parent_macro_kl = (
+                        active_pre_parent_kl_sum / active_pre_parent_kl_cnt
+                        if (self.config.macro_pg_fallback_scale == 0.0 and active_pre_parent_kl_cnt > 0)
+                        else (pre_parent_kl_sum / max(1, pre_parent_kl_cnt))
+                    )
                     eff_parent_cap = (
                         max(self.config.max_parent_macro_kl, pre_parent_macro_kl)
                         if self.config.max_parent_macro_kl > 0.0
@@ -6339,6 +6390,27 @@ class MacroCreditLearner:
                                 (not still_step_over and not still_combat_over and not still_parent_over)
                                 or line_search_scale <= self.config.line_search_min_scale + 1e-9
                             ):
+                                if (
+                                    still_parent_over
+                                    and line_search_scale <= self.config.line_search_min_scale + 1e-9
+                                ):
+                                    line_search_scale = 0.0
+                                    line_search_backtracks += 1
+                                    with torch.no_grad():
+                                        for p, b, _ in policy_trunk_pairs:
+                                            p.copy_(b)
+                                    (
+                                        post_macro_kl,
+                                        post_combat_kl,
+                                        post_parent_macro_kl,
+                                        ls_zero_calls,
+                                    ) = self._measure_updated_durable_kl(
+                                        prepared,
+                                        denominators,
+                                        packed_cache=eval_packed_cache,
+                                        parent_teacher_logs=kickstart_teacher_logs,
+                                    )
+                                    target_calls += ls_zero_calls
                                 break
         except BaseException:
             self.optimizer.zero_grad(set_to_none=True)

@@ -178,12 +178,21 @@ class FrozenMacroRootPolicy:
                 "enable_twin_durable_value_heads",
                 "enable_local_combat_value_head",
                 "enable_marginal_card_id_durable_value",
+                "enable_centered_marginal_card_id_durable_value",
+                "enable_saturated_high_hp_basis",
                 "suppress_full_hp_campfire_heal",
             ):
                 if getattr(parsed_macro_source_cfg, flag_name) and not getattr(model_config, flag_name):
                     raise ValueError(
                         f"macro publication hot-start cannot disable parent flag {flag_name}"
                     )
+            if (
+                parsed_macro_source_cfg.campfire_heal_suppress_hp_ratio
+                > model_config.campfire_heal_suppress_hp_ratio + 1e-6
+            ):
+                raise ValueError(
+                    "macro publication hot-start cannot lower parent campfire_heal_suppress_hp_ratio"
+                )
             source_model_config = parsed_macro_source_cfg.as_mapping()
         else:
             source_model_config = model_config.as_mapping()

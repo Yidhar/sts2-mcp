@@ -306,8 +306,17 @@ def _actor_critic_config(config: MacroTrainingConfig) -> HybridActorCriticConfig
             enable_marginal_card_id_durable_value=(
                 config.learner.enable_marginal_card_id_durable_value
             ),
+            enable_centered_marginal_card_id_durable_value=(
+                config.learner.enable_centered_marginal_card_id_durable_value
+            ),
+            enable_saturated_high_hp_basis=(
+                config.learner.enable_saturated_high_hp_basis
+            ),
             suppress_full_hp_campfire_heal=(
                 config.learner.suppress_full_hp_campfire_heal
+            ),
+            campfire_heal_suppress_hp_ratio=(
+                config.learner.campfire_heal_suppress_hp_ratio
             ),
         )
     return HybridActorCriticConfig(

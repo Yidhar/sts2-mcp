@@ -153,7 +153,10 @@ class HybridActorCriticConfig:
     enable_direct_combat_vitals_context: bool = False
     enable_active_durable_vitals_gates: bool = False
     enable_marginal_card_id_durable_value: bool = False
+    enable_centered_marginal_card_id_durable_value: bool = False
+    enable_saturated_high_hp_basis: bool = False
     suppress_full_hp_campfire_heal: bool = False
+    campfire_heal_suppress_hp_ratio: float = 0.0
 
     def __post_init__(self) -> None:
         HybridCandidateQConfig(
@@ -182,6 +185,8 @@ class HybridActorCriticConfig:
             "enable_direct_combat_vitals_context",
             "enable_active_durable_vitals_gates",
             "enable_marginal_card_id_durable_value",
+            "enable_centered_marginal_card_id_durable_value",
+            "enable_saturated_high_hp_basis",
             "suppress_full_hp_campfire_heal",
         ):
             if not isinstance(getattr(self, name), bool):
@@ -249,6 +254,27 @@ class HybridActorCriticConfig:
             raise ValueError(
                 "enable_marginal_card_id_durable_value requires enable_draw_weighted_durable_value=True"
             )
+        if (
+            self.enable_centered_marginal_card_id_durable_value
+            and not self.enable_marginal_card_id_durable_value
+        ):
+            raise ValueError(
+                "enable_centered_marginal_card_id_durable_value requires enable_marginal_card_id_durable_value=True"
+            )
+        if (
+            self.enable_saturated_high_hp_basis
+            and not self.enable_monotone_deconfounded_durable_value
+        ):
+            raise ValueError(
+                "enable_saturated_high_hp_basis requires enable_monotone_deconfounded_durable_value=True"
+            )
+        if (
+            isinstance(self.campfire_heal_suppress_hp_ratio, bool)
+            or not isinstance(self.campfire_heal_suppress_hp_ratio, int | float)
+            or not math.isfinite(float(self.campfire_heal_suppress_hp_ratio))
+            or not 0.0 <= float(self.campfire_heal_suppress_hp_ratio) <= 1.0
+        ):
+            raise ValueError("campfire_heal_suppress_hp_ratio must be a finite float in [0, 1]")
 
     @property
     def has_v2_extensions(self) -> bool:
@@ -273,7 +299,10 @@ class HybridActorCriticConfig:
             or self.enable_direct_combat_vitals_context
             or self.enable_active_durable_vitals_gates
             or self.enable_marginal_card_id_durable_value
+            or self.enable_centered_marginal_card_id_durable_value
+            or self.enable_saturated_high_hp_basis
             or self.suppress_full_hp_campfire_heal
+            or (self.campfire_heal_suppress_hp_ratio > 0.0)
         )
 
     @classmethod
@@ -601,8 +630,17 @@ class HybridActorCriticConfig:
                 enable_marginal_card_id_durable_value=bool(
                     mapping.get("enable_marginal_card_id_durable_value", False)
                 ),
+                enable_centered_marginal_card_id_durable_value=bool(
+                    mapping.get("enable_centered_marginal_card_id_durable_value", False)
+                ),
+                enable_saturated_high_hp_basis=bool(
+                    mapping.get("enable_saturated_high_hp_basis", False)
+                ),
                 suppress_full_hp_campfire_heal=bool(
                     mapping.get("suppress_full_hp_campfire_heal", False)
+                ),
+                campfire_heal_suppress_hp_ratio=float(
+                    mapping.get("campfire_heal_suppress_hp_ratio", 0.0)
                 ),
             )
         raise ValueError(f"unsupported hybrid actor-critic model_config version: {version!r}")
@@ -717,10 +755,28 @@ class HybridActorCriticConfig:
                         self.enable_marginal_card_id_durable_value
                     ),
                 )
+            if self.enable_centered_marginal_card_id_durable_value:
+                base.update(
+                    enable_centered_marginal_card_id_durable_value=(
+                        self.enable_centered_marginal_card_id_durable_value
+                    ),
+                )
+            if self.enable_saturated_high_hp_basis:
+                base.update(
+                    enable_saturated_high_hp_basis=(
+                        self.enable_saturated_high_hp_basis
+                    ),
+                )
             if self.suppress_full_hp_campfire_heal:
                 base.update(
                     suppress_full_hp_campfire_heal=(
                         self.suppress_full_hp_campfire_heal
+                    ),
+                )
+            if self.campfire_heal_suppress_hp_ratio > 0.0:
+                base.update(
+                    campfire_heal_suppress_hp_ratio=float(
+                        self.campfire_heal_suppress_hp_ratio
                     ),
                 )
         return base
@@ -856,6 +912,9 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         self._detach_macro_branch_prior_lse: bool = False
         self._suppress_full_hp_campfire_heal: bool = bool(
             actor_critic.suppress_full_hp_campfire_heal
+        )
+        self._campfire_heal_suppress_hp_ratio: float = float(
+            actor_critic.campfire_heal_suppress_hp_ratio
         )
         del self.candidate_q_head
         cfg = actor_critic.grounded
@@ -1257,6 +1316,19 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                         nn.SiLU(),
                         marg_fc_out,
                     )
+                    if actor_critic.enable_centered_marginal_card_id_durable_value:
+                        self.register_buffer(
+                            "durable_deck_seen_unupgraded_mask",
+                            torch.zeros((cfg.entity_vocab_size,), dtype=torch.bool),
+                        )
+                        self.register_buffer(
+                            "durable_deck_marginal_ema",
+                            torch.zeros((), dtype=torch.float32),
+                        )
+                        self.register_buffer(
+                            "durable_deck_marginal_ema_init",
+                            torch.zeros((), dtype=torch.bool),
+                        )
                 if actor_critic.enable_expressive_synergy_backbone:
                     synergy_heads = (
                         cfg.n_heads if cfg.ffn_dim % cfg.n_heads == 0 else 1
@@ -1452,6 +1524,19 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                             nn.SiLU(),
                             t_marg_fc_out,
                         )
+                        if actor_critic.enable_centered_marginal_card_id_durable_value:
+                            self.register_buffer(
+                                "durable_twin_deck_seen_unupgraded_mask",
+                                torch.zeros((cfg.entity_vocab_size,), dtype=torch.bool),
+                            )
+                            self.register_buffer(
+                                "durable_twin_deck_marginal_ema",
+                                torch.zeros((), dtype=torch.float32),
+                            )
+                            self.register_buffer(
+                                "durable_twin_deck_marginal_ema_init",
+                                torch.zeros((), dtype=torch.bool),
+                            )
                     if actor_critic.enable_monotone_deconfounded_durable_value:
                         self.durable_twin_deck_tilted_out = nn.Linear(
                             cfg.ffn_dim * 3,
@@ -2460,12 +2545,18 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         ).clamp_min(1.0)
         hp_ratio = (hp_val / max_hp_val).clamp(0.0, 2.0)
         r_c = hp_ratio.clamp(0.0, 1.0)
+        if self.actor_critic_config.enable_saturated_high_hp_basis:
+            r_eff = (0.76 - nn.functional.softplus((0.76 - r_c) * 24.0) / 24.0).clamp_min(0.0)
+            hp_eff = r_eff * max_hp_val
+        else:
+            r_eff = r_c
+            hp_eff = hp_val
         hp_basis = torch.stack(
             [
-                1.0 - (1.0 - r_c).pow(3),
-                1.0 - (1.0 - r_c).pow(2),
-                torch.tanh(hp_val / 35.0),
-                torch.tanh(hp_val / 75.0),
+                1.0 - (1.0 - r_eff).pow(3),
+                1.0 - (1.0 - r_eff).pow(2),
+                torch.tanh(hp_eff / 35.0),
+                torch.tanh(hp_eff / 75.0),
                 torch.tanh(max_hp_val / 100.0),
             ],
             dim=-1,
@@ -2829,7 +2920,83 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
                 if head_drop is not None:
                     id_emb = head_drop(id_emb)
                 marg_in = torch.cat([id_emb, card_hidden, raw_hidden], dim=-1)
-                marg_raw = (d_marg_id_lin(id_emb) + d_marg_mlp(marg_in)).squeeze(-1)
+                if ac.enable_centered_marginal_card_id_durable_value:
+                    seen_buf: Tensor = (
+                        getattr(self, "durable_twin_deck_seen_unupgraded_mask")
+                        if use_twin
+                        else getattr(self, "durable_deck_seen_unupgraded_mask")
+                    )
+                    ema_buf: Tensor = (
+                        getattr(self, "durable_twin_deck_marginal_ema")
+                        if use_twin
+                        else getattr(self, "durable_deck_marginal_ema")
+                    )
+                    ema_init_buf: Tensor = (
+                        getattr(self, "durable_twin_deck_marginal_ema_init")
+                        if use_twin
+                        else getattr(self, "durable_deck_marginal_ema_init")
+                    )
+                    is_upg_slot = (bounded_upg_ids % 2).eq(1)
+                    unupg_slot_mask = marg_card_mask & (~is_upg_slot) & (bounded_upg_ids >= 2)
+                    can_update_buf = (
+                        self.training
+                        and torch.is_grad_enabled()
+                        and not torch.is_inference_mode_enabled()
+                    )
+                    if can_update_buf and bool(unupg_slot_mask.any().item()):
+                        with torch.no_grad():
+                            seen_eids_upd = (bounded_upg_ids[unupg_slot_mask] // 2).clamp(
+                                1, int(seen_buf.numel()) - 1
+                            )
+                            seen_buf[seen_eids_upd] = True
+                    seen_cnt = int(seen_buf.long().sum().item())
+                    if seen_cnt >= 2:
+                        seen_eids = torch.nonzero(seen_buf, as_tuple=False).squeeze(-1)
+                        ref_id_emb = (
+                            d_card_id_emb(seen_eids * 2).to(dtype=card_hidden.dtype).mean(dim=0)
+                        )
+                    else:
+                        ref_id_emb = (
+                            d_card_id_emb.weight[2::2].to(dtype=card_hidden.dtype).mean(dim=0)
+                        )
+                    mlp_last = d_marg_mlp[-1]
+                    mlp_out = d_marg_mlp(marg_in)
+                    if isinstance(mlp_last, nn.Linear) and mlp_last.bias is not None:
+                        mlp_out = mlp_out - mlp_last.bias.to(dtype=mlp_out.dtype)
+                    marg_raw = (
+                        d_marg_id_lin(id_emb - ref_id_emb.view(1, 1, -1)) + mlp_out
+                    ).squeeze(-1)
+                    if can_update_buf and bool(unupg_slot_mask.any().item()):
+                        batch_unupg_mean = marg_raw[unupg_slot_mask].mean()
+                        with torch.no_grad():
+                            if not bool(ema_init_buf.item()):
+                                ema_buf.copy_(batch_unupg_mean.detach().float())
+                                ema_init_buf.fill_(True)
+                            else:
+                                ema_buf.lerp_(batch_unupg_mean.detach().float(), 0.10)
+                        center_scalar = ema_buf.to(dtype=marg_raw.dtype) + (
+                            batch_unupg_mean - batch_unupg_mean.detach()
+                        )
+                        marg_raw = marg_raw - center_scalar
+                    elif bool(ema_init_buf.item()):
+                        marg_raw = marg_raw - ema_buf.to(dtype=marg_raw.dtype)
+                    else:
+                        zero_ctx = torch.zeros(
+                            (1, 1, int(card_hidden.shape[-1]) + int(raw_hidden.shape[-1])),
+                            dtype=card_hidden.dtype,
+                            device=card_hidden.device,
+                        )
+                        cold_ref_in = torch.cat(
+                            [ref_id_emb.view(1, 1, -1), zero_ctx], dim=-1
+                        )
+                        cold_ref_out = d_marg_mlp(cold_ref_in)
+                        if isinstance(mlp_last, nn.Linear) and mlp_last.bias is not None:
+                            cold_ref_out = cold_ref_out - mlp_last.bias.to(
+                                dtype=cold_ref_out.dtype
+                            )
+                        marg_raw = marg_raw - cold_ref_out.squeeze()
+                else:
+                    marg_raw = (d_marg_id_lin(id_emb) + d_marg_mlp(marg_in)).squeeze(-1)
                 marginal_card_delta = 0.30 * torch.tanh(marg_raw / 0.30)
                 marginal_deck_sum = (
                     torch.einsum(
@@ -3806,8 +3973,17 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         ).amax(dim=1)
         hp_val = torch.expm1((10.0 * hp_log.float()).clamp(0.0, 8.0))
         max_hp_val = torch.expm1((10.0 * max_hp_log.float()).clamp(0.0, 8.0))
-        is_full_hp = (max_hp_val >= 2.0) & (hp_val >= (max_hp_val - 1.25))
-        if not bool((is_rest_surface & is_full_hp).any().item()):
+        eff_ratio_thr = max(
+            float(self.actor_critic_config.campfire_heal_suppress_hp_ratio),
+            float(getattr(self, "_campfire_heal_suppress_hp_ratio", 0.0)),
+        )
+        if eff_ratio_thr > 0.0:
+            is_high_hp = (max_hp_val >= 2.0) & (
+                (hp_val / max_hp_val.clamp_min(1.0)) >= (eff_ratio_thr - 1e-4)
+            )
+        else:
+            is_high_hp = (max_hp_val >= 2.0) & (hp_val >= (max_hp_val - 1.25))
+        if not bool((is_rest_surface & is_high_hp).any().item()):
             return policy_logits
 
         is_heal_cand = batch.candidates.role_ids.eq(self._rest_heal_role_id)
@@ -3822,7 +3998,7 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
         is_heal_cand = action_mask & is_heal_cand
         has_other_legal = (action_mask & (~is_heal_cand)).any(dim=1)
         suppress_mask = (
-            (is_rest_surface & is_full_hp & has_other_legal).unsqueeze(1) & is_heal_cand
+            (is_rest_surface & is_high_hp & has_other_legal).unsqueeze(1) & is_heal_cand
         )
         if not bool(suppress_mask.any().item()):
             return policy_logits
@@ -3955,6 +4131,8 @@ class HybridDomainActorCriticModel(HybridDomainCandidateQModel):
             if (
                 self.actor_critic_config.suppress_full_hp_campfire_heal
                 or bool(getattr(self, "_suppress_full_hp_campfire_heal", False))
+                or self.actor_critic_config.campfire_heal_suppress_hp_ratio > 0.0
+                or float(getattr(self, "_campfire_heal_suppress_hp_ratio", 0.0)) > 0.0
             ):
                 policy_logits = self._apply_full_hp_campfire_heal_suppression(
                     policy_logits=policy_logits,
