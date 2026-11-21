@@ -77,6 +77,8 @@ class CourseLimits:
     seed_index_offset: int = 0
     parallel_collectors: int = 1
     macro_branch_epsilon: float = 0.0
+    crn_roots_per_episode: int = 0
+    crn_max_branches_per_root: int = 4
     maximum_root_snapshot_bytes: int = 256 * 1024 * 1024
     maximum_cohort_snapshot_bytes: int = 512 * 1024 * 1024
     maximum_root_seconds: float = 3600.0
@@ -86,9 +88,13 @@ class CourseLimits:
 
     def __post_init__(self) -> None:
         for name, value in asdict(self).items():
-            if name == "seed_index_offset":
+            if name in {"seed_index_offset", "crn_roots_per_episode"}:
                 if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                    raise ValueError("course.seed_index_offset must be a non-negative integer")
+                    raise ValueError(f"course.{name} must be a non-negative integer")
+                continue
+            if name == "crn_max_branches_per_root":
+                if isinstance(value, bool) or not isinstance(value, int) or value < 2:
+                    raise ValueError("course.crn_max_branches_per_root must be an integer >= 2")
                 continue
             if name == "macro_branch_epsilon":
                 if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or not 0.0 <= value < 1.0:
@@ -561,7 +567,7 @@ def run_cohorts(
                     return seed_at(config.course.seed_index_offset + base_cursor + attempt_offset)
 
                 remaining_seconds = config.course.maximum_cohort_seconds - (time.monotonic() - guard.started)
-                cohort, training_episodes, _ = collect_durable_afterstate_cohort(
+                cohort, training_episodes, cohort_reports = collect_durable_afterstate_cohort(
                     backend_factory=backend_factory,
                     policy=teacher,
                     config=config.training,
@@ -575,6 +581,11 @@ def run_cohorts(
                     allow_single_pick_manual_confirm=(
                         config.learner.enable_manual_confirm_selection_afterstates
                     ),
+                    crn_roots_per_episode=config.course.crn_roots_per_episode,
+                    crn_max_branches_per_root=config.course.crn_max_branches_per_root,
+                    crn_zero_macro_pace_penalty=config.learner.zero_macro_pace_penalty,
+                    crn_linear_hp_loss_weight=config.learner.linear_hp_loss_weight,
+                    crn_hp_loss_reference=config.learner.hp_loss_reference,
                     parallel_collectors=config.course.parallel_collectors,
                     replacement_seed_fn=replacement_seed,
                     max_recoverable_incidents=max(2, config.course.roots_per_cohort // 2),
@@ -588,6 +599,7 @@ def run_cohorts(
                 )
                 natural_only = list(cohort.natural_only)
             else:
+                cohort_reports = []
                 for offset in range(config.course.roots_per_cohort):
                     guard.check(force=True)
                     current_bytes = sum(
@@ -627,6 +639,9 @@ def run_cohorts(
                 "natural_macro_steps": sum(step.control_domain == "macro" for item in references for step in item.steps),
                 "natural_combat_steps": sum(step.control_domain == "combat" for item in references for step in item.steps),
                 "afterstate_steps": sum(len(getattr(item, "afterstate_nodes", ())) for item in references),
+                "crn_roots_collected": sum(int(r.get("crn_roots_collected", 0)) for r in cohort_reports),
+                "crn_branches_executed": sum(int(r.get("crn_branches_executed", 0)) for r in cohort_reports),
+                "crn_prefix_mismatches": sum(int(r.get("crn_prefix_mismatches", 0)) for r in cohort_reports),
                 "complete_roots": len(roots),
                 "natural_only_games": len(natural_only),
                 "candidate_trajectories": sum(len(item.candidates) for item in roots),

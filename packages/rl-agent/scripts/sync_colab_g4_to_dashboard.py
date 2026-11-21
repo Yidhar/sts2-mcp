@@ -941,7 +941,9 @@ def sync_once(
                 "unix_s": start_ts,
                 "config": {
                     "profile": (
-                        "durable_afterstate_v7"
+                        "durable_afterstate_v8"
+                        if "v8" in lineage
+                        else "durable_afterstate_v7"
                         if "v7" in lineage
                         else "durable_afterstate_v6"
                         if "v6" in lineage
@@ -952,7 +954,9 @@ def sync_once(
                         )
                     ),
                     "version": (
-                        "sts2-durable-afterstate-v7.5-active-vitals-b0"
+                        "sts2-durable-afterstate-v8.0-crn-b0"
+                        if ("v8-0" in lineage or "v8.0" in lineage or "v8" in lineage)
+                        else "sts2-durable-afterstate-v7.5-active-vitals-b0"
                         if ("v7-5" in lineage or "v7.5" in lineage)
                         else "sts2-durable-afterstate-v7.4-joint-b0"
                         if ("v7-4" in lineage or "v7.4" in lineage)

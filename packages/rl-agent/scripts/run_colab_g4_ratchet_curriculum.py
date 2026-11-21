@@ -162,6 +162,79 @@ ZERO_REVIVAL_ACT_LADDER: tuple[RatchetStageSpec, ...] = (
     ),
 )
 
+_CRN_B0_STAGE_OVERRIDES: tuple[str, ...] = (
+    "course.roots_per_cohort=32",
+    "course.parallel_collectors=48",
+    "course.crn_roots_per_episode=1",
+    "course.crn_max_branches_per_root=4",
+    "learner.crn_only_macro_mpo=true",
+    "learner.crn_pairwise_value_weight=1.0",
+    "learner.crn_mpo_return_scale=1.0",
+    "learner.macro_pg_fallback_scale=0.0",
+    "learner.macro_entropy_weight=0.0",
+    "learner.minority_only_within_branch_mpo=false",
+    "learner.durable_warmup_updates=1",
+    "learner.combat_actor_warmup_updates=1",
+    "learner.macro_actor_warmup_updates=1",
+    "learner.learning_rate=0.000120",
+    "learner.shared_learning_rate_scale=0.25",
+    "learner.durable_value_lr_scale=3.0",
+    "learner.local_combat_win_reward=1.5",
+    "learner.local_combat_loss_reward=-1.5",
+    "learner.local_combat_hp_weight=1.2",
+    "learner.combat_pg_kl_weight=0.02",
+    "learner.combat_entropy_weight=0.007",
+    "learner.macro_kl=0.025",
+    "learner.macro_within_branch_kl=0.040",
+    "learner.mpo_parent_prior_mix=0.03",
+    "learner.enable_post_step_kl_line_search=true",
+    "learner.max_parent_macro_kl=0.0",
+    "learner.target_macro_step_kl=0.015",
+    "learner.target_combat_step_kl=0.020",
+    "learner.kickstart_kl_weight=0.020",
+    "learner.kickstart_kl_floor=0.005",
+    "learner.kickstart_combat_kl_scale=0.0",
+    "learner.likelihood_tolerance=0.15",
+    "learner.ppo_epochs_per_cohort=1",
+    "learner.ppo_minibatches_per_cohort=2",
+)
+
+CRN_ZERO_REVIVAL_ACT_LADDER: tuple[RatchetStageSpec, ...] = (
+    RatchetStageSpec(
+        budget=0,
+        reward_objective="act1",
+        stage_tag="b0-act1",
+        wins_required=30,
+        mean_revivals_limit=0.0,
+        seed_index_offset=830_000,
+        min_skip_rate=0.08,
+        max_mean_deck_size=21.0,
+        extra_overrides=_CRN_B0_STAGE_OVERRIDES,
+    ),
+    RatchetStageSpec(
+        budget=0,
+        reward_objective="act2",
+        stage_tag="b0-act2",
+        wins_required=20,
+        mean_revivals_limit=0.0,
+        seed_index_offset=890_000,
+        min_skip_rate=0.10,
+        max_mean_deck_size=28.0,
+        extra_overrides=_CRN_B0_STAGE_OVERRIDES,
+    ),
+    RatchetStageSpec(
+        budget=0,
+        reward_objective="run",
+        stage_tag="b0-act3",
+        wins_required=12,
+        mean_revivals_limit=0.0,
+        seed_index_offset=960_000,
+        min_skip_rate=0.12,
+        max_mean_deck_size=33.0,
+        extra_overrides=_CRN_B0_STAGE_OVERRIDES,
+    ),
+)
+
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -221,6 +294,11 @@ def evaluate_stage_promotion_gate(
     deadlocks = row.get("deadlock_count", 0)
 
     row_objective = row.get("reward_objective")
+    required_wins = (
+        stage.wins_required
+        if expected_episodes == 48
+        else math.ceil(stage.wins_required * expected_episodes / 48)
+    )
 
     checks = {
         "policy_version_ready": isinstance(pv, int) and not isinstance(pv, bool) and pv >= min_policy_version,
@@ -228,7 +306,7 @@ def evaluate_stage_promotion_gate(
         "budget_match": budget == stage.budget,
         "objective_match": row_objective is None or row_objective == stage.reward_objective,
         "zero_deadlocks": deadlocks == 0,
-        "wins_ok": isinstance(wins, int) and not isinstance(wins, bool) and wins >= stage.wins_required,
+        "wins_ok": isinstance(wins, int) and not isinstance(wins, bool) and wins >= required_wins,
         "revivals_ok": (
             isinstance(mean_rev, int | float)
             and not isinstance(mean_rev, bool)
@@ -253,7 +331,7 @@ def evaluate_stage_promotion_gate(
         "passed": passed,
         "policy_version": pv,
         "wins": wins,
-        "wins_required": stage.wins_required,
+        "wins_required": required_wins,
         "mean_revivals_used": mean_rev,
         "mean_revivals_limit": stage.mean_revivals_limit,
         "skip_rate": skip_rate,
@@ -318,7 +396,12 @@ def select_intrastage_teacher_reanchor(
     if not candidates:
         return None
     best_wins, _, _, best_pv = max(candidates)
-    if baseline_wins is not None and best_wins < baseline_wins + max(1, min_win_gain):
+    scaled_gain = (
+        max(1, min_win_gain)
+        if expected_episodes == 48
+        else max(1, math.ceil(min_win_gain * expected_episodes / 48))
+    )
+    if baseline_wins is not None and best_wins < baseline_wins + scaled_gain:
         return None
     return best_pv
 
@@ -390,9 +473,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep-raw-trace-cohorts", type=int, default=2)
     parser.add_argument(
         "--curriculum-mode",
-        choices=("revival-ratchet", "act-b0"),
+        choices=("revival-ratchet", "act-b0", "act-b0-crn"),
         default="revival-ratchet",
-        help="'revival-ratchet' decreases revival budget on full runs; 'act-b0' trains B=0 across act1 -> act2 -> run",
+        help=(
+            "'revival-ratchet' decreases revival budget on full runs; "
+            "'act-b0' trains B=0 across act1 -> act2 -> run; "
+            "'act-b0-crn' runs same-seed CRN counterfactual branches on B=0 act1 -> act2 -> run"
+        ),
     )
     parser.add_argument(
         "--budgets",
@@ -422,8 +509,12 @@ def _select_ratchet_stages(
     start_key = start_stage.strip()
     if start_key and (stages.strip() or budgets.strip()):
         raise ValueError("--start-stage cannot be combined with --stages or --budgets")
-    if curriculum_mode == "act-b0":
-        base_ladder = ZERO_REVIVAL_ACT_LADDER
+    if curriculum_mode in {"act-b0", "act-b0-crn"}:
+        base_ladder = (
+            CRN_ZERO_REVIVAL_ACT_LADDER
+            if curriculum_mode == "act-b0-crn"
+            else ZERO_REVIVAL_ACT_LADDER
+        )
         by_key = {spec.stage_key: spec for spec in base_ladder}
         if stages.strip():
             wanted_keys = [tok.strip() for tok in stages.split(",") if tok.strip()]

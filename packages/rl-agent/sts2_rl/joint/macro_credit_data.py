@@ -163,6 +163,8 @@ class MacroAfterstateNode:
     post_worlds: tuple[EncodedWorldSnapshot, ...]
     candidate_indices: tuple[int, ...] | None = None
     is_partial: bool = False
+    crn_candidate_indices: tuple[int, ...] | None = None
+    crn_candidate_returns: tuple[float, ...] | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.step_index, bool) or not isinstance(self.step_index, int) or self.step_index < 0:
@@ -192,6 +194,23 @@ class MacroAfterstateNode:
             prev_idx = idx
         if not self.is_partial and indices != tuple(range(len(self.post_worlds))):
             raise ValueError("non-partial afterstate node must cover contiguous 0..K-1 candidate indices")
+        if (self.crn_candidate_indices is None) != (self.crn_candidate_returns is None):
+            raise ValueError("crn_candidate_indices and crn_candidate_returns must both be set or both None")
+        if self.crn_candidate_indices is not None:
+            assert self.crn_candidate_returns is not None
+            if len(self.crn_candidate_indices) < 2 or len(self.crn_candidate_indices) != len(
+                self.crn_candidate_returns
+            ):
+                raise ValueError("crn_candidate_indices and crn_candidate_returns must match with length >= 2")
+            allowed_idx = set(indices)
+            prev_c = -1
+            for c_idx in self.crn_candidate_indices:
+                if isinstance(c_idx, bool) or not isinstance(c_idx, int) or c_idx <= prev_c or c_idx not in allowed_idx:
+                    raise ValueError("crn_candidate_indices must be strictly increasing subset of candidate_indices")
+                prev_c = c_idx
+            for c_ret in self.crn_candidate_returns:
+                if isinstance(c_ret, bool) or not isinstance(c_ret, int | float) or not math.isfinite(float(c_ret)):
+                    raise ValueError("crn_candidate_returns must be finite numbers")
 
     @property
     def resolved_candidate_indices(self) -> tuple[int, ...]:

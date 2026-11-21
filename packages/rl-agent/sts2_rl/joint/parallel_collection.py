@@ -432,6 +432,16 @@ def _rollout_worker_entry(
                 allow_single_pick_manual_confirm=bool(
                     task.get("allow_single_pick_manual_confirm", False)
                 ),
+                crn_roots_per_episode=int(task.get("crn_roots_per_episode", 0)),
+                crn_max_branches_per_root=int(task.get("crn_max_branches_per_root", 4)),
+                crn_surfaces=tuple(task.get("crn_surfaces", ("reward", "rest"))),
+                crn_zero_macro_pace_penalty=bool(
+                    task.get("crn_zero_macro_pace_penalty", True)
+                ),
+                crn_linear_hp_loss_weight=float(
+                    task.get("crn_linear_hp_loss_weight", 0.0)
+                ),
+                crn_hp_loss_reference=float(task.get("crn_hp_loss_reference", 80.0)),
                 maximum_snapshot_bytes=int(task["maximum_snapshot_bytes"]),
                 maximum_group_seconds=float(task["maximum_group_seconds"]),
                 artifact_root=root_path,
@@ -539,6 +549,12 @@ class PersistentRolloutWorkerPool:
         macro_branch_epsilon: float,
         allow_partial_afterstates: bool = False,
         allow_single_pick_manual_confirm: bool = False,
+        crn_roots_per_episode: int = 0,
+        crn_max_branches_per_root: int = 4,
+        crn_surfaces: tuple[str, ...] = ("reward", "rest"),
+        crn_zero_macro_pace_penalty: bool = True,
+        crn_linear_hp_loss_weight: float = 0.0,
+        crn_hp_loss_reference: float = 80.0,
         replacement_seed_fn: Callable[[int], int] | None,
         max_recoverable_incidents: int,
         maximum_episode_snapshot_bytes: int,
@@ -584,6 +600,12 @@ class PersistentRolloutWorkerPool:
                     "allow_single_pick_manual_confirm": bool(
                         allow_single_pick_manual_confirm
                     ),
+                    "crn_roots_per_episode": int(crn_roots_per_episode),
+                    "crn_max_branches_per_root": int(crn_max_branches_per_root),
+                    "crn_surfaces": tuple(crn_surfaces),
+                    "crn_zero_macro_pace_penalty": bool(crn_zero_macro_pace_penalty),
+                    "crn_linear_hp_loss_weight": float(crn_linear_hp_loss_weight),
+                    "crn_hp_loss_reference": float(crn_hp_loss_reference),
                     "maximum_snapshot_bytes": min(
                         maximum_episode_snapshot_bytes, maximum_cohort_snapshot_bytes
                     ),

@@ -32,6 +32,7 @@ from sts2_rl.macro_root_diagnostic import (
     FrozenPolicy,
     ProbeAuthority,
     ProbeBudgetExhausted,
+    ProbeMismatch,
     validate_course,
 )
 from sts2_rl.macro_root_evidence import canonical_facts
@@ -128,6 +129,7 @@ class StochasticBranchAuthority(BranchAuthority):
         self.current_afterstate_is_partial: bool = False
         self.bootstrap_snapshot: EncodedDecisionSnapshot | None = None
         self.root_teacher_log_probs: tuple[float, ...] | None = None
+        self.last_teacher_log_probs: tuple[float, ...] | None = None
         self._behavior_log_probability = 0.0
 
     def _prepare_semantic_exploration(
@@ -164,6 +166,7 @@ class StochasticBranchAuthority(BranchAuthority):
         logits = torch.tensor(self.last_q_values, dtype=torch.float64)
         mask = torch.tensor(snapshot.action_mask.tolist(), dtype=torch.bool)
         teacher_logs = torch.log_softmax(logits[: mask.numel()].masked_fill(~mask, -torch.inf), dim=0)
+        self.last_teacher_log_probs = tuple(float(value) for value in teacher_logs.tolist())
         behavior_logs = macro_mixture_log_probs(teacher_logs, snapshot, self.macro_branch_epsilon)
         probabilities = behavior_logs.exp().numpy()
         draw = float(self._sampling_rng.random())  # Burn one draw even at the forced root.
@@ -261,6 +264,282 @@ class _DiscardEvidenceTrace(_GuardedEvidenceTrace):
         return
 
 
+class _CRNPrefixReplayAuthority(StochasticBranchAuthority):
+    """Bit-exact prefix replay up to a target step, forced CRN branch action, then CRN continuation."""
+
+    def __init__(
+        self,
+        policy: FrozenPolicy,
+        seed: int,
+        limits: BranchLimits,
+        *,
+        prefix_selected_actions: tuple[int, ...],
+        root_step_index: int,
+        expected_root_candidates: int,
+        forced_candidate: int,
+        teacher_version: int,
+        config: TrainingConfig,
+        macro_branch_epsilon: float = 0.0,
+    ) -> None:
+        super().__init__(
+            policy,
+            seed,
+            limits,
+            forced_candidate,
+            teacher_version=teacher_version,
+            config=config,
+            macro_branch_epsilon=macro_branch_epsilon,
+            collect_afterstates=False,
+        )
+        self._prefix_selected_actions = prefix_selected_actions
+        self._root_step_index = int(root_step_index)
+        self._expected_root_candidates = int(expected_root_candidates)
+        self.reached_root = False
+
+    def _prepare_semantic_exploration(
+        self,
+        *,
+        observation: Mapping[str, Any],
+        decision: ForwardDecision,
+        candidates: Sequence[SemanticCandidate],
+        control_domain: Literal["macro", "combat"],
+    ) -> None:
+        del observation, decision, candidates, control_domain
+        self.current_afterstates = None
+        self.current_afterstate_branches = None
+        self.current_afterstate_indices = None
+        self.current_afterstate_is_partial = False
+        self._current_is_root = self.semantic_count == self._root_step_index
+
+    def _semantic_choice(
+        self, *, candidates: Sequence[SemanticCandidate], snapshot: EncodedDecisionSnapshot
+    ) -> int:
+        greedy = ProbeAuthority._semantic_choice(self, candidates=candidates, snapshot=snapshot)
+        assert self.last_q_values is not None
+        self.current_snapshot = snapshot
+        logits = torch.tensor(self.last_q_values, dtype=torch.float64)
+        mask = torch.tensor(snapshot.action_mask.tolist(), dtype=torch.bool)
+        teacher_logs = torch.log_softmax(logits[: mask.numel()].masked_fill(~mask, -torch.inf), dim=0)
+        self.last_teacher_log_probs = tuple(float(value) for value in teacher_logs.tolist())
+        behavior_logs = macro_mixture_log_probs(teacher_logs, snapshot, self.macro_branch_epsilon)
+        probabilities = behavior_logs.exp().numpy()
+        draw = float(self._sampling_rng.random())  # Keep post-root CRN RNG aligned with reference.
+        step_idx = self.semantic_count
+        if step_idx < self._root_step_index:
+            forced_prefix = self._prefix_selected_actions[step_idx]
+            if not 0 <= forced_prefix < len(candidates):
+                raise ProbeMismatch(
+                    {
+                        "kind": "crn_prefix_candidate_mismatch",
+                        "step_index": step_idx,
+                        "forced_prefix": forced_prefix,
+                        "candidate_count": len(candidates),
+                    }
+                )
+            self._behavior_log_probability = 0.0
+            return forced_prefix
+        if step_idx == self._root_step_index:
+            assert self.forced_candidate is not None
+            if len(candidates) != self._expected_root_candidates or not (
+                0 <= self.forced_candidate < len(candidates)
+            ):
+                raise ProbeMismatch(
+                    {
+                        "kind": "crn_root_candidate_mismatch",
+                        "step_index": step_idx,
+                        "expected_candidates": self._expected_root_candidates,
+                        "candidate_count": len(candidates),
+                        "forced_candidate": self.forced_candidate,
+                    }
+                )
+            self.reached_root = True
+            self.greedy_root_index = greedy
+            self.root_teacher_log_probs = self.last_teacher_log_probs
+            self._behavior_log_probability = 0.0
+            return self.forced_candidate
+        selected = min(int(np.searchsorted(np.cumsum(probabilities), draw, side="right")), len(candidates) - 1)
+        self._behavior_log_probability = float(behavior_logs[selected].item())
+        return selected
+
+
+class _CRNReturnCaptureTrace(_DiscardEvidenceTrace):
+    """Lightweight zero-I/O trace that accumulates exact post-root discounted effective return."""
+
+    def __init__(
+        self,
+        *,
+        root_step_index: int,
+        limits: BranchLimits,
+        resource_guard: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(io.StringIO(), limits.trace_limits(), None, resource_guard=resource_guard)
+        self._root_step_index = int(root_step_index)
+        self._semantic_seen = 0
+        self._pending: dict[str, Any] | None = None
+        self._sums = dict.fromkeys(COMPONENTS, 0.0)
+        self._revivals = 0
+        self._hp_lost = 0.0
+        self._native_steps = 0
+        self._edge_weight = 1.0
+        self._last_native_floor: int | None = None
+        self._post_root_edges: list[tuple[str, float, MacroRewardFacts]] = []
+        self.last_state: dict[str, Any] | None = None
+        self.last_task_terminal = False
+        self.last_task_outcome: str | None = None
+
+    def _close_edge(self, floor: int, terminal: bool) -> None:
+        if self._pending is None:
+            return
+        pending = self._pending
+        discount = decision_discount(floor_before=pending["floor"], floor_after=floor, terminal=terminal)
+        facts = MacroRewardFacts(
+            **self._sums,
+            revivals_used_delta=self._revivals,
+            player_hp_lost_delta=self._hp_lost,
+            floor_before=pending["floor"],
+            floor_after=floor,
+            native_steps=self._native_steps,
+        )
+        if pending["step_idx"] >= self._root_step_index:
+            self._post_root_edges.append((str(pending["domain"]), float(discount), facts))
+        self._pending = None
+        self._sums = dict.fromkeys(COMPONENTS, 0.0)
+        self._revivals = 0
+        self._hp_lost = 0.0
+        self._native_steps = 0
+        self._edge_weight = 1.0
+        self._last_native_floor = None
+
+    def record(self, kind: str, facts: Any, policy: Any = None) -> None:
+        del policy
+        if self.resource_guard is not None:
+            self.resource_guard()
+        if isinstance(facts, dict) and isinstance(facts.get("state"), dict):
+            self.last_state = facts["state"]
+        if kind == "decision" and isinstance(facts, dict) and facts.get("semantic") is not None:
+            event = facts["semantic"]
+            floor = int(facts["state"]["observation"]["run"]["floor"])
+            self._close_edge(floor, False)
+            step_idx = self._semantic_seen
+            self._semantic_seen += 1
+            self._pending = {
+                "step_idx": step_idx,
+                "floor": floor,
+                "domain": event["domain"],
+            }
+            self._last_native_floor = floor
+        elif kind == "transition" and isinstance(facts, dict):
+            breakdown = facts["reward_breakdown"]
+            self.last_task_terminal = bool(breakdown.get("task_terminal"))
+            raw_out = breakdown.get("outcome")
+            self.last_task_outcome = str(raw_out) if isinstance(raw_out, str) else None
+            if self._pending is not None:
+                native = facts["native_discount"]
+                before, after = native["floor_before"], native["floor_after"]
+                terminal = bool(breakdown["task_terminal"])
+                discount = decision_discount(floor_before=before, floor_after=after, terminal=terminal)
+                for component in COMPONENTS:
+                    self._sums[component] += self._edge_weight * float(breakdown[component])
+                self._revivals += int(breakdown["revivals_used_delta"])
+                self._hp_lost += float(breakdown["player_hp_lost_delta"])
+                self._native_steps += 1
+                self._edge_weight *= discount
+                self._last_native_floor = after
+                if terminal:
+                    self._close_edge(int(facts["state"]["observation"]["run"]["floor"]), True)
+
+    def post_root_effective_return(
+        self,
+        *,
+        zero_macro_pace_penalty: bool,
+        linear_hp_loss_weight: float,
+        hp_loss_reference: float,
+    ) -> float:
+        total = 0.0
+        weight = 1.0
+        for domain, discount, facts in self._post_root_edges:
+            r = float(facts.reward)
+            if zero_macro_pace_penalty and domain == "macro":
+                r -= float(facts.pace_penalty)
+            if linear_hp_loss_weight > 0.0:
+                r = (
+                    r
+                    - float(facts.hp_loss_penalty)
+                    - float(linear_hp_loss_weight)
+                    * (float(facts.player_hp_lost_delta) / float(hp_loss_reference))
+                )
+            total += weight * r
+            weight *= discount
+        return float(total)
+
+
+def _trajectory_post_root_effective_return(
+    trajectory: MacroCreditTrajectory,
+    root_step_index: int,
+    *,
+    zero_macro_pace_penalty: bool,
+    linear_hp_loss_weight: float,
+    hp_loss_reference: float,
+) -> float:
+    total = 0.0
+    weight = 1.0
+    for step, facts in zip(
+        trajectory.steps[root_step_index:],
+        trajectory.reward_facts[root_step_index:],
+        strict=True,
+    ):
+        r = float(step.reward)
+        if zero_macro_pace_penalty and step.control_domain == "macro":
+            r -= float(facts.pace_penalty)
+        if linear_hp_loss_weight > 0.0:
+            r = (
+                r
+                - float(facts.hp_loss_penalty)
+                - float(linear_hp_loss_weight)
+                * (float(facts.player_hp_lost_delta) / float(hp_loss_reference))
+            )
+        total += weight * r
+        weight *= float(step.discount)
+    return float(total)
+
+
+def _select_crn_branch_indices(
+    node: MacroAfterstateNode,
+    *,
+    ref_action: int,
+    teacher_log_probs: tuple[float, ...] | None,
+    max_branches: int,
+) -> tuple[int, ...]:
+    resolved = node.resolved_candidate_indices
+    if len(resolved) <= max_branches:
+        return resolved
+    branch_by_idx = dict(zip(resolved, node.candidate_branches, strict=True))
+    chosen: list[int] = []
+    if ref_action in branch_by_idx:
+        chosen.append(ref_action)
+    if node.surface == "rest":
+        for idx in resolved:
+            if branch_by_idx[idx] == "rest" and idx not in chosen:
+                chosen.append(idx)
+                break
+    elif node.surface == "reward":
+        for idx in resolved:
+            if branch_by_idx[idx] == "skip" and idx not in chosen:
+                chosen.append(idx)
+                break
+    remaining = [idx for idx in resolved if idx not in chosen]
+    if teacher_log_probs is not None:
+        remaining.sort(
+            key=lambda i: float(teacher_log_probs[i]) if i < len(teacher_log_probs) else -1e9,
+            reverse=True,
+        )
+    for idx in remaining:
+        if len(chosen) >= max_branches:
+            break
+        chosen.append(idx)
+    return tuple(sorted(chosen))
+
+
 class TrainingEvidenceTrace(_GuardedEvidenceTrace):
     """Observe validated simulator events; retain CPU sparse inputs, not hidden."""
 
@@ -281,6 +560,7 @@ class TrainingEvidenceTrace(_GuardedEvidenceTrace):
         self.steps: list[HybridVTraceStep] = []
         self.reward_facts: list[MacroRewardFacts] = []
         self.afterstate_nodes: list[MacroAfterstateNode] = []
+        self.afterstate_teacher_log_probs: dict[int, tuple[float, ...]] = {}
         self.macro_surface_branch_counts: dict[str, int] = {}
         self.root_index: int | None = None
         self.pending: dict[str, Any] | None = None
@@ -427,6 +707,10 @@ class TrainingEvidenceTrace(_GuardedEvidenceTrace):
                 if self.snapshot_bytes > self.maximum_snapshot_bytes:
                     raise ProbeBudgetExhausted("maximum_snapshot_bytes")
                 self.afterstate_nodes.append(node)
+                if self.authority.last_teacher_log_probs is not None:
+                    self.afterstate_teacher_log_probs[node.step_index] = (
+                        self.authority.last_teacher_log_probs
+                    )
             if event["domain"] == "macro":
                 selected_branch = event["candidates"][event["selected_index"]]["branch"]
                 branch_key = f"{event['surface']}:{selected_branch}"
@@ -799,6 +1083,12 @@ def collect_durable_afterstate_episode(
     macro_branch_epsilon: float = 0.0,
     allow_partial_afterstates: bool = False,
     allow_single_pick_manual_confirm: bool = False,
+    crn_roots_per_episode: int = 0,
+    crn_max_branches_per_root: int = 4,
+    crn_surfaces: tuple[str, ...] = ("reward", "rest"),
+    crn_zero_macro_pace_penalty: bool = True,
+    crn_linear_hp_loss_weight: float = 0.0,
+    crn_hp_loss_reference: float = 80.0,
     maximum_snapshot_bytes: int = 256 * 1024 * 1024,
     maximum_group_seconds: float = 1800.0,
     artifact_root: Path | None = None,
@@ -900,6 +1190,150 @@ def collect_durable_afterstate_episode(
                 seed=seed,
                 ending=result["ending"],
             )
+            crn_roots_collected = 0
+            crn_branches_executed = 0
+            crn_prefix_mismatches = 0
+            crn_return_spreads: list[float] = []
+            crn_selected_surfaces: list[str] = []
+            if crn_roots_per_episode > 0 and trajectory.afterstate_nodes:
+                eligible_by_surface: dict[str, list[MacroAfterstateNode]] = {}
+                for node in trajectory.afterstate_nodes:
+                    if node.surface not in crn_surfaces:
+                        continue
+                    bset = set(node.candidate_branches)
+                    if node.surface == "reward" and not {"take", "skip"}.issubset(bset):
+                        continue
+                    if node.surface == "rest" and not {"rest", "smith"}.issubset(bset):
+                        continue
+                    if len(node.resolved_candidate_indices) < 2:
+                        continue
+                    eligible_by_surface.setdefault(node.surface, []).append(node)
+
+                chosen_nodes: list[MacroAfterstateNode] = []
+                sel_rng = np.random.default_rng(np.random.SeedSequence([seed, teacher_version, 0x43524E53]))
+                avail_surfaces = [s for s in crn_surfaces if eligible_by_surface.get(s)]
+                used_steps: set[int] = set()
+                for _ in range(crn_roots_per_episode):
+                    if not avail_surfaces:
+                        break
+                    if "reward" in avail_surfaces and "rest" in avail_surfaces:
+                        pick_surf = "rest" if float(sel_rng.random()) < 0.30 else "reward"
+                    else:
+                        pick_surf = avail_surfaces[int(sel_rng.integers(0, len(avail_surfaces)))]
+                    pool_nodes = [n for n in eligible_by_surface[pick_surf] if n.step_index not in used_steps]
+                    if not pool_nodes:
+                        avail_surfaces = [s for s in avail_surfaces if s != pick_surf]
+                        continue
+                    picked = pool_nodes[int(sel_rng.integers(0, len(pool_nodes)))]
+                    used_steps.add(picked.step_index)
+                    chosen_nodes.append(picked)
+
+                updated_node_map: dict[int, MacroAfterstateNode] = {}
+                for target_node in chosen_nodes:
+                    r_idx = target_node.step_index
+                    ref_step = trajectory.steps[r_idx]
+                    ref_action = int(ref_step.action_index)
+                    branch_indices = _select_crn_branch_indices(
+                        target_node,
+                        ref_action=ref_action,
+                        teacher_log_probs=capture.afterstate_teacher_log_probs.get(r_idx),
+                        max_branches=max(2, int(crn_max_branches_per_root)),
+                    )
+                    if len(branch_indices) < 2:
+                        continue
+                    prefix_actions = tuple(int(st.action_index) for st in trajectory.steps[:r_idx])
+                    expected_cands = int(ref_step.snapshot.candidate_count)
+                    returns_by_idx: dict[int, float] = {}
+                    if ref_action in branch_indices:
+                        returns_by_idx[ref_action] = _trajectory_post_root_effective_return(
+                            trajectory,
+                            r_idx,
+                            zero_macro_pace_penalty=crn_zero_macro_pace_penalty,
+                            linear_hp_loss_weight=crn_linear_hp_loss_weight,
+                            hp_loss_reference=crn_hp_loss_reference,
+                        )
+                    branch_ok = True
+                    for alt_idx in branch_indices:
+                        if alt_idx == ref_action:
+                            continue
+                        rem_branch = maximum_group_seconds - (time.monotonic() - started)
+                        if rem_branch <= 5.0:
+                            branch_ok = False
+                            break
+                        branch_limits = replace(actual_limits, timeout_seconds=min(rem_branch, actual_limits.timeout_seconds))
+                        crn_auth = _CRNPrefixReplayAuthority(
+                            policy,
+                            seed,
+                            branch_limits,
+                            prefix_selected_actions=prefix_actions,
+                            root_step_index=r_idx,
+                            expected_root_candidates=expected_cands,
+                            forced_candidate=int(alt_idx),
+                            teacher_version=teacher_version,
+                            config=config,
+                            macro_branch_epsilon=macro_branch_epsilon,
+                        )
+                        crn_trace = _CRNReturnCaptureTrace(
+                            root_step_index=r_idx,
+                            limits=branch_limits,
+                            resource_guard=resource_guard,
+                        )
+                        try:
+                            b_res = run_branch_pass(
+                                backend=backend,
+                                policy=policy,
+                                config=config,
+                                seed=seed,
+                                limits=branch_limits,
+                                trace=crn_trace,
+                                prefix=_DiscardEvidenceTrace(
+                                    io.StringIO(), branch_limits.trace_limits(), None, resource_guard=resource_guard
+                                ),
+                                forced_candidate=int(alt_idx),
+                                authority=crn_auth,
+                                allow_zero_budget_training=(config.curriculum.revival_budget == 0),
+                                allow_act_objectives=True,
+                            )
+                            if (
+                                not crn_auth.reached_root
+                                or b_res.get("ending") != "factual_terminal"
+                                or not crn_trace.last_task_terminal
+                            ):
+                                branch_ok = False
+                                break
+                            returns_by_idx[int(alt_idx)] = crn_trace.post_root_effective_return(
+                                zero_macro_pace_penalty=crn_zero_macro_pace_penalty,
+                                linear_hp_loss_weight=crn_linear_hp_loss_weight,
+                                hp_loss_reference=crn_hp_loss_reference,
+                            )
+                            crn_branches_executed += 1
+                        except ProbeMismatch:
+                            crn_prefix_mismatches += 1
+                            branch_ok = False
+                            break
+                        except Exception as b_exc:
+                            if is_recoverable_episode_exception(b_exc):
+                                branch_ok = False
+                                break
+                            raise
+                    if branch_ok and len(returns_by_idx) == len(branch_indices):
+                        ordered_rets = tuple(float(returns_by_idx[idx]) for idx in branch_indices)
+                        updated_node_map[r_idx] = replace(
+                            target_node,
+                            crn_candidate_indices=branch_indices,
+                            crn_candidate_returns=ordered_rets,
+                        )
+                        crn_roots_collected += 1
+                        crn_return_spreads.append(max(ordered_rets) - min(ordered_rets))
+                        crn_selected_surfaces.append(target_node.surface)
+
+                if updated_node_map:
+                    trajectory = replace(
+                        trajectory,
+                        afterstate_nodes=tuple(
+                            updated_node_map.get(n.step_index, n) for n in trajectory.afterstate_nodes
+                        ),
+                    )
             report.update(
                 status="complete",
                 trajectory_id=trajectory.trajectory_id,
@@ -907,6 +1341,15 @@ def collect_durable_afterstate_episode(
                 macro_steps=sum(step.control_domain == "macro" for step in trajectory.steps),
                 combat_steps=sum(step.control_domain == "combat" for step in trajectory.steps),
                 afterstate_nodes=len(trajectory.afterstate_nodes),
+                crn_roots_collected=crn_roots_collected,
+                crn_branches_executed=crn_branches_executed,
+                crn_prefix_mismatches=crn_prefix_mismatches,
+                crn_mean_return_spread=(
+                    float(sum(crn_return_spreads) / len(crn_return_spreads))
+                    if crn_return_spreads
+                    else 0.0
+                ),
+                crn_surfaces=crn_selected_surfaces,
                 simulator_steps=int(result["native_steps"]),
             )
             if resource_guard is not None:
@@ -934,6 +1377,12 @@ def collect_durable_afterstate_cohort(
     macro_branch_epsilon: float = 0.0,
     allow_partial_afterstates: bool = False,
     allow_single_pick_manual_confirm: bool = False,
+    crn_roots_per_episode: int = 0,
+    crn_max_branches_per_root: int = 4,
+    crn_surfaces: tuple[str, ...] = ("reward", "rest"),
+    crn_zero_macro_pace_penalty: bool = True,
+    crn_linear_hp_loss_weight: float = 0.0,
+    crn_hp_loss_reference: float = 80.0,
     parallel_collectors: int = 1,
     replacement_seed_fn: Callable[[int], int] | None = None,
     max_recoverable_incidents: int = 4,
@@ -971,6 +1420,12 @@ def collect_durable_afterstate_cohort(
                 macro_branch_epsilon=macro_branch_epsilon,
                 allow_partial_afterstates=allow_partial_afterstates,
                 allow_single_pick_manual_confirm=allow_single_pick_manual_confirm,
+                crn_roots_per_episode=crn_roots_per_episode,
+                crn_max_branches_per_root=crn_max_branches_per_root,
+                crn_surfaces=crn_surfaces,
+                crn_zero_macro_pace_penalty=crn_zero_macro_pace_penalty,
+                crn_linear_hp_loss_weight=crn_linear_hp_loss_weight,
+                crn_hp_loss_reference=crn_hp_loss_reference,
                 replacement_seed_fn=replacement_seed_fn,
                 max_recoverable_incidents=max_recoverable_incidents,
                 maximum_episode_snapshot_bytes=maximum_episode_snapshot_bytes,
@@ -1014,6 +1469,12 @@ def collect_durable_afterstate_cohort(
                     macro_branch_epsilon=macro_branch_epsilon,
                     allow_partial_afterstates=allow_partial_afterstates,
                     allow_single_pick_manual_confirm=allow_single_pick_manual_confirm,
+                    crn_roots_per_episode=crn_roots_per_episode,
+                    crn_max_branches_per_root=crn_max_branches_per_root,
+                    crn_surfaces=crn_surfaces,
+                    crn_zero_macro_pace_penalty=crn_zero_macro_pace_penalty,
+                    crn_linear_hp_loss_weight=crn_linear_hp_loss_weight,
+                    crn_hp_loss_reference=crn_hp_loss_reference,
                     maximum_snapshot_bytes=min(maximum_episode_snapshot_bytes, maximum_cohort_snapshot_bytes),
                     maximum_group_seconds=min(maximum_episode_seconds, remaining_seconds),
                     artifact_root=artifact_root,

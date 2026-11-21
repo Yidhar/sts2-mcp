@@ -326,6 +326,7 @@ def project_hierarchical_macro_policy(
     det_action_values_twin: Tensor | None = None,
     pessimism_coef: float = 0.0,
     within_branch_prob_cap: float = 1.0,
+    center_twin_disagreement: bool = False,
 ) -> MacroPolicyProjection:
     """Two-level hierarchical MPO matching ``branch_policy_head + within_log_probs``.
 
@@ -374,7 +375,12 @@ def project_hierarchical_macro_policy(
     det_v1 = det_action_values.detach().double()
     if det_action_values_twin is not None:
         det_v2 = det_action_values_twin.detach().double()
-        det_disagree = (det_v1 - det_v2).abs()
+        if center_twin_disagreement:
+            v1_centered = det_v1 - det_v1.mean()
+            v2_centered = det_v2 - det_v2.mean()
+            det_disagree = (v1_centered - v2_centered).abs()
+        else:
+            det_disagree = (det_v1 - det_v2).abs()
         det_mean = 0.5 * (det_v1 + det_v2)
         det_cons = det_mean - pessimism_coef * det_disagree
     else:
